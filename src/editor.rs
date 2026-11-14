@@ -172,12 +172,28 @@ fn when_summary(ed: &Editor) -> (String, String) {
     }
 }
 
-fn time_combo(ui: &mut egui::Ui, id: &str, t: &mut NaiveTime) {
-    egui::ComboBox::new(id, "").selected_text(fmt_time(*t)).width(78.0).height(260.0).show_ui(ui, |ui| {
-        for q in 0..96 {
-            let slot = NaiveTime::from_hms_opt(q / 4, (q % 4) * 15, 0).unwrap();
-            ui.selectable_value(t, slot, fmt_time(slot));
-        }
+/// Size of the date and time buttons in the "starts"/"ends" rows. Both are
+/// fixed so the two rows' clocks line up with each other.
+const DATE_BUTTON: Vec2 = Vec2::new(112.0, 26.0);
+const TIME_BUTTON: Vec2 = Vec2::new(80.0, 26.0);
+
+/// A button showing the time that drops down a list of 15-minute slots.
+/// (A plain button rather than an egui ComboBox: ComboBox ignores the row's
+/// vertical centering, so it sat out of line with the date button beside it.)
+fn time_button(ui: &mut egui::Ui, id: &str, t: &mut NaiveTime) {
+    let resp = ui.add_sized(TIME_BUTTON, egui::Button::new(fmt_time(*t)));
+    let popup_id = ui.make_persistent_id(id);
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    egui::popup::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+        ui.set_min_width(TIME_BUTTON.x);
+        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            for q in 0..96 {
+                let slot = NaiveTime::from_hms_opt(q / 4, (q % 4) * 15, 0).unwrap();
+                ui.selectable_value(t, slot, fmt_time(slot));
+            }
+        });
     });
 }
 
@@ -272,9 +288,9 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
                 ] {
                     ui.label(RichText::new(label).color(p.secondary));
                     ui.horizontal(|ui| {
-                        ui.push_id(id, |ui| ui.add(egui_extras::DatePickerButton::new(date)));
+                        ui.push_id(id, |ui| ui.add_sized(DATE_BUTTON, egui_extras::DatePickerButton::new(date)));
                         if !ed.draft.all_day {
-                            time_combo(ui, &format!("{id}-time"), time);
+                            time_button(ui, &format!("{id}-time"), time);
                         }
                     });
                     ui.end_row();
