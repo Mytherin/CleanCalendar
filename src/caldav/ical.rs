@@ -16,6 +16,8 @@
 //! clients' X- properties) is kept as it was: writing starts from the
 //! server's copy and only replaces the properties the app owns.
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::{OffsetComponents, OffsetName, Tz};
@@ -288,7 +290,9 @@ pub fn parse(text: &str) -> Result<Component> {
             }
         }
     }
-    done.ok_or_else(|| anyhow!("not an iCalendar object"))
+    let mut cal = done.ok_or_else(|| anyhow!("not an iCalendar object"))?;
+    attach_guessed_zones(&mut cal);
+    Ok(cal)
 }
 
 /// Folds a content line at 75 octets (RFC 5545 §3.1), on character boundaries.
@@ -330,7 +334,7 @@ fn write_into(c: &Component, out: &mut String) {
             continue;
         }
         let mut line = p.name.clone();
-        for (k, v) in &p.params {
+        for (k, v) in p.params.iter().filter(|(k, _)| k != GUESSED_ZONE) {
             line += &format!(";{k}={}", quote(v));
         }
         line.push(':');
@@ -369,6 +373,101 @@ pub fn parse_tzid(s: &str) -> Option<Tz> {
     }
     let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
     (1..parts.len()).find_map(|i| recurrence::parse_zone(&parts[i..].join("/")))
+}
+
+/// A parameter the parser adds next to a TZID it doesn't know: the IANA zone
+/// that the file's own VTIMEZONE for it matches. Never written back out.
+const GUESSED_ZONE: &str = "X-CLEANCALENDAR-ZONE";
+
+/// "+0530", "-0400", "+010000" → seconds east of UTC.
+fn parse_offset(v: &str) -> Option<i32> {
+    let v = v.trim();
+    let (sign, digits) = match v.as_bytes().first()? {
+        b'+' => (1, &v[1..]),
+        b'-' => (-1, &v[1..]),
+        _ => return None,
+    };
+    if !(digits.len() == 4 || digits.len() == 6) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| digits[r].parse::<i32>().ok();
+    let secs = n(0..2)? * 3600 + n(2..4)? * 60 + if digits.len() == 6 { n(4..6)? } else { 0 };
+    Some(sign * secs)
+}
+
+/// An IANA zone with the same standard (and daylight-saving) offsets as a
+/// VTIMEZONE, for one this app doesn't know by name (Outlook's "Customized
+/// Time Zone", made-up names). Transition dates may differ a little from
+/// the original's, but times land in the right place, rather than being
+/// read as this computer's local time.
+fn guess_zone(vtz: &Component) -> Option<Tz> {
+    use chrono::{Datelike, Offset};
+    let offset_of = |kind: &str| {
+        vtz.subs.iter().filter(|s| s.name == kind).find_map(|s| s.prop("TZOFFSETTO").and_then(|p| parse_offset(&p.value)))
+    };
+    let std = offset_of("STANDARD").or_else(|| offset_of("DAYLIGHT"))?;
+    let dst = offset_of("DAYLIGHT").unwrap_or(std);
+    let mut want = [std, dst];
+    want.sort();
+    let year = chrono::Utc::now().year();
+    let offsets = |tz: &Tz| {
+        let at = |m: u32| tz.offset_from_utc_datetime(&NaiveDate::from_ymd_opt(year, m, 15)?.and_hms_opt(12, 0, 0)?).fix().local_minus_utc().into();
+        let (Some(a), Some(b)): (Option<i32>, Option<i32>) = (at(1), at(7)) else { return None };
+        let mut v = [a, b];
+        v.sort();
+        Some(v)
+    };
+    // A fixed offset in whole hours reads best as Etc/GMT±N (whose sign is
+    // reversed: Etc/GMT-5 is UTC+5).
+    if std == dst && std % 3600 == 0 {
+        let h = -std / 3600;
+        let name = if h == 0 { "Etc/GMT".to_owned() } else { format!("Etc/GMT{h:+}") };
+        if let Some(tz) = recurrence::parse_zone(&name) {
+            return Some(tz);
+        }
+    }
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .filter(|tz| tz.name().contains('/') && !tz.name().starts_with("Etc/"))
+        .find(|tz| offsets(tz) == Some(want))
+        .copied()
+}
+
+/// Adds [`GUESSED_ZONE`] to every property whose TZID isn't a zone we know
+/// but has a VTIMEZONE in the file we can match.
+fn attach_guessed_zones(cal: &mut Component) {
+    let guesses: HashMap<String, Tz> = cal
+        .subs
+        .iter()
+        .filter(|c| c.name == "VTIMEZONE")
+        .filter_map(|c| {
+            let id = c.prop("TZID")?.value.trim().to_owned();
+            if parse_tzid(&id).is_some() {
+                return None;
+            }
+            Some((id, guess_zone(c)?))
+        })
+        .collect();
+    if guesses.is_empty() {
+        return;
+    }
+    fn walk(c: &mut Component, guesses: &HashMap<String, Tz>) {
+        if c.name == "VTIMEZONE" {
+            return;
+        }
+        for p in &mut c.props {
+            let guess = p.param("TZID").and_then(|id| guesses.get(id.trim().trim_matches('"')));
+            if let Some(tz) = guess {
+                let name = tz.name().to_owned();
+                p.params.retain(|(k, _)| k != GUESSED_ZONE);
+                p.params.push((GUESSED_ZONE.to_owned(), name));
+            }
+        }
+        for s in &mut c.subs {
+            walk(s, guesses);
+        }
+    }
+    walk(cal, &guesses);
 }
 
 /// Windows zone names → IANA (CLDR's "001" mappings), for the zones
@@ -451,7 +550,10 @@ fn when_value(v: &str, date: bool, tz: Option<Tz>) -> Option<When> {
 /// The values of a date property (EXDATE and RDATE may list several).
 pub fn whens(p: &Prop) -> Vec<When> {
     let date = p.param("VALUE") == Some("DATE");
-    let tz = p.param("TZID").and_then(parse_tzid);
+    let tz = p
+        .param(GUESSED_ZONE)
+        .and_then(recurrence::parse_zone)
+        .or_else(|| p.param("TZID").and_then(parse_tzid));
     p.value.split(',').filter_map(|v| when_value(v, date, tz)).collect()
 }
 
