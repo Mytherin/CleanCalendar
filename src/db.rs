@@ -28,33 +28,162 @@ use crate::model::{Calendar, Event, GoogleSettings, PendingDelete, Source, Store
 const DATA_VERSION: i32 = 1;
 const CACHE_VERSION: i32 = 1;
 
-/// Where the two databases (and the old JSON store, for migration) live.
+/// Where the two databases (and the old JSON store, for migration) live, and
+/// where the Google refresh token is kept.
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub data: PathBuf,
     pub cache: PathBuf,
     pub legacy_json: PathBuf,
+    pub secrets: Secrets,
 }
+
+/// The app's folder name inside the OS's data and cache folders. Linux
+/// convention is lowercase.
+const APP_DIR: &str = if cfg!(any(windows, target_os = "macos")) { "CleanCalendar" } else { "cleancalendar" };
 
 impl Paths {
     /// `CLEANCALENDAR_DATA=<dir>` puts everything in one folder; otherwise the
-    /// OS's per-user data and cache folders are used.
+    /// OS's per-user data and cache folders are used:
+    ///
+    /// | | data.db | cache.db |
+    /// |---|---|---|
+    /// | Windows | `%APPDATA%\CleanCalendar` | `%LOCALAPPDATA%\CleanCalendar` |
+    /// | macOS | `~/Library/Application Support/CleanCalendar` | `~/Library/Caches/CleanCalendar` |
+    /// | Linux | `~/.local/share/cleancalendar` | `~/.cache/cleancalendar` |
+    ///
+    /// Files left in the folders older versions used are moved over.
     pub fn default_location() -> Self {
         if let Some(dir) = std::env::var_os("CLEANCALENDAR_DATA") {
-            return Paths::in_dir(Path::new(&dir));
+            let dir = PathBuf::from(dir);
+            let account = format!("{REFRESH_TOKEN}@{}", std::path::absolute(&dir).unwrap_or(dir.clone()).display());
+            return Paths::in_dir(&dir, Secrets::Keyring(account));
         }
-        match directories::ProjectDirs::from("com", "CleanCalendar", "CleanCalendar") {
-            Some(d) => Paths {
-                data: d.data_dir().join("data.db"),
-                cache: d.cache_dir().join("cache.db"),
-                legacy_json: d.data_dir().join("store.json"),
+        let Some(base) = directories::BaseDirs::new() else {
+            return Paths::in_dir(Path::new("."), Secrets::Keyring(REFRESH_TOKEN.into()));
+        };
+        let paths = Paths {
+            data: base.data_dir().join(APP_DIR).join("data.db"),
+            cache: base.cache_dir().join(APP_DIR).join("cache.db"),
+            legacy_json: base.data_dir().join(APP_DIR).join("store.json"),
+            secrets: Secrets::Keyring(REFRESH_TOKEN.into()),
+        };
+        if let Some(old) = directories::ProjectDirs::from("com", "CleanCalendar", "CleanCalendar") {
+            move_from_old_folders(old.data_dir(), old.cache_dir(), &paths);
+        }
+        paths
+    }
+
+    pub fn in_dir(dir: &Path, secrets: Secrets) -> Self {
+        Paths { data: dir.join("data.db"), cache: dir.join("cache.db"), legacy_json: dir.join("store.json"), secrets }
+    }
+}
+
+/// Moves the files from the folders versions before 2026-11 used
+/// (`directories::ProjectDirs`, e.g. `%APPDATA%\CleanCalendar\CleanCalendar\data`)
+/// to the current ones. Does nothing once the new folder has data, or where
+/// the two are the same folder (Linux). If `data.db` can't be moved the old
+/// files are left alone, and the app starts with an empty new folder rather
+/// than splitting the database from its journal.
+fn move_from_old_folders(old_data: &Path, old_cache: &Path, new: &Paths) {
+    let new_data = new.data.parent().unwrap_or(Path::new("."));
+    let new_cache = new.cache.parent().unwrap_or(Path::new("."));
+    if old_data == new_data || new.data.exists() || new.legacy_json.exists() {
+        return;
+    }
+    let data_files = ["data.db", "data.db-wal", "data.db-shm", "data.db-journal", "store.json", "store.json.migrated"];
+    if !data_files.iter().any(|f| old_data.join(f).exists()) {
+        return;
+    }
+    if let Err(e) = move_files(old_data, new_data, &data_files) {
+        eprintln!("Could not move data from {} to {}: {e}", old_data.display(), new_data.display());
+        return;
+    }
+    // The cache can always be downloaded again, so a failure here is fine.
+    if old_cache != new_cache {
+        if let Err(e) = move_files(old_cache, new_cache, &["cache.db", "cache.db-wal", "cache.db-shm", "cache.db-journal"]) {
+            eprintln!("Could not move cache from {}: {e}; it will be downloaded again", old_cache.display());
+        }
+    }
+    // Tidy up the old folders if nothing else is in them (on Windows this is
+    // `...\CleanCalendar\CleanCalendar\data` and its parent).
+    for dir in [old_data, old_cache] {
+        let _ = std::fs::remove_dir(dir);
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+fn move_files(from: &Path, to: &Path, names: &[&str]) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for name in names {
+        let src = from.join(name);
+        if src.exists() {
+            std::fs::rename(&src, to.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// The credential-store entry the refresh token is kept under.
+const KEYRING_SERVICE: &str = "CleanCalendar";
+const REFRESH_TOKEN: &str = "google-refresh-token";
+
+/// Where the Google refresh token is kept: the OS credential store (Windows
+/// Credential Manager, macOS Keychain, Secret Service on Linux) under the
+/// given account name. Tests use an in-memory one so they never touch the
+/// real store.
+#[derive(Clone, Debug)]
+pub enum Secrets {
+    Keyring(String),
+    #[cfg(test)]
+    Memory(std::sync::Arc<std::sync::Mutex<Option<String>>>),
+    /// A credential store that always fails, to test the fallback.
+    #[cfg(test)]
+    Unavailable,
+}
+
+impl Secrets {
+    fn entry(account: &str) -> keyring::Result<keyring::Entry> {
+        keyring::Entry::new(KEYRING_SERVICE, account)
+    }
+
+    fn get(&self) -> Result<Option<String>> {
+        match self {
+            Secrets::Keyring(account) => match Self::entry(account)?.get_password() {
+                Ok(token) => Ok(Some(token)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(e.into()),
             },
-            None => Paths::in_dir(Path::new(".")),
+            #[cfg(test)]
+            Secrets::Memory(m) => Ok(m.lock().unwrap().clone()),
+            #[cfg(test)]
+            Secrets::Unavailable => bail!("no credential store"),
         }
     }
 
-    pub fn in_dir(dir: &Path) -> Self {
-        Paths { data: dir.join("data.db"), cache: dir.join("cache.db"), legacy_json: dir.join("store.json") }
+    fn set(&self, token: Option<&str>) -> Result<()> {
+        match self {
+            Secrets::Keyring(account) => {
+                let entry = Self::entry(account)?;
+                match token {
+                    Some(t) => entry.set_password(t)?,
+                    None => match entry.delete_credential() {
+                        Ok(()) | Err(keyring::Error::NoEntry) => {}
+                        Err(e) => return Err(e.into()),
+                    },
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Secrets::Memory(m) => {
+                *m.lock().unwrap() = token.map(str::to_owned);
+                Ok(())
+            }
+            #[cfg(test)]
+            Secrets::Unavailable => bail!("no credential store"),
+        }
     }
 }
 
@@ -93,6 +222,10 @@ struct Saved {
 pub struct Db {
     conn: Connection,
     saved: Saved,
+    secrets: Secrets,
+    /// The refresh token is in `main.settings` because the credential store
+    /// couldn't be used (or it was saved by an older version).
+    token_in_db: bool,
 }
 
 /// `data.db` was written by a newer version of the app; leave it alone.
@@ -190,7 +323,9 @@ pub fn open(paths: &Paths) -> Store {
         }
     };
 
-    let mut db = Db { conn, saved: Saved::default() };
+    let mut db = Db { conn, saved: Saved::default(), secrets: paths.secrets.clone(), token_in_db: false };
+    let mut data = data;
+    db.load_token(&mut data.google);
 
     if fresh || data.is_empty() {
         // Nothing saved yet: bring over the old JSON store, or start with defaults.
@@ -455,6 +590,48 @@ impl Db {
     /// Builds the in-memory store from what was loaded and remembers it as
     /// saved. An event in both the outbox and the cache is the outbox's
     /// (unconfirmed local edits win); the stale cached copy is dropped.
+    /// Fills in the refresh token. A token found in `main.settings` (saved by
+    /// an older version, or because the credential store failed last time) is
+    /// the newest one; it is moved into the credential store when possible.
+    fn load_token(&mut self, google: &mut GoogleSettings) {
+        if let Some(token) = &google.refresh_token {
+            match self.secrets.set(Some(token)) {
+                Ok(()) => match self.conn.execute("DELETE FROM main.settings WHERE key = 'google.refresh_token'", []) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("Could not remove the refresh token from data.db: {e}");
+                        self.token_in_db = true;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Credential store unavailable ({e:#}); the refresh token stays in data.db");
+                    self.token_in_db = true;
+                }
+            }
+            return;
+        }
+        match self.secrets.get() {
+            Ok(token) => google.refresh_token = token,
+            Err(e) => eprintln!("Could not read the refresh token from the credential store: {e:#}"),
+        }
+    }
+
+    /// Writes the refresh token to the credential store. Returns whether it
+    /// must go in `main.settings` instead, because that failed.
+    fn store_token(&mut self, token: Option<&String>) -> bool {
+        let changed = token != self.saved.google.refresh_token.as_ref();
+        if changed || self.token_in_db {
+            match self.secrets.set(token.map(String::as_str)) {
+                Ok(()) => self.token_in_db = false,
+                Err(e) => {
+                    eprintln!("Credential store unavailable ({e:#}); keeping the refresh token in data.db");
+                    self.token_in_db = true;
+                }
+            }
+        }
+        self.token_in_db
+    }
+
     fn assemble(mut self, data: DataPart, cache: CachePart) -> Store {
         let in_outbox: HashSet<String> = data.outbox.iter().map(|e| e.id.clone()).collect();
         let (stale, cached): (Vec<Event>, Vec<Event>) =
@@ -541,6 +718,8 @@ impl Db {
             return Ok(());
         }
 
+        let token_in_db = google_changed && self.store_token(s.google.refresh_token.as_ref());
+
         let tx = self.conn.transaction()?;
         for (p, id) in &deletes {
             tx.prepare_cached(&format!("DELETE FROM {} WHERE id = ?1", p.table()))?.execute([id])?;
@@ -554,7 +733,7 @@ impl Db {
             let rows = [
                 ("google.client_id", Some(&g.client_id)),
                 ("google.client_secret", Some(&g.client_secret)),
-                ("google.refresh_token", g.refresh_token.as_ref()),
+                ("google.refresh_token", g.refresh_token.as_ref().filter(|_| token_in_db)),
                 ("google.account_email", g.account_email.as_ref()),
             ];
             for (key, value) in rows {
@@ -623,17 +802,28 @@ mod tests {
     use crate::model::EventFields;
     use chrono::{NaiveDate, NaiveDateTime};
 
-    struct TempDir(PathBuf);
+    /// A scratch folder, plus an in-memory credential store that lasts as
+    /// long as it does.
+    struct TempDir(PathBuf, Secrets);
 
     impl TempDir {
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!("cleancalendar-db-{}", uuid::Uuid::new_v4().simple()));
             std::fs::create_dir_all(&dir).unwrap();
-            TempDir(dir)
+            TempDir(dir, Secrets::Memory(Default::default()))
         }
         fn paths(&self) -> Paths {
-            Paths::in_dir(&self.0)
+            Paths::in_dir(&self.0, self.1.clone())
         }
+        fn token(&self) -> Option<String> {
+            self.1.get().unwrap()
+        }
+    }
+
+    fn setting_keys(path: &Path) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut stmt = conn.prepare("SELECT key FROM settings ORDER BY key").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
     }
 
     impl Drop for TempDir {
@@ -845,6 +1035,93 @@ mod tests {
     }
 
     #[test]
+    fn the_refresh_token_is_kept_in_the_credential_store() {
+        let dir = TempDir::new();
+        drop(populated(&dir));
+        assert_eq!(dir.token().as_deref(), Some("refresh"));
+        assert_eq!(
+            setting_keys(&dir.paths().data),
+            ["google.account_email", "google.client_id", "google.client_secret"],
+            "no token in data.db"
+        );
+
+        let mut again = open(&dir.paths());
+        assert_eq!(again.google.refresh_token.as_deref(), Some("refresh"));
+        again.google.refresh_token = None; // signing out
+        again.save();
+        assert_eq!(dir.token(), None);
+        drop(again);
+        assert_eq!(open(&dir.paths()).google.refresh_token, None);
+    }
+
+    /// Round-trips a throwaway entry through the real OS credential store:
+    /// `cargo test real_credential_store -- --ignored`
+    #[test]
+    #[ignore]
+    fn real_credential_store() {
+        let s = Secrets::Keyring(format!("test-{}", uuid::Uuid::new_v4().simple()));
+        assert_eq!(s.get().unwrap(), None);
+        s.set(Some("secret")).unwrap();
+        assert_eq!(s.get().unwrap().as_deref(), Some("secret"));
+        s.set(None).unwrap();
+        assert_eq!(s.get().unwrap(), None);
+        s.set(None).unwrap(); // deleting twice is fine
+    }
+
+    #[test]
+    fn without_a_credential_store_the_token_stays_in_data_db() {
+        let dir = TempDir::new();
+        let broken = Paths { secrets: Secrets::Unavailable, ..dir.paths() };
+        let mut store = open(&broken);
+        store.google.client_id = "cid".into();
+        store.google.refresh_token = Some("rt".into());
+        store.save();
+        drop(store);
+        assert!(setting_keys(&dir.paths().data).contains(&"google.refresh_token".to_string()));
+        assert_eq!(open(&broken).google.refresh_token.as_deref(), Some("rt"));
+
+        // Once a credential store works, the token is moved into it.
+        let store = open(&dir.paths());
+        assert_eq!(store.google.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(dir.token().as_deref(), Some("rt"));
+        assert!(!setting_keys(&dir.paths().data).contains(&"google.refresh_token".to_string()));
+        drop(store);
+        assert_eq!(open(&dir.paths()).google.refresh_token.as_deref(), Some("rt"));
+    }
+
+    #[test]
+    fn files_in_the_old_folders_are_moved() {
+        let root = TempDir::new();
+        let old_data = root.0.join("Old").join("App").join("data");
+        let old_cache = root.0.join("OldLocal").join("App").join("cache");
+        std::fs::create_dir_all(&old_data).unwrap();
+        std::fs::create_dir_all(&old_cache).unwrap();
+        std::fs::write(old_data.join("data.db"), b"data").unwrap();
+        std::fs::write(old_data.join("store.json.migrated"), b"json").unwrap();
+        std::fs::write(old_cache.join("cache.db"), b"cache").unwrap();
+        let new = Paths {
+            data: root.0.join("New").join("data.db"),
+            cache: root.0.join("NewLocal").join("cache.db"),
+            legacy_json: root.0.join("New").join("store.json"),
+            secrets: root.1.clone(),
+        };
+
+        move_from_old_folders(&old_data, &old_cache, &new);
+        assert_eq!(std::fs::read(&new.data).unwrap(), b"data");
+        assert_eq!(std::fs::read(&new.cache).unwrap(), b"cache");
+        assert!(root.0.join("New").join("store.json.migrated").exists());
+        assert!(!root.0.join("Old").join("App").exists(), "empty old folders are removed");
+        assert!(!root.0.join("OldLocal").join("App").exists());
+
+        // Once the new folder has data, the old one is left alone.
+        std::fs::create_dir_all(&old_data).unwrap();
+        std::fs::write(old_data.join("data.db"), b"older").unwrap();
+        move_from_old_folders(&old_data, &old_cache, &new);
+        assert_eq!(std::fs::read(&new.data).unwrap(), b"data");
+        assert!(old_data.join("data.db").exists());
+    }
+
+    #[test]
     fn an_old_json_store_is_imported_once() {
         let dir = TempDir::new();
         let json = r#"{
@@ -868,6 +1145,8 @@ mod tests {
         let store = open(&dir.paths());
         assert_eq!(store.events.len(), 2);
         assert_eq!(store.google.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(dir.token().as_deref(), Some("rt"), "the imported token goes to the credential store");
+        assert!(!setting_keys(&dir.paths().data).contains(&"google.refresh_token".to_string()));
         assert!(!dir.paths().legacy_json.exists());
         assert!(dir.0.join("store.json.migrated").exists());
         drop(store);

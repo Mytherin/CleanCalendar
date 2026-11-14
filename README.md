@@ -66,14 +66,13 @@ Google requires every app to have its own OAuth client:
 
 Data is kept in two SQLite databases, split by who owns it:
 
-- **`data.db`: things only this computer has.** Google sign-in settings, the calendar list (with your colours and which are shown), events on local calendars, and changes to Google events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\CleanCalendar\data\` on Windows (`~/Library/Application Support/...` on macOS, `~/.local/share/...` on Linux).
-- **`cache.db`: a copy of Google.** Google events as last downloaded, plus the sync tokens. Lives in `%LOCALAPPDATA%\CleanCalendar\CleanCalendar\cache\` on Windows (`~/Library/Caches/...` on macOS, `~/.cache/...` on Linux). It is safe to delete: the next sync downloads everything again. If it can't be read, it is started over automatically.
+- **`data.db`: things only this computer has.** Google sign-in settings (client id, account), the calendar list (with your colours and which are shown), events on local calendars, and changes to Google events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\` on Windows (`~/Library/Application Support/CleanCalendar/` on macOS, `~/.local/share/cleancalendar/` on Linux).
+- **`cache.db`: a copy of Google.** Google events as last downloaded, plus the sync tokens. Lives in `%LOCALAPPDATA%\CleanCalendar\` on Windows (`~/Library/Caches/CleanCalendar/` on macOS, `~/.cache/cleancalendar/` on Linux), so it isn't carried around in a roaming profile. It is safe to delete: the next sync downloads everything again. If it can't be read, it is started over automatically.
+- **The Google refresh token** is kept in the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux) under `CleanCalendar` / `google-refresh-token`, not in either file. If no credential store is available it falls back to `data.db` (with a warning), and moves into the credential store once one works.
 
-The cache is attached to the same connection, so each save commits to both files at once. Only rows that changed are written. A `store.json` from an older version is imported on first start and renamed to `store.json.migrated`.
+The cache is attached to the same connection, so each save commits to both files at once. Only rows that changed are written. A `store.json` from an older version is imported on first start and renamed to `store.json.migrated`. Files in the folders older versions used (`%APPDATA%\CleanCalendar\CleanCalendar\data\`, `~/Library/Application Support/com.CleanCalendar.CleanCalendar/`) are moved over on first start.
 
-Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice.
-
-> **Note:** the Google refresh token is stored in `data.db` in plain text. Moving it into the OS keychain (e.g. with the `keyring` crate) is a good next step.
+Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (the token still goes to the credential store, under an entry named after that folder).
 
 ## Code layout
 
