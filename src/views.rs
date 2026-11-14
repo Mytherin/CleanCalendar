@@ -49,7 +49,11 @@ fn draw_text(ui: &Ui, painter: &egui::Painter, pos: Pos2, text: &str, font: Font
 /// fonts like Segoe UI reserve much more room above the caps than below the
 /// baseline. Measured from the real "H" glyph so it tracks the loaded font.
 fn cap_middle(ui: &Ui, font: FontId) -> f32 {
-    let g = ui.fonts(|f| f.layout_no_wrap("H".to_owned(), font, Color32::WHITE));
+    cap_middle_in(ui.ctx(), font)
+}
+
+fn cap_middle_in(ctx: &egui::Context, font: FontId) -> f32 {
+    let g = ctx.fonts(|f| f.layout_no_wrap("H".to_owned(), font, Color32::WHITE));
     match g.rows.first().and_then(|r| r.glyphs.first()) {
         Some(h) if h.uv_rect.size.y > 0.0 => h.pos.y + h.uv_rect.offset.y + h.uv_rect.size.y / 2.0,
         _ => g.size().y / 2.0,
@@ -153,13 +157,34 @@ fn is_selected(app: &App, ev: &Event) -> bool {
     app.selected.as_deref() == Some(ev.id.as_str())
 }
 
+/// One line of text placed by `align` horizontally, with its capitals
+/// vertically centered on `pos.y` (see [`cap_middle`]).
+fn text_cap_centered(painter: &egui::Painter, pos: Pos2, align: Align2, text: &str, font: FontId, color: Color32) {
+    let top = (pos.y - cap_middle_in(painter.ctx(), font.clone())).round();
+    let g = painter.layout_no_wrap(text.to_owned(), font, color);
+    let x = match align.x() {
+        egui::Align::Min => pos.x,
+        egui::Align::Center => pos.x - g.size().x / 2.0,
+        egui::Align::Max => pos.x - g.size().x,
+    };
+    painter.galley(Pos2::new(x, top), g, color);
+}
+
+/// Size of the red "today" badge behind a day number: a circle for one or
+/// two digits, a pill for longer labels ("Nov 1").
+fn badge_size(painter: &egui::Painter, text: &str, font: &FontId) -> Vec2 {
+    let w = painter.layout_no_wrap(text.to_owned(), theme::bold_font(font.size), Color32::WHITE).size().x;
+    let h = font.size + 8.0;
+    Vec2::new((w + 10.0).max(h), h)
+}
+
 fn day_number_badge(painter: &egui::Painter, center: Pos2, text: &str, is_today: bool, font: FontId, color: Color32) {
     if is_today {
-        let w = (text.len() as f32 * font.size * 0.32).max(font.size * 0.62);
-        painter.rect_filled(Rect::from_center_size(center, Vec2::new(w * 2.0 + 4.0, font.size + 8.0)), 50.0, RED);
-        painter.text(center, Align2::CENTER_CENTER, text, theme::bold_font(font.size), Color32::WHITE);
+        let size = badge_size(painter, text, &font);
+        painter.rect_filled(Rect::from_center_size(center, size), size.y / 2.0, RED);
+        text_cap_centered(painter, center, Align2::CENTER_CENTER, text, theme::bold_font(font.size), Color32::WHITE);
     } else {
-        painter.text(center, Align2::CENTER_CENTER, text, font, color);
+        text_cap_centered(painter, center, Align2::CENTER_CENTER, text, font, color);
     }
 }
 
@@ -342,8 +367,10 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
 
     let painter = ui.painter_at(rect);
     for i in 0..7 {
-        let x = rect.left() + (i as f32 + 1.0) * lay.cell_w - 8.0;
-        painter.text(
+        // Right-aligned with the day numbers below.
+        let x = rect.left() + (i as f32 + 1.0) * lay.cell_w - layout::MONTH_NUMBER_INSET;
+        text_cap_centered(
+            &painter,
             Pos2::new(x, rect.top() + lay.header_h / 2.0),
             Align2::RIGHT_CENTER,
             weekday_short(i),
@@ -411,7 +438,8 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
 
     for &(_, more, r) in &lay.more {
-        painter.text(r.min, Align2::LEFT_TOP, format!("+{more} more"), theme::font(11.5), p.secondary);
+        // Lined up with the event titles above it.
+        draw_text_centered(ui, &painter, r.left() + 11.0, r, &format!("+{more} more"), theme::font(11.5), p.secondary, r.width() - 11.0);
     }
 }
 
@@ -489,9 +517,12 @@ fn paint_day_headers(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayo
         } else {
             let label_w = text_galley(ui, wd, font.clone(), color, 100.0).size().x;
             let nw = text_galley(ui, &num, font.clone(), color, 50.0).size().x;
-            let x0 = x + (g.col_w - (label_w + 6.0 + nw)) / 2.0;
-            painter.text(Pos2::new(x0, cy), Align2::LEFT_CENTER, wd, font.clone(), color);
-            day_number_badge(painter, Pos2::new(x0 + label_w + 6.0 + nw / 2.0, cy), &num, is_today, font, color);
+            // Today's number sits in a badge wider than the digits; keep
+            // the same gap between the weekday and the badge's edge.
+            let (gap, num_w) = if is_today { (4.0, badge_size(painter, &num, &font).x) } else { (6.0, nw) };
+            let x0 = (x + (g.col_w - (label_w + gap + num_w)) / 2.0).round();
+            text_cap_centered(painter, Pos2::new(x0, cy), Align2::LEFT_CENTER, wd, font.clone(), color);
+            day_number_badge(painter, Pos2::new(x0 + label_w + gap + num_w / 2.0, cy), &num, is_today, font, color);
         }
     }
 }
