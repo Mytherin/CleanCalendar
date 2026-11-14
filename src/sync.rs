@@ -14,7 +14,7 @@ use chrono::{Duration, NaiveDate};
 
 use crate::dates::{add_months, first_of_month};
 use crate::google::{self, CalendarChanges, Cmd, Creds, Failure, Msg, RemoteCalendar};
-use crate::model::{Calendar, Event, PendingDelete, Source, Store};
+use crate::model::{Calendar, Event, EventFields, PendingDelete, Source, Store};
 
 /// Incremental syncs only report changes, so recurring-event occurrences
 /// that slide into the sync window are picked up by a periodic full sync.
@@ -28,8 +28,6 @@ pub enum Notice {
     Status { text: String, error: bool },
     /// An event got a new id after its first upload.
     Renamed { from: String, to: String },
-    /// An event was removed because it no longer exists on Google.
-    Removed(String),
 }
 
 #[derive(Default)]
@@ -121,11 +119,24 @@ impl SyncEngine {
         self.push(store, id);
     }
 
-    /// Call when an event leaves a Google calendar (deleted, or moved to
-    /// another calendar), with the event as it was before.
-    pub fn event_deleted(&mut self, store: &mut Store, ev: &Event) {
+    /// Call *before* changing an event: remembers the version Google
+    /// confirmed, so a later conflict can be merged field by field.
+    pub fn before_change(&mut self, store: &mut Store, id: &str) {
+        let Some(ev) = store.event(id) else { return };
+        if ev.base.is_none() && ev.remote_id.is_some() && store.google_calendar_of(ev).is_some() {
+            let fields = ev.fields();
+            store.event_mut(id).unwrap().base = Some(fields);
+        }
+    }
+
+    /// Call when an event leaves a Google calendar, with the event as it was
+    /// before. `user_deleted`: the user deleted it, so the remote delete only
+    /// applies if nobody changed it meanwhile (their change wins). Otherwise
+    /// (moved to another calendar) the old copy is removed unconditionally.
+    pub fn event_deleted(&mut self, store: &mut Store, ev: &Event, user_deleted: bool) {
         if let (Some(gcal), Some(rid)) = (store.google_calendar_of(ev), ev.remote_id.clone()) {
-            self.queue_delete(store, gcal, rid);
+            let etag = if user_deleted { ev.etag.clone() } else { None };
+            self.queue_delete(store, PendingDelete { google_calendar_id: gcal, remote_id: rid, etag });
         }
         // Never uploaded: if an upload is in flight, `on_saved` notices the
         // event is gone and deletes the copy it created.
@@ -145,13 +156,17 @@ impl SyncEngine {
     fn send_delete(&mut self, store: &Store, d: PendingDelete) {
         let Some(creds) = creds(store) else { return };
         if self.in_flight.insert(format!("del:{}", d.remote_id)) {
-            self.outbox.push(Cmd::Delete { creds, google_calendar_id: d.google_calendar_id, remote_id: d.remote_id });
+            self.outbox.push(Cmd::Delete {
+                creds,
+                google_calendar_id: d.google_calendar_id,
+                remote_id: d.remote_id,
+                etag: d.etag,
+            });
         }
     }
 
-    fn queue_delete(&mut self, store: &mut Store, google_calendar_id: String, remote_id: String) {
-        let d = PendingDelete { google_calendar_id, remote_id };
-        if !store.pending_deletes.contains(&d) {
+    fn queue_delete(&mut self, store: &mut Store, d: PendingDelete) {
+        if !store.pending_deletes.iter().any(|p| p.remote_id == d.remote_id) {
             store.pending_deletes.push(d.clone());
         }
         self.send_delete(store, d);
@@ -200,11 +215,27 @@ impl SyncEngine {
                 self.status(format!("Couldn't sync with Google: {e}"), true);
                 self.sync_finished(store, today);
             }
-            Msg::Saved { local_id, google_calendar_id, rev, remote_id } => {
-                self.on_saved(store, local_id, google_calendar_id, rev, remote_id)
+            Msg::Saved { local_id, google_calendar_id, rev, remote_id, etag } => {
+                self.on_saved(store, local_id, google_calendar_id, rev, remote_id, etag)
             }
             Msg::SaveFailed { local_id, google_calendar_id, error, kind } => {
                 self.on_save_failed(store, local_id, google_calendar_id, error, kind, today)
+            }
+            Msg::SaveConflict { local_id, server } => {
+                self.in_flight.remove(&format!("save:{local_id}"));
+                self.resolve_save_conflict(store, &local_id, server);
+            }
+            Msg::DeleteConflict { remote_id, google_calendar_id, server } => {
+                self.in_flight.remove(&format!("del:{remote_id}"));
+                store.pending_deletes.retain(|d| d.remote_id != remote_id);
+                // Their change beats our delete: bring the event back.
+                if let Some(ev) = server {
+                    let id = google::local_event_id(&google_calendar_id, &remote_id);
+                    if store.event(&id).is_none() {
+                        self.status(format!("“{}” was changed on another device, so it wasn't deleted", ev.title), true);
+                        store.events.push(ev);
+                    }
+                }
             }
             Msg::Deleted { remote_id } => {
                 self.in_flight.remove(&format!("del:{remote_id}"));
@@ -232,22 +263,36 @@ impl SyncEngine {
         }
     }
 
-    fn on_saved(&mut self, store: &mut Store, local_id: String, gcal: String, rev: u64, remote_id: String) {
+    fn on_saved(
+        &mut self,
+        store: &mut Store,
+        local_id: String,
+        gcal: String,
+        rev: u64,
+        remote_id: String,
+        etag: Option<String>,
+    ) {
         self.in_flight.remove(&format!("save:{local_id}"));
         let still_there =
             store.event(&local_id).is_some_and(|ev| store.google_calendar_of(ev).as_deref() == Some(gcal.as_str()));
         if !still_there {
             // Deleted (or moved to another calendar) while the upload was in
             // flight: remove the copy that just landed on Google.
-            self.queue_delete(store, gcal, remote_id);
+            self.queue_delete(store, PendingDelete { google_calendar_id: gcal, remote_id, etag: None });
             return;
         }
         let new_id = google::local_event_id(&gcal, &remote_id);
         let ev = store.event_mut(&local_id).unwrap();
         ev.remote_id = Some(remote_id);
         ev.id = new_id.clone();
+        ev.etag = etag;
         if ev.rev == rev {
             ev.pending = false;
+            ev.base = None;
+        } else {
+            // Edited again meanwhile: what Google has now is what we sent.
+            // (`base` stays the older snapshot; merging against it only
+            // makes our side win more often, never loses their changes.)
         }
         let changed_again = ev.pending;
         if new_id != local_id {
@@ -272,21 +317,96 @@ impl SyncEngine {
         match kind {
             // Stays pending; the next sync retries it.
             Failure::Retry => self.status(OFFLINE, true),
-            Failure::Gone => {
-                // Deleted on Google by someone else; their delete wins.
-                store.events.retain(|e| e.id != local_id);
-                self.notices.push(Notice::Removed(local_id));
-                self.status(format!("“{title}” was deleted on Google"), true);
-            }
-            Failure::Rejected => {
+            // Creating failed because the calendar itself is gone (updates of
+            // deleted events arrive as conflicts instead), or Google refused.
+            Failure::Gone | Failure::Rejected => {
                 if let Some(ev) = store.event_mut(&local_id) {
                     ev.pending = false;
+                    ev.base = None;
                 }
                 self.status(format!("Google rejected changes to “{title}”: {error}"), true);
                 self.force_full_sync(store, &gcal, today);
             }
         }
     }
+
+    /// Our upload was refused because the event changed on Google first.
+    /// Edits are never silently dropped: fields changed on only one side
+    /// are combined, and if both sides changed the same field, ours wins.
+    /// If the event was deleted there, our edited version is recreated.
+    fn resolve_save_conflict(&mut self, store: &mut Store, local_id: &str, server: Option<Event>) {
+        let Some(ev) = store.event_mut(local_id) else {
+            // Deleted here meanwhile; that delete is queued separately.
+            return;
+        };
+        let title = ev.title.clone();
+        match server {
+            None => {
+                ev.remote_id = None;
+                ev.recurring_id = None;
+                ev.etag = None;
+                ev.base = None;
+                ev.pending = true;
+                self.status(format!("“{title}” was deleted on another device; your edited version was kept"), true);
+            }
+            Some(srv) => {
+                let theirs = srv.fields();
+                let base = ev.base.clone().unwrap_or_else(|| theirs.clone());
+                let (merged, clashes) = merge_fields(&base, &ev.fields(), &theirs);
+                ev.set_fields(merged.clone());
+                ev.etag = srv.etag;
+                ev.recurring_id = srv.recurring_id;
+                if merged == theirs {
+                    // Nothing of ours left to send.
+                    ev.pending = false;
+                    ev.base = None;
+                } else {
+                    ev.base = Some(theirs);
+                }
+                let text = if clashes.is_empty() {
+                    format!("Merged your changes to “{title}” with changes from another device")
+                } else {
+                    format!(
+                        "“{title}” was also changed on another device; kept your {}",
+                        clashes.join(" and ")
+                    )
+                };
+                self.status(text, !clashes.is_empty());
+            }
+        }
+        self.push(store, local_id);
+    }
+}
+
+/// Three-way merge of event fields. A field changed on only one side takes
+/// that side's value; changed differently on both sides, ours wins and the
+/// field is reported as a clash. Start, end, and all-day move together.
+fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) -> (EventFields, Vec<&'static str>) {
+    let mut clashes = Vec::new();
+    // Whether to take our value for one field (or field group).
+    let mut take_ours = |name: &'static str, base, ours, theirs| {
+        let ours_changed = ours != base;
+        if ours_changed && theirs != base && ours != theirs {
+            clashes.push(name);
+        }
+        ours_changed
+    };
+    let when = |f: &EventFields| format!("{} {} {}", f.start, f.end, f.all_day);
+    let take_title = take_ours("title", base.title.clone(), ours.title.clone(), theirs.title.clone());
+    let take_loc = take_ours("location", base.location.clone(), ours.location.clone(), theirs.location.clone());
+    let take_notes = take_ours("notes", base.notes.clone(), ours.notes.clone(), theirs.notes.clone());
+    let take_when = take_ours("time", when(base), when(ours), when(theirs));
+
+    let from = |take_ours: bool| if take_ours { ours } else { theirs };
+    let merged = EventFields {
+        title: from(take_title).title.clone(),
+        location: from(take_loc).location.clone(),
+        notes: from(take_notes).notes.clone(),
+        start: from(take_when).start,
+        end: from(take_when).end,
+        all_day: from(take_when).all_day,
+    };
+    (merged, clashes)
 }
 
 /// Brings the calendar list in line with Google's.
@@ -398,6 +518,8 @@ mod tests {
             recurring_id: None,
             pending: false,
             rev: 0,
+            etag: None,
+            base: None,
         }
     }
 
@@ -465,7 +587,13 @@ mod tests {
     }
 
     fn saved(local_id: &str, rev: u64, remote_id: &str) -> Msg {
-        Msg::Saved { local_id: local_id.into(), google_calendar_id: CAL.into(), rev, remote_id: remote_id.into() }
+        Msg::Saved {
+            local_id: local_id.into(),
+            google_calendar_id: CAL.into(),
+            rev,
+            remote_id: remote_id.into(),
+            etag: Some(format!("etag-{rev}")),
+        }
     }
 
     fn save_failed(local_id: &str, kind: Failure) -> Msg {
@@ -477,6 +605,7 @@ mod tests {
     }
 
     fn edit(store: &mut Store, engine: &mut SyncEngine, id: &str, title: &str) {
+        engine.before_change(store, id);
         store.event_mut(id).unwrap().title = title.into();
         engine.event_changed(store, id);
     }
@@ -593,7 +722,7 @@ mod tests {
         let mut engine = SyncEngine::default();
 
         store.events.clear();
-        engine.event_deleted(&mut store, &ev);
+        engine.event_deleted(&mut store, &ev, true);
         assert_eq!(sent(&mut engine), [Sent::Delete("a".into())]);
 
         let failed = Msg::DeleteFailed {
@@ -624,7 +753,7 @@ mod tests {
         sent(&mut engine);
         let ev = store.event("local:x").unwrap().clone();
         store.events.clear();
-        engine.event_deleted(&mut store, &ev);
+        engine.event_deleted(&mut store, &ev, true);
         assert!(sent(&mut engine).is_empty(), "nothing to delete remotely yet");
 
         // The upload lands after all: delete what it created.
@@ -639,7 +768,7 @@ mod tests {
         let mut store = store_with(vec![]);
         store.sync_state.insert(CAL.into(), SyncState { token: Some("t".into()), full_sync_on: Some(today()) });
         let mut engine = SyncEngine::default();
-        engine.event_deleted(&mut store, &ev);
+        engine.event_deleted(&mut store, &ev, true);
         sent(&mut engine);
 
         let refused = Msg::DeleteFailed {
@@ -656,16 +785,196 @@ mod tests {
 
     // ---- failures --------------------------------------------------------
 
-    #[test]
-    fn edit_to_event_deleted_on_google_is_dropped() {
+    // ---- conflicts -------------------------------------------------------
+
+    /// Google's copy of event "a" after another device changed it.
+    fn theirs(change: impl FnOnce(&mut Event)) -> Event {
+        let mut ev = gev("a", "Standup");
+        ev.etag = Some("theirs".into());
+        change(&mut ev);
+        ev
+    }
+
+    fn conflict(server: Option<Event>) -> Msg {
+        Msg::SaveConflict { local_id: google::local_event_id(CAL, "a"), server }
+    }
+
+    fn statuses(engine: &SyncEngine) -> Vec<String> {
+        engine
+            .notices
+            .iter()
+            .filter_map(|n| match n {
+                Notice::Status { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Store with event "a" (title "Standup", 9:00–10:00) that we've edited
+    /// locally with `ours`; the upload is out.
+    fn edited_locally(ours: impl FnOnce(&mut Event)) -> (Store, SyncEngine, String) {
         let id = google::local_event_id(CAL, "a");
-        let mut store = store_with(vec![gev("a", "x")]);
+        let mut original = gev("a", "Standup");
+        original.etag = Some("v1".into());
+        let mut store = store_with(vec![original]);
+        let mut engine = SyncEngine::default();
+        engine.before_change(&mut store, &id);
+        ours(store.event_mut(&id).unwrap());
+        engine.event_changed(&mut store, &id);
+        sent(&mut engine);
+        (store, engine, id)
+    }
+
+    #[test]
+    fn uploads_carry_the_version_they_were_based_on() {
+        let id = google::local_event_id(CAL, "a");
+        let mut ev = gev("a", "Standup");
+        ev.etag = Some("v1".into());
+        let mut store = store_with(vec![ev]);
         let mut engine = SyncEngine::default();
 
-        edit(&mut store, &mut engine, &id, "y");
-        engine.handle(&mut store, save_failed(&id, Failure::Gone), None, today());
-        assert!(store.events.is_empty());
-        assert!(engine.notices.contains(&Notice::Removed(id)));
+        edit(&mut store, &mut engine, &id, "Daily standup");
+        match &engine.outbox[0] {
+            Cmd::Save { event, .. } => assert_eq!(event.etag.as_deref(), Some("v1")),
+            _ => panic!("expected a save"),
+        }
+        assert_eq!(store.event(&id).unwrap().base.as_ref().unwrap().title, "Standup", "snapshot taken");
+
+        engine.handle(&mut store, saved(&id, 1, "a"), None, today());
+        let ev = store.event(&id).unwrap();
+        assert_eq!(ev.etag.as_deref(), Some("etag-1"), "new version remembered");
+        assert_eq!(ev.base, None, "snapshot dropped once confirmed");
+    }
+
+    #[test]
+    fn concurrent_edits_to_different_fields_are_merged() {
+        // We moved it to 11:00; the other device renamed it.
+        let (mut store, mut engine, id) = edited_locally(|e| {
+            e.start += Duration::hours(2);
+            e.end += Duration::hours(2);
+        });
+        engine.handle(&mut store, conflict(Some(theirs(|e| e.title = "Standup (room 2)".into()))), None, today());
+
+        let ev = store.event(&id).unwrap();
+        assert_eq!(ev.title, "Standup (room 2)", "their rename kept");
+        assert_eq!(ev.start.time(), chrono::NaiveTime::from_hms_opt(11, 0, 0).unwrap(), "our move kept");
+        assert!(ev.pending);
+        assert_eq!(ev.etag.as_deref(), Some("theirs"), "next upload is based on their version");
+        assert_eq!(sent(&mut engine), [save(&id, 1, Some("a"))], "merged result uploaded");
+        assert!(statuses(&engine)[0].starts_with("Merged your changes"));
+    }
+
+    #[test]
+    fn concurrent_edits_to_the_same_field_keep_ours_and_say_so() {
+        let (mut store, mut engine, id) = edited_locally(|e| e.title = "Ours".into());
+        engine.handle(
+            &mut store,
+            conflict(Some(theirs(|e| {
+                e.title = "Theirs".into();
+                e.location = "Room 9".into();
+            }))),
+            None,
+            today(),
+        );
+        let ev = store.event(&id).unwrap();
+        assert_eq!((ev.title.as_str(), ev.location.as_str()), ("Ours", "Room 9"));
+        assert_eq!(sent(&mut engine).len(), 1);
+        let status = &statuses(&engine)[0];
+        assert!(status.contains("kept your title"), "{status}");
+    }
+
+    #[test]
+    fn identical_concurrent_edits_need_no_upload() {
+        let (mut store, mut engine, id) = edited_locally(|e| e.title = "Renamed".into());
+        engine.handle(&mut store, conflict(Some(theirs(|e| e.title = "Renamed".into()))), None, today());
+        let ev = store.event(&id).unwrap();
+        assert!(!ev.pending);
+        assert_eq!(ev.base, None);
+        assert!(sent(&mut engine).is_empty());
+    }
+
+    #[test]
+    fn edit_beats_delete_on_another_device() {
+        let (mut store, mut engine, id) = edited_locally(|e| e.title = "Still needed".into());
+        engine.handle(&mut store, conflict(None), None, today());
+
+        let ev = store.event(&id).unwrap();
+        assert_eq!((ev.title.as_str(), ev.remote_id.as_deref()), ("Still needed", None));
+        // Recreated on Google.
+        assert_eq!(sent(&mut engine), [save(&id, 1, None)]);
+        assert!(statuses(&engine)[0].contains("your edited version was kept"));
+    }
+
+    #[test]
+    fn edit_on_another_device_beats_our_delete() {
+        let mut ev = gev("a", "Standup");
+        ev.etag = Some("v1".into());
+        let mut store = store_with(vec![]);
+        let mut engine = SyncEngine::default();
+        engine.event_deleted(&mut store, &ev, true);
+        match &engine.outbox[0] {
+            Cmd::Delete { etag, .. } => assert_eq!(etag.as_deref(), Some("v1"), "delete only that version"),
+            _ => panic!("expected a delete"),
+        }
+        sent(&mut engine);
+
+        let msg = Msg::DeleteConflict {
+            remote_id: "a".into(),
+            google_calendar_id: CAL.into(),
+            server: Some(theirs(|e| e.title = "Standup, moved".into())),
+        };
+        engine.handle(&mut store, msg, None, today());
+        assert_eq!(titles(&store), ["Standup, moved"], "restored with their change");
+        assert!(store.pending_deletes.is_empty());
+        assert!(statuses(&engine)[0].contains("wasn't deleted"));
+    }
+
+    #[test]
+    fn moving_to_another_calendar_removes_the_old_copy_unconditionally() {
+        let mut ev = gev("a", "Standup");
+        ev.etag = Some("v1".into());
+        let mut store = store_with(vec![]);
+        let mut engine = SyncEngine::default();
+        engine.event_deleted(&mut store, &ev, false);
+        match &engine.outbox[0] {
+            Cmd::Delete { etag, .. } => assert_eq!(*etag, None),
+            _ => panic!("expected a delete"),
+        }
+    }
+
+    #[test]
+    fn a_sync_during_a_conflict_does_not_lose_our_edit() {
+        let (mut store, mut engine, id) = edited_locally(|e| e.notes = "bring slides".into());
+        // A pull arrives with their newer copy before our upload is answered.
+        let theirs_now = theirs(|e| e.title = "Standup v2".into());
+        engine.handle(&mut store, synced(changes(true, vec![theirs_now.clone()], &[], None)), None, today());
+        assert_eq!(store.event(&id).unwrap().notes, "bring slides", "pending edit kept");
+        // Then the upload is refused, and the merge combines both.
+        engine.handle(&mut store, conflict(Some(theirs_now)), None, today());
+        let ev = store.event(&id).unwrap();
+        assert_eq!((ev.title.as_str(), ev.notes.as_str()), ("Standup v2", "bring slides"));
+    }
+
+    #[test]
+    fn merge_rules() {
+        let base = gev("a", "T").fields();
+        let with = |f: fn(&mut EventFields)| {
+            let mut x = base.clone();
+            f(&mut x);
+            x
+        };
+        let ours = with(|f| f.notes = "ours".into());
+        let theirs = with(|f| f.location = "theirs".into());
+        let (m, clashes) = merge_fields(&base, &ours, &theirs);
+        assert_eq!((m.notes.as_str(), m.location.as_str()), ("ours", "theirs"));
+        assert!(clashes.is_empty());
+
+        // Time fields move as one: their all-day switch vs our new start.
+        let ours = with(|f| f.start += Duration::minutes(30));
+        let theirs = with(|f| f.all_day = true);
+        let (m, clashes) = merge_fields(&base, &ours, &theirs);
+        assert_eq!((m.start, m.all_day), (ours.start, false));
+        assert_eq!(clashes, ["time"]);
     }
 
     #[test]

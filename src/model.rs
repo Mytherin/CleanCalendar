@@ -71,9 +71,48 @@ pub struct Event {
     /// upload doesn't clear `pending` for a newer edit.
     #[serde(default)]
     pub rev: u64,
+    /// The remote version tag of the copy we last saw. Uploads send it so
+    /// the server refuses them if someone else changed the event meanwhile.
+    #[serde(default)]
+    pub etag: Option<String>,
+    /// While local edits are pending: the event as the server last had it.
+    /// With it, a conflict can be merged field by field (three-way merge).
+    #[serde(default)]
+    pub base: Option<EventFields>,
+}
+
+/// The user-editable parts of an event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EventFields {
+    pub title: String,
+    pub location: String,
+    pub notes: String,
+    pub start: NaiveDateTime,
+    pub end: NaiveDateTime,
+    pub all_day: bool,
 }
 
 impl Event {
+    pub fn fields(&self) -> EventFields {
+        EventFields {
+            title: self.title.clone(),
+            location: self.location.clone(),
+            notes: self.notes.clone(),
+            start: self.start,
+            end: self.end,
+            all_day: self.all_day,
+        }
+    }
+
+    pub fn set_fields(&mut self, f: EventFields) {
+        self.title = f.title;
+        self.location = f.location;
+        self.notes = f.notes;
+        self.start = f.start;
+        self.end = f.end;
+        self.all_day = f.all_day;
+    }
+
     pub fn occurs_on(&self, day: NaiveDate) -> bool {
         let ds = day.and_hms_opt(0, 0, 0).unwrap();
         let de = ds + Duration::days(1);
@@ -112,6 +151,9 @@ impl GoogleSettings {
 pub struct PendingDelete {
     pub google_calendar_id: String,
     pub remote_id: String,
+    /// Delete only if the server still has this version (`None`: always).
+    #[serde(default)]
+    pub etag: Option<String>,
 }
 
 /// Per-calendar incremental sync bookmark.

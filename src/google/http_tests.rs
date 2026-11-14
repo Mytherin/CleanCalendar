@@ -18,6 +18,7 @@ struct Req {
     path: String,
     query: Vec<(String, String)>,
     auth: Option<String>,
+    if_match: Option<String>,
     body: String,
 }
 
@@ -62,7 +63,15 @@ impl FakeServer {
     }
 
     fn client(&self) -> Client {
-        Client::with_endpoints(creds(), &format!("{}/calendar/v3", self.base), &format!("{}/token", self.base))
+        Client::new(creds(), &self.endpoints())
+    }
+
+    fn endpoints(&self) -> Endpoints {
+        Endpoints {
+            auth: format!("{}/auth", self.base),
+            token: format!("{}/token", self.base),
+            api: format!("{}/calendar/v3", self.base),
+        }
     }
 
     /// Requests received so far, excluding token refreshes.
@@ -85,6 +94,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Req> {
 
     let mut content_length = 0;
     let mut auth = None;
+    let mut if_match = None;
     loop {
         let mut h = String::new();
         reader.read_line(&mut h).ok()?;
@@ -96,6 +106,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Req> {
         match name.to_ascii_lowercase().as_str() {
             "content-length" => content_length = value.trim().parse().ok()?,
             "authorization" => auth = Some(value.trim().to_owned()),
+            "if-match" => if_match = Some(value.trim().to_owned()),
             _ => {}
         }
     }
@@ -104,7 +115,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> Option<Req> {
 
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     let query = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
-    Some(Req { method, path: path.to_owned(), query, auth, body: String::from_utf8_lossy(&body).into_owned() })
+    Some(Req { method, path: path.to_owned(), query, auth, if_match, body: String::from_utf8_lossy(&body).into_owned() })
 }
 
 fn creds() -> Creds {
@@ -300,6 +311,8 @@ fn local_event(remote_id: Option<&str>) -> Event {
         recurring_id: None,
         pending: true,
         rev: 3,
+        etag: None,
+        base: None,
     }
 }
 
@@ -312,8 +325,8 @@ fn new_events_are_posted_and_existing_ones_patched() {
         _ => (405, Value::Null),
     });
     let mut c = server.client();
-    assert_eq!(c.save_event("primary", &local_event(None)).unwrap(), "new1");
-    assert_eq!(c.save_event("primary", &local_event(Some("e1"))).unwrap(), "e1");
+    assert_eq!(c.save_event("primary", &local_event(None)).unwrap().0, "new1");
+    assert_eq!(c.save_event("primary", &local_event(Some("e1"))).unwrap().0, "e1");
 
     let reqs = server.api_requests();
     assert_eq!((reqs[0].method.as_str(), reqs[0].path.as_str()), ("POST", CAL_EVENTS));
@@ -351,10 +364,10 @@ fn deleting_an_already_deleted_event_succeeds() {
         _ => google_error(500, "Backend Error"),
     });
     let mut c = server.client();
-    c.delete_event("primary", "gone").unwrap();
-    c.delete_event("primary", "missing").unwrap();
-    c.delete_event("primary", "ok").unwrap();
-    let err = c.delete_event("primary", "broken").unwrap_err();
+    c.delete_event("primary", "gone", None).unwrap();
+    c.delete_event("primary", "missing", None).unwrap();
+    c.delete_event("primary", "ok", None).unwrap();
+    let err = c.delete_event("primary", "broken", None).unwrap_err();
     assert_eq!(classify(&err), Failure::Retry);
     assert!(server.api_requests().iter().all(|r| r.method == "DELETE"));
 }
@@ -372,20 +385,131 @@ fn worker_reports_save_results_with_revision_and_failure_kind() {
     let mut client = Some(server.client());
     let save = |ev: Event| Cmd::Save { creds: creds(), google_calendar_id: "primary".into(), event: ev };
 
-    match run(&mut client, save(local_event(None))) {
-        Msg::Saved { local_id, rev, remote_id, google_calendar_id } => {
+    match run(&mut client, &server.endpoints(), &no_browser, save(local_event(None))) {
+        Msg::Saved { local_id, rev, remote_id, google_calendar_id, .. } => {
             assert_eq!((local_id.as_str(), rev, remote_id.as_str()), ("local:1", 3, "new1"));
             assert_eq!(google_calendar_id, "primary");
         }
         _ => panic!("expected Saved"),
     }
-    match run(&mut client, save(local_event(Some("deleted-elsewhere")))) {
-        Msg::SaveFailed { kind, error, .. } => {
-            assert_eq!(kind, Failure::Gone);
-            assert!(error.contains("Not Found"), "{error}");
+    // Updating an event someone deleted is a conflict, not a failure.
+    match run(&mut client, &server.endpoints(), &no_browser, save(local_event(Some("deleted-elsewhere")))) {
+        Msg::SaveConflict { local_id, server } => {
+            assert_eq!(local_id, "local:1");
+            assert!(server.is_none());
         }
-        _ => panic!("expected SaveFailed"),
+        _ => panic!("expected SaveConflict"),
     }
+}
+
+// ---- conflicts and duplicates ------------------------------------------------
+
+#[test]
+fn updates_and_deletes_send_the_version_they_are_based_on() {
+    let server = FakeServer::start(|r| match (r.path.as_str(), r.method.as_str()) {
+        ("/token", _) => token_ok(),
+        (_, "PATCH") => (200, json!({"id": "e1", "etag": "\"v2\""})),
+        (_, "DELETE") => (204, Value::Null),
+        _ => (405, Value::Null),
+    });
+    let mut c = server.client();
+    let mut ev = local_event(Some("e1"));
+    ev.etag = Some("\"v1\"".into());
+    let (_, etag) = c.save_event("primary", &ev).unwrap();
+    assert_eq!(etag.as_deref(), Some("\"v2\""), "new version returned");
+    c.delete_event("primary", "e1", Some("\"v2\"")).unwrap();
+    c.delete_event("primary", "e2", None).unwrap();
+
+    let reqs = server.api_requests();
+    assert_eq!(reqs[0].if_match.as_deref(), Some("\"v1\""));
+    assert_eq!(reqs[1].if_match.as_deref(), Some("\"v2\""));
+    assert_eq!(reqs[2].if_match, None, "unconditional delete");
+}
+
+#[test]
+fn update_refused_as_stale_returns_googles_current_copy() {
+    let server = FakeServer::start(|r| match (r.path.as_str(), r.method.as_str()) {
+        ("/token", _) => token_ok(),
+        (_, "PATCH") => google_error(412, "Precondition Failed"),
+        (p, "GET") if p.ends_with("/e1") => {
+            let mut v = item("e1", "Renamed on phone");
+            v["etag"] = json!("\"v9\"");
+            (200, v)
+        }
+        (p, "GET") if p.ends_with("/e2") => (200, json!({"id": "e2", "status": "cancelled"})),
+        _ => (405, Value::Null),
+    });
+    let mut client = Some(server.client());
+    let save = |rid: &str| {
+        let mut ev = local_event(Some(rid));
+        ev.etag = Some("\"v1\"".into());
+        Cmd::Save { creds: creds(), google_calendar_id: "primary".into(), event: ev }
+    };
+    match run(&mut client, &server.endpoints(), &no_browser, save("e1")) {
+        Msg::SaveConflict { server: Some(ev), .. } => {
+            assert_eq!(ev.title, "Renamed on phone");
+            assert_eq!(ev.etag.as_deref(), Some("\"v9\""));
+        }
+        _ => panic!("expected a conflict with their copy"),
+    }
+    // Deleted events can still be fetched, marked cancelled: that's "gone".
+    match run(&mut client, &server.endpoints(), &no_browser, save("e2")) {
+        Msg::SaveConflict { server: None, .. } => {}
+        _ => panic!("expected a conflict without a copy"),
+    }
+}
+
+#[test]
+fn delete_refused_as_stale_returns_googles_current_copy() {
+    let server = FakeServer::start(|r| match (r.path.as_str(), r.method.as_str()) {
+        ("/token", _) => token_ok(),
+        (_, "DELETE") => google_error(412, "Precondition Failed"),
+        (_, "GET") => (200, item("e1", "Changed on phone")),
+        _ => (405, Value::Null),
+    });
+    let mut client = Some(server.client());
+    let cmd = Cmd::Delete {
+        creds: creds(),
+        google_calendar_id: "primary".into(),
+        remote_id: "e1".into(),
+        etag: Some("\"v1\"".into()),
+    };
+    match run(&mut client, &server.endpoints(), &no_browser, cmd) {
+        Msg::DeleteConflict { remote_id, server: Some(ev), .. } => {
+            assert_eq!(remote_id, "e1");
+            assert_eq!(ev.title, "Changed on phone");
+        }
+        _ => panic!("expected DeleteConflict"),
+    }
+}
+
+#[test]
+fn new_events_request_a_stable_id_so_retries_cannot_duplicate() {
+    // First attempt "lost its reply"; Google already has the event.
+    let server = FakeServer::start(|r| match (r.path.as_str(), r.method.as_str()) {
+        ("/token", _) => token_ok(),
+        (_, "POST") => google_error(409, "The requested identifier already exists."),
+        (p, "GET") if p.ends_with("/0123456789abcdef") => {
+            let mut v = item("0123456789abcdef", "Lunch");
+            v["etag"] = json!("\"v1\"");
+            (200, v)
+        }
+        _ => (405, Value::Null),
+    });
+    let mut ev = local_event(None);
+    ev.id = "local:0123456789abcdef".into();
+    let (id, etag) = server.client().save_event("primary", &ev).unwrap();
+    assert_eq!((id.as_str(), etag.as_deref()), ("0123456789abcdef", Some("\"v1\"")));
+    assert_eq!(server.api_requests()[0].json()["id"], "0123456789abcdef", "id chosen by us");
+}
+
+#[test]
+fn only_valid_ids_are_requested() {
+    assert_eq!(client_event_id("local:0123456789abcdefuv").as_deref(), Some("0123456789abcdefuv"));
+    assert_eq!(client_event_id("local:abc"), None, "too short");
+    assert_eq!(client_event_id("local:has-dash12"), None);
+    assert_eq!(client_event_id("local:wxyz12345"), None, "w-z aren't base32hex");
+    assert_eq!(client_event_id("google:cal:e1"), None, "already on Google");
 }
 
 #[test]
@@ -396,11 +520,24 @@ fn worker_turns_rejections_into_rejected_failures() {
     });
     let mut client = Some(server.client());
     let cmd = Cmd::Save { creds: creds(), google_calendar_id: "primary".into(), event: local_event(Some("e1")) };
-    match run(&mut client, cmd) {
+    match run(&mut client, &server.endpoints(), &no_browser, cmd) {
         Msg::SaveFailed { kind, error, .. } => {
             assert_eq!(kind, Failure::Rejected);
             assert!(error.contains("writer access"), "{error}");
         }
         _ => panic!("expected SaveFailed"),
     }
+}
+
+fn no_browser(_: &str) -> Result<()> {
+    panic!("tests never open a browser")
+}
+
+#[test]
+fn emulator_base_url_maps_to_googles_paths() {
+    let e = Endpoints::at("http://127.0.0.1:4002/");
+    assert_eq!(e.auth, "http://127.0.0.1:4002/o/oauth2/v2/auth");
+    assert_eq!(e.token, "http://127.0.0.1:4002/oauth2/token");
+    assert_eq!(e.api, "http://127.0.0.1:4002/calendar/v3");
+    assert_eq!(Endpoints::google().api, "https://www.googleapis.com/calendar/v3");
 }
