@@ -546,7 +546,7 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
     // Unreadable preferences (e.g. hand-edited) fall back to the defaults
     // rather than failing the whole load.
     let prefs = match settings.remove(PREFS_KEY) {
-        Some(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+        Some(text) => serde_json::from_str::<Settings>(&text).map(Settings::sanitized).unwrap_or_else(|e| {
             eprintln!("Ignoring unreadable settings ({e}); using defaults");
             Settings::default()
         }),

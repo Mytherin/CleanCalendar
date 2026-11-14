@@ -15,7 +15,7 @@ use crate::sync::MONTHS_AHEAD;
 /// The events matching `query`, sorted by start. An empty query matches
 /// nothing.
 pub fn search(store: &Store, query: &str, today: NaiveDate) -> Vec<Event> {
-    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let terms: Vec<String> = query.split_whitespace().map(fold).collect();
     if terms.is_empty() {
         return Vec::new();
     }
@@ -29,16 +29,24 @@ pub fn search(store: &Store, query: &str, today: NaiveDate) -> Vec<Event> {
             out.push(ev.clone());
         }
     }
-    out.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase())));
+    // Lowercase each title once, not twice per comparison.
+    out.sort_by_cached_key(|e| (e.start, e.title.to_lowercase()));
     out
+}
+
+/// Text for case-insensitive matching. Lowercasing "İ" (Turkish capital
+/// I with a dot) gives "i" plus a combining dot, which "istanbul" wouldn't
+/// match; the dot is dropped.
+fn fold(s: &str) -> String {
+    s.to_lowercase().replace('\u{307}', "")
 }
 
 /// Whether every term appears somewhere in the event.
 fn matches(ev: &Event, terms: &[String]) -> bool {
-    let mut fields = vec![ev.title.to_lowercase(), ev.location.to_lowercase(), ev.notes.to_lowercase()];
+    let mut fields = vec![fold(&ev.title), fold(&ev.location), fold(&ev.notes)];
     for a in &ev.attendees {
-        fields.push(a.name.to_lowercase());
-        fields.push(a.email.to_lowercase());
+        fields.push(fold(&a.name));
+        fields.push(fold(&a.email));
     }
     terms.iter().all(|t| fields.iter().any(|f| f.contains(t.as_str())))
 }
@@ -105,6 +113,14 @@ mod tests {
         assert_eq!(ids(&search(&store, "example.com", day(11, 14))), ["c"], "invitee addresses");
         assert!(search(&store, "   ", day(11, 14)).is_empty());
         assert!(search(&store, "dentist zebra", day(11, 14)).is_empty());
+    }
+
+    #[test]
+    fn dotted_capitals_match_their_plain_letters() {
+        let mut store = Store::with_defaults();
+        store.events = vec![ev("a", "Flight to İstanbul", day(11, 20))];
+        assert_eq!(search(&store, "istanbul", day(11, 1)).len(), 1);
+        assert_eq!(search(&store, "İSTANBUL", day(11, 1)).len(), 1);
     }
 
     #[test]
