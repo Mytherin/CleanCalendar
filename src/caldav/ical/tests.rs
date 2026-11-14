@@ -207,6 +207,40 @@ fn invitees_are_read_from_attendee_lines() {
 }
 
 #[test]
+fn an_unknown_zone_is_read_through_its_own_vtimezone() {
+    use chrono::Offset;
+    // Outlook's made-up zone name, with a definition matching central Europe.
+    let vtz = "BEGIN:VTIMEZONE\r\nTZID:Customized Time Zone\r\n\
+        BEGIN:STANDARD\r\nDTSTART:16010101T030000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\n\
+        RRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nEND:STANDARD\r\n\
+        BEGIN:DAYLIGHT\r\nDTSTART:16010101T020000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\n\
+        RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n";
+    let c = ics(&format!(
+        "{vtz}BEGIN:VEVENT\r\nUID:o\r\nSUMMARY:Review\r\n\
+         DTSTART;TZID=Customized Time Zone:20261114T090000\r\nDTEND;TZID=Customized Time Zone:20261114T100000\r\nEND:VEVENT\r\n"
+    ));
+    let ev = events(&cal(), "/o.ics", None, &c, year().0, year().1).remove(0);
+    let zone: Tz = ev.time_zone.as_deref().and_then(recurrence::parse_zone).expect("a real zone");
+    let offset = |m| zone.offset_from_utc_datetime(&t(2026, m, 15, 12, 0)).fix().local_minus_utc();
+    assert_eq!((offset(1), offset(7)), (3600, 7200), "same offsets as the definition ({})", zone.name());
+    assert_eq!(wall(&ev, zone), t(2026, 11, 14, 9, 0));
+    // The guess is ours only: the file is written back as it was.
+    let out = write(&c);
+    assert!(!out.contains("X-CLEANCALENDAR"), "{out}");
+    assert!(out.contains("DTSTART;TZID=Customized Time Zone:20261114T090000"), "{out}");
+
+    // A fixed offset reads as Etc/GMT±N.
+    let fixed = ics("BEGIN:VTIMEZONE\r\nTZID:Pakistan Custom\r\nBEGIN:STANDARD\r\nDTSTART:16010101T000000\r\n\
+        TZOFFSETFROM:+0500\r\nTZOFFSETTO:+0500\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n\
+        BEGIN:VEVENT\r\nUID:k\r\nDTSTART;TZID=Pakistan Custom:20261114T090000\r\nEND:VEVENT\r\n");
+    let ev = events(&cal(), "/k.ics", None, &fixed, year().0, year().1).remove(0);
+    assert_eq!(ev.time_zone.as_deref(), Some("Etc/GMT-5"));
+    assert_eq!(parse_offset("+0530"), Some(19800));
+    assert_eq!(parse_offset("-040000"), Some(-14400));
+    assert_eq!(parse_offset("0500"), None);
+}
+
+#[test]
 fn durations() {
     assert_eq!(parse_duration("PT1H30M"), Some(Duration::minutes(90)));
     assert_eq!(parse_duration("P2D"), Some(Duration::days(2)));
