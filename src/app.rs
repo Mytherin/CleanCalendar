@@ -9,15 +9,14 @@ use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, S
 use crate::app_icon::AppIcon;
 use crate::editor::{self, Editor, Outcome, Placement, Scope};
 use crate::dates::*;
-use crate::caldav;
 use crate::google;
 use crate::menu::{self, Command, ContextMenu, Icon, Item, MenuAt};
-use crate::model::{CalDavAccount, Calendar, Event, Source, Store, CALENDAR_COLORS};
-use crate::remote::{Cmd, Worker, GOOGLE};
+use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
+use crate::remote::{Worker, GOOGLE};
 use crate::recurrence;
 use crate::settings::WeekScroll;
 use crate::sync::{Notice, SyncEngine};
-use crate::theme::{self, Palette, ACCENT, RED};
+use crate::theme::{self, Palette, RED};
 use crate::interact::Pointer;
 use crate::views;
 
@@ -98,21 +97,7 @@ pub struct App {
     last_sync: Option<Instant>,
     status: Option<(String, bool)>,
     settings_ui: settings_window::SettingsUi,
-    show_accounts: bool,
-    caldav_form: CalDavForm,
     icon: AppIcon,
-}
-
-/// The "add a CalDAV account" form in the Accounts window.
-#[derive(Default)]
-struct CalDavForm {
-    /// Another CalDAV server rather than iCloud.
-    other: bool,
-    server: String,
-    username: String,
-    password: String,
-    /// The account being signed in, until it's added (or fails).
-    pending: Option<String>,
 }
 
 impl App {
@@ -145,8 +130,6 @@ impl App {
             last_sync: None,
             status: None,
             settings_ui: Default::default(),
-            show_accounts: false,
-            caldav_form: CalDavForm::default(),
             icon: AppIcon::new(&cc.egui_ctx),
         };
         if let Some((view, date)) = std::env::var("CLEANCALENDAR_START").ok().and_then(|s| parse_start(&s)) {
@@ -160,10 +143,8 @@ impl App {
     // ---- Sync glue (the logic lives in sync.rs) ---------------------------
 
     fn sync(&mut self) {
-        // A switched-off account isn't synced; its changes wait until it's back on.
-        if !self.store.settings.google_enabled {
-            return;
-        }
+        // A Google account switched off in Settings isn't among the accounts
+        // synced (see `Store::accounts`); its changes wait until it's back on.
         if self.engine.sync(&self.store, self.today) {
             self.last_sync = Some(Instant::now());
         }
@@ -877,7 +858,7 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
         let popover = self.editor.as_ref().is_some_and(|ed| matches!(ed.placement, Placement::Popover { .. }));
-        let modal = popover || self.settings_ui.open || self.show_accounts || self.menu.is_some();
+        let modal = popover || self.settings_ui.open || self.menu.is_some();
         let mut view = None;
         let mut step = 0;
         let mut today = false;
@@ -1002,7 +983,7 @@ impl App {
                         }
                         let accounts_label = if connected { "Accounts" } else { "Add Account" };
                         if ui.button(accounts_label).on_hover_text("iCloud, CalDAV and Google accounts").clicked() {
-                            self.show_accounts = true;
+                            self.open_accounts();
                         }
                         let unsynced = self.store.unsynced_count();
                         if connected && unsynced > 0 {
@@ -1256,174 +1237,6 @@ impl App {
                 });
             });
     }
-
-    fn accounts_window(&mut self, ctx: &egui::Context, p: &Palette) {
-        // A CalDAV sign-in finished: clear the form once the account is in.
-        if let Some(id) = &self.caldav_form.pending {
-            if self.store.caldav_account(id).is_some() {
-                self.caldav_form = CalDavForm { other: self.caldav_form.other, ..CalDavForm::default() };
-            } else if !self.engine.is_connecting() {
-                self.caldav_form.pending = None;
-            }
-        }
-        let mut open = self.show_accounts;
-        let mut connect_google = false;
-        let mut connect_caldav = false;
-        let mut disconnect: Option<String> = None;
-        egui::Window::new("Accounts")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(460.0, 0.0))
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Changes from other devices appear within 5 minutes. Your changes are sent right away; if a server can't be reached they're kept and retried every minute.")
-                        .color(p.secondary),
-                );
-
-                // ---- iCloud / CalDAV
-                ui.add_space(10.0);
-                ui.label(RichText::new("iCloud and CalDAV").font(theme::bold_font(14.0)));
-                for a in &self.store.caldav {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} — {}", a.label, a.username));
-                        if a.password.is_none() {
-                            ui.label(RichText::new("(password missing)").color(RED).small());
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button(RichText::new("Disconnect").color(RED)).clicked() {
-                                disconnect = Some(a.id.clone());
-                            }
-                        });
-                    });
-                }
-                let f = &mut self.caldav_form;
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut f.other, false, "iCloud");
-                    ui.selectable_value(&mut f.other, true, "Other CalDAV server");
-                });
-                if f.other {
-                    ui.label(RichText::new("Fastmail, Nextcloud, Radicale, … Enter the server address; the calendars are found from there.").color(p.secondary));
-                } else {
-                    ui.label(
-                        RichText::new("Sign in with your Apple ID and an app-specific password (not your Apple ID password): account.apple.com → Sign-In and Security → App-Specific Passwords.")
-                            .color(p.secondary),
-                    );
-                    ui.hyperlink_to("Create an app-specific password", "https://account.apple.com/account/manage");
-                }
-                ui.add_space(4.0);
-                egui::Grid::new("caldav-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    if f.other {
-                        ui.label("Server");
-                        ui.add(egui::TextEdit::singleline(&mut f.server).hint_text("https://caldav.example.com").desired_width(300.0));
-                        ui.end_row();
-                    }
-                    ui.label(if f.other { "User name" } else { "Apple ID" });
-                    ui.add(egui::TextEdit::singleline(&mut f.username).desired_width(300.0));
-                    ui.end_row();
-                    ui.label(if f.other { "Password" } else { "App password" });
-                    ui.add(egui::TextEdit::singleline(&mut f.password).password(true).hint_text(if f.other { "" } else { "xxxx-xxxx-xxxx-xxxx" }).desired_width(300.0));
-                    ui.end_row();
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let busy = f.pending.is_some();
-                    let ready = !f.username.trim().is_empty() && !f.password.is_empty() && (!f.other || !f.server.trim().is_empty());
-                    let btn = egui::Button::new(RichText::new("Sign In").color(Color32::WHITE)).fill(ACCENT);
-                    if ui.add_enabled(!busy && ready, btn).clicked() {
-                        connect_caldav = true;
-                    }
-                    if busy {
-                        ui.spinner();
-                        ui.label(RichText::new("Finding your calendars…").color(p.secondary));
-                    }
-                });
-
-                // ---- Google
-                ui.add_space(12.0);
-                ui.separator();
-                ui.label(RichText::new("Google").font(theme::bold_font(14.0)));
-                let g = &mut self.store.google;
-                if g.is_connected() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "Connected{}.",
-                            g.account_email.as_ref().map(|e| format!(" as {e}")).unwrap_or_default()
-                        ));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button(RichText::new("Disconnect").color(RED)).clicked() {
-                                disconnect = Some(GOOGLE.to_owned());
-                            }
-                        });
-                    });
-                    return;
-                }
-                egui::CollapsingHeader::new("Connect Google Calendar").default_open(false).show(ui, |ui| {
-                    ui.label("CleanCalendar talks to Google with your own OAuth client:");
-                    ui.add_space(4.0);
-                    for step in [
-                        "1. In Google Cloud Console, create a project and enable the Google Calendar API.",
-                        "2. Configure the OAuth consent screen and add yourself as a test user.",
-                        "3. Create Credentials → OAuth client ID → Application type “Desktop app”.",
-                        "4. Paste the client ID and secret below, then sign in.",
-                    ] {
-                        ui.label(RichText::new(step).color(p.secondary));
-                    }
-                    ui.hyperlink_to("Open Google Cloud Console", "https://console.cloud.google.com/apis/credentials");
-                    ui.add_space(8.0);
-                    egui::Grid::new("google-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                        ui.label("Client ID");
-                        ui.add(egui::TextEdit::singleline(&mut g.client_id).desired_width(300.0));
-                        ui.end_row();
-                        ui.label("Client secret");
-                        ui.add(egui::TextEdit::singleline(&mut g.client_secret).password(true).desired_width(300.0));
-                        ui.end_row();
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let busy = self.worker.busy > 0;
-                        let btn = egui::Button::new(RichText::new("Sign in with Google").color(Color32::WHITE)).fill(ACCENT);
-                        if ui.add_enabled(!busy && !g.client_id.trim().is_empty(), btn).clicked() {
-                            connect_google = true;
-                        }
-                        if busy {
-                            ui.spinner();
-                            ui.label(RichText::new("Waiting for the browser…").color(p.secondary));
-                        }
-                    });
-                });
-            });
-        self.show_accounts = open;
-        if connect_google {
-            self.store.save();
-            let g = &self.store.google;
-            self.worker.send(Cmd::ConnectGoogle { client_id: g.client_id.clone(), client_secret: g.client_secret.clone() });
-        }
-        if connect_caldav {
-            let f = &mut self.caldav_form;
-            let server = if f.other { f.server.trim().to_owned() } else { caldav::ICLOUD.to_owned() };
-            let label = if f.other {
-                caldav::normalize_server(&server).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_else(|| server.clone())
-            } else {
-                "iCloud".to_owned()
-            };
-            let account = CalDavAccount {
-                id: CalDavAccount::new_id(),
-                label,
-                server,
-                username: f.username.trim().to_owned(),
-                password: Some(f.password.clone()),
-            };
-            f.pending = Some(account.id.clone());
-            self.engine.connect_caldav(account);
-            self.flush();
-        }
-        if let Some(account) = disconnect {
-            self.engine.disconnect(&mut self.store, &account);
-            self.flush();
-        }
-    }
 }
 
 impl eframe::App for App {
@@ -1480,7 +1293,6 @@ impl eframe::App for App {
         self.editor_popover(ctx, &p);
         self.context_menu(ctx, &p);
         self.settings_window(ctx, &p);
-        self.accounts_window(ctx, &p);
 
         // Keep the current-time line moving.
         ctx.request_repaint_after(StdDuration::from_secs(30));
