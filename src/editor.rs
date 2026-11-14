@@ -49,7 +49,20 @@ pub enum Scope {
     AllEvents,
 }
 
+/// The date/time fields at one moment, to tell which of them the user changed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WhenFields {
+    all_day: bool,
+    start_date: NaiveDate,
+    start_time: NaiveTime,
+    end_date: NaiveDate,
+    end_time: NaiveTime,
+}
+
 pub struct Editor {
+    /// The event as it was when the editor opened, to tell whether anything
+    /// was edited.
+    original: Event,
     /// The event being edited. Its start/end follow the date/time fields as
     /// they change, so the calendar can preview it live.
     pub draft: Event,
@@ -79,6 +92,7 @@ impl Editor {
             start_time: draft.start.time(),
             end_date: draft.start.date(),
             end_time: draft.end.time(),
+            original: draft.clone(),
             draft,
             is_new,
             placement,
@@ -123,6 +137,44 @@ impl Editor {
         self.fields_from_draft();
     }
 
+    fn when_fields(&self) -> WhenFields {
+        WhenFields {
+            all_day: self.draft.all_day,
+            start_date: self.start_date,
+            start_time: self.start_time,
+            end_date: self.end_date,
+            end_time: self.end_time,
+        }
+    }
+
+    /// Follows up on the date/time fields changing from `before`, the way
+    /// macOS Calendar does: moving the start keeps the duration, and turning
+    /// "all-day" on or off picks times that still make sense.
+    fn adjust_when(&mut self, before: WhenFields) {
+        if before.all_day != self.draft.all_day {
+            if self.draft.all_day {
+                // An event ending at midnight doesn't touch that last day.
+                if self.end_time == NaiveTime::MIN && self.end_date > self.start_date {
+                    self.end_date = self.end_date.pred_opt().unwrap_or(self.end_date);
+                }
+            } else if self.start_time == NaiveTime::MIN && self.end_time == NaiveTime::MIN {
+                // From all-day: the fields hold midnight; give it real hours.
+                self.start_time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+                self.end_time = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
+            }
+            return;
+        }
+        let start_moved = before.start_date != self.start_date || before.start_time != self.start_time;
+        let end_moved = before.end_date != self.end_date || before.end_time != self.end_time;
+        if start_moved && !end_moved {
+            let old_start = before.start_date.and_time(before.start_time);
+            let new_start = self.start_date.and_time(self.start_time);
+            let end = before.end_date.and_time(before.end_time) + (new_start - old_start);
+            self.end_date = end.date();
+            self.end_time = end.time();
+        }
+    }
+
     /// The edited event, or why it can't be saved.
     pub fn result(&self) -> Result<Event, String> {
         let mut ev = self.draft.clone();
@@ -137,6 +189,11 @@ impl Editor {
         }
         if ev.end < ev.start {
             return Err("The event ends before it starts.".into());
+        }
+        if let Some(RepeatEnd::Until(last)) = ev.recurrence.as_ref().map(|r| r.end) {
+            if last < self.start_date {
+                return Err("The repeat ends before the event starts.".into());
+            }
         }
         if ev.title.trim().is_empty() {
             ev.title = "New Event".into();
@@ -161,9 +218,12 @@ impl Editor {
 /// change anything).
 pub fn changed(ed: &Editor, stored: Option<&Event>) -> bool {
     let Ok(ev) = ed.result() else { return true };
+    let differs = |s: &Event| ev.fields() != s.fields() || ev.calendar_id != s.calendar_id;
     match stored {
-        None => true,
-        Some(s) => ev.fields() != s.fields() || ev.calendar_id != s.calendar_id,
+        // Gone (deleted elsewhere, or with its calendar): only an actual
+        // edit is worth keeping; closing it untouched must not bring it back.
+        None => ed.is_new || differs(&ed.original),
+        Some(s) => differs(s),
     }
 }
 
@@ -577,6 +637,7 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
         }
         if ed.editing_when && !read_only {
             divider(ui, p);
+            let before = ed.when_fields();
             egui::Grid::new("when-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                 ui.label(RichText::new("all-day").color(p.secondary));
                 ui.checkbox(&mut ed.draft.all_day, "");
@@ -603,6 +664,7 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
                     repeat_rows(ui, ed, p);
                 }
             });
+            ed.adjust_when(before);
         }
         for line in when_details(ed) {
             ui.label(RichText::new(line).color(p.secondary).small());
@@ -746,4 +808,102 @@ pub fn inspector(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette)
         return Outcome::Cancel;
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap()
+    }
+
+    fn event(start: NaiveDateTime, end: NaiveDateTime, all_day: bool) -> Event {
+        Event {
+            id: "local:e".into(),
+            calendar_id: "local:home".into(),
+            title: "Dentist".into(),
+            start,
+            end,
+            all_day,
+            location: String::new(),
+            notes: String::new(),
+            remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
+            etag: None,
+            base: None,
+            recurrence: None,
+            time_zone: None,
+        }
+    }
+
+    fn editor(ev: Event) -> Editor {
+        Editor::new(ev, false, Placement::Inspector)
+    }
+
+    #[test]
+    fn moving_the_start_keeps_the_duration() {
+        let mut ed = editor(event(at(2026, 11, 14, 10, 0), at(2026, 11, 14, 11, 30), false));
+        let before = ed.when_fields();
+        ed.start_date = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        ed.start_time = NaiveTime::from_hms_opt(23, 0, 0).unwrap();
+        ed.adjust_when(before);
+        let ev = ed.result().unwrap();
+        assert_eq!((ev.start, ev.end), (at(2026, 11, 15, 23, 0), at(2026, 11, 16, 0, 30)));
+    }
+
+    #[test]
+    fn moving_the_end_leaves_the_start() {
+        let mut ed = editor(event(at(2026, 11, 14, 10, 0), at(2026, 11, 14, 11, 0), false));
+        let before = ed.when_fields();
+        ed.end_time = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        ed.adjust_when(before);
+        let ev = ed.result().unwrap();
+        assert_eq!((ev.start, ev.end), (at(2026, 11, 14, 10, 0), at(2026, 11, 14, 12, 0)));
+    }
+
+    #[test]
+    fn unchecking_all_day_gives_real_hours() {
+        let mut ed = editor(event(at(2026, 11, 14, 0, 0), at(2026, 11, 17, 0, 0), true));
+        let before = ed.when_fields();
+        ed.draft.all_day = false;
+        ed.adjust_when(before);
+        let ev = ed.result().unwrap();
+        assert_eq!((ev.start, ev.end), (at(2026, 11, 14, 9, 0), at(2026, 11, 16, 10, 0)), "keeps its last day");
+    }
+
+    #[test]
+    fn checking_all_day_on_an_event_ending_at_midnight_keeps_one_day() {
+        let mut ed = editor(event(at(2026, 11, 14, 22, 0), at(2026, 11, 15, 0, 0), false));
+        let before = ed.when_fields();
+        ed.draft.all_day = true;
+        ed.adjust_when(before);
+        let ev = ed.result().unwrap();
+        assert_eq!((ev.start, ev.end), (at(2026, 11, 14, 0, 0), at(2026, 11, 15, 0, 0)));
+    }
+
+    #[test]
+    fn a_repeat_ending_before_the_start_is_refused() {
+        let mut ev = event(at(2026, 11, 14, 9, 0), at(2026, 11, 14, 10, 0), false);
+        let mut rule = Recurrence::new(Freq::Weekly);
+        rule.end = RepeatEnd::Until(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        ev.recurrence = Some(rule.clone());
+        assert!(editor(ev.clone()).result().is_err());
+        rule.end = RepeatEnd::Until(NaiveDate::from_ymd_opt(2026, 11, 14).unwrap());
+        ev.recurrence = Some(rule);
+        assert!(editor(ev).result().is_ok(), "ending on its first day is fine");
+    }
+
+    #[test]
+    fn closing_an_untouched_editor_on_a_deleted_event_keeps_it_deleted() {
+        let ev = event(at(2026, 11, 14, 9, 0), at(2026, 11, 14, 10, 0), false);
+        let mut ed = editor(ev.clone());
+        assert!(!changed(&ed, None), "nothing edited: don't bring it back");
+        assert!(!changed(&ed, Some(&ev)));
+        ed.draft.title = "Dentist (moved)".into();
+        assert!(changed(&ed, None), "an edit beats a delete");
+        assert!(changed(&Editor::new(ev, true, Placement::Inspector), None), "a new event is always saved");
+    }
 }
