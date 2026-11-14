@@ -531,9 +531,6 @@ fn worker_turns_rejections_into_rejected_failures() {
     }
 }
 
-fn no_browser(_: &str) -> Result<()> {
-    panic!("tests never open a browser")
-}
 
 #[test]
 fn emulator_base_url_maps_to_googles_paths() {

@@ -34,9 +34,6 @@ fn creds() -> Creds {
     }
 }
 
-fn no_browser(_: &str) -> Result<()> {
-    panic!("only live_sign_in opens a browser")
-}
 
 /// One-time interactive sign-in: opens the browser, waits for approval, and
 /// writes the refresh token to CLEANCALENDAR_LIVE_TOKEN_FILE (never prints it).

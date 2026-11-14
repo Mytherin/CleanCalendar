@@ -1304,3 +1304,214 @@ mod tests {
         assert_eq!((merged.time_zone.as_deref(), merged.recurrence), (Some("Asia/Tokyo"), None));
     }
 }
+
+/// Several accounts at once: Google plus CalDAV accounts each sync, fail,
+/// and sign out on their own.
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    use crate::remote::Login;
+
+    const DAV: &str = "caldav-1";
+    const DAV2: &str = "caldav-2";
+
+    fn today() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 11, 14).unwrap()
+    }
+
+    fn dav_account(id: &str, label: &str) -> CalDavAccount {
+        CalDavAccount {
+            id: id.into(),
+            label: label.into(),
+            server: "https://dav.example.com/".into(),
+            username: "me".into(),
+            password: Some("pw".into()),
+        }
+    }
+
+    fn cal(id: &str) -> RemoteCalendar {
+        RemoteCalendar { id: id.into(), name: id.into(), color: [1, 2, 3], read_only: false, primary: false }
+    }
+
+    /// Signed in to Google and two CalDAV accounts, each with one calendar.
+    fn store() -> Store {
+        let mut s = Store::with_defaults();
+        s.google.refresh_token = Some("r".into());
+        s.caldav = vec![dav_account(DAV, "iCloud"), dav_account(DAV2, "Fastmail")];
+        merge_calendars(&mut s, DAV2, &[cal("https://dav.example.com/f/")]);
+        merge_calendars(&mut s, DAV, &[cal("https://dav.example.com/i/")]);
+        merge_calendars(&mut s, GOOGLE, &[cal("me@gmail.com")]);
+        s
+    }
+
+    fn event_on(store: &mut Store, account: &str, cal_id: &str, rid: &str) -> String {
+        let r = CalRef::new(account, cal_id);
+        let mut ev = crate::model::tests::event(&r.event_id(rid), &r.local_id(), rid);
+        ev.remote_id = Some(rid.into());
+        store.events.push(ev);
+        r.event_id(rid)
+    }
+
+    fn syncs(engine: &mut SyncEngine) -> Vec<String> {
+        engine
+            .outbox
+            .drain(..)
+            .filter_map(|c| match c {
+                Cmd::Sync { account, .. } => Some(account),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn calendars_are_grouped_by_account_in_a_stable_order() {
+        let s = store();
+        let order: Vec<Option<&str>> = s.calendars.iter().map(|c| c.account()).collect();
+        assert_eq!(order, [None, None, Some(GOOGLE), Some(DAV), Some(DAV2)]);
+        let dav = s.calendars.iter().find(|c| c.account() == Some(DAV)).unwrap();
+        assert_eq!(dav.id, "caldav-1:https://dav.example.com/i/");
+        assert_eq!(dav.source, Source::CalDav { account: DAV.into(), url: "https://dav.example.com/i/".into() });
+    }
+
+    #[test]
+    fn every_signed_in_account_syncs_on_its_own() {
+        let mut s = store();
+        let mut engine = SyncEngine::default();
+        assert!(engine.sync(&s, today()));
+        assert_eq!(syncs(&mut engine), [GOOGLE, DAV, DAV2]);
+
+        // While they're out, asking again only marks them for later.
+        assert!(!engine.sync(&s, today()));
+        assert!(syncs(&mut engine).is_empty());
+
+        // One account finishing starts only its own follow-up sync.
+        engine.handle(&mut s, Msg::Synced { account: DAV.into(), calendars: vec![cal("https://dav.example.com/i/")], changes: vec![] }, None, today());
+        assert_eq!(syncs(&mut engine), [DAV]);
+        engine.handle(&mut s, Msg::SyncFailed { account: GOOGLE.into(), error: "offline".into() }, None, today());
+        assert_eq!(syncs(&mut engine), [GOOGLE]);
+        assert!(engine.notices.contains(&Notice::Status { text: "Couldn't sync with Google: offline".into(), error: true }));
+
+        // Accounts without a password stay out of it.
+        s.caldav[1].password = None;
+        let mut fresh = SyncEngine::default();
+        fresh.sync(&s, today());
+        assert_eq!(syncs(&mut fresh), [GOOGLE, DAV]);
+    }
+
+    #[test]
+    fn one_accounts_calendar_list_leaves_the_others_alone() {
+        let mut s = store();
+        event_on(&mut s, GOOGLE, "me@gmail.com", "g1");
+        event_on(&mut s, DAV2, "https://dav.example.com/f/", "f1");
+        // The iCloud account now has no calendars.
+        merge_calendars(&mut s, DAV, &[]);
+        assert!(s.calendars.iter().all(|c| c.account() != Some(DAV)));
+        assert_eq!(s.events.len(), 2, "other accounts' events kept");
+        assert_eq!(s.calendars.iter().filter(|c| c.account() == Some(GOOGLE)).count(), 1);
+    }
+
+    #[test]
+    fn changes_are_applied_to_the_right_account() {
+        let mut s = store();
+        // Same calendar id on two servers must not mix.
+        merge_calendars(&mut s, DAV2, &[cal("https://dav.example.com/i/")]);
+        event_on(&mut s, DAV, "https://dav.example.com/i/", "x");
+        let r = CalRef::new(DAV2, "https://dav.example.com/i/");
+        let mut theirs = crate::model::tests::event(&r.event_id("y"), &r.local_id(), "y");
+        theirs.remote_id = Some("y".into());
+        let changes = vec![CalendarChanges {
+            calendar_id: "https://dav.example.com/i/".into(),
+            full: true,
+            events: vec![theirs],
+            cancelled: vec![],
+            next_token: Some("t".into()),
+        }];
+        apply_changes(&mut s, DAV2, changes, None, today());
+        let mut titles: Vec<&str> = s.events.iter().map(|e| e.title.as_str()).collect();
+        titles.sort();
+        assert_eq!(titles, ["x", "y"], "a full sync of one account doesn't wipe the other");
+        assert_eq!(s.sync_state[&r.local_id()].token.as_deref(), Some("t"));
+        assert!(!s.sync_state.contains_key(&CalRef::new(DAV, "https://dav.example.com/i/").local_id()));
+    }
+
+    #[test]
+    fn uploads_go_to_the_events_own_account() {
+        let mut s = store();
+        let mut engine = SyncEngine::default();
+        let id = event_on(&mut s, DAV, "https://dav.example.com/i/", "x");
+        engine.event_changed(&mut s, &id);
+        match engine.outbox.pop() {
+            Some(Cmd::Save { login: Login::CalDav(l), calendar, .. }) => {
+                assert_eq!(calendar, CalRef::new(DAV, "https://dav.example.com/i/"));
+                assert_eq!(l.password, "pw");
+            }
+            c => panic!("{c:?}"),
+        }
+        let ev = s.event(&id).unwrap().clone();
+        s.events.clear();
+        engine.event_deleted(&mut s, &ev, true);
+        assert_eq!(s.pending_deletes[0].calendar.account, DAV);
+        assert!(matches!(engine.outbox.pop(), Some(Cmd::Delete { login: Login::CalDav(_), .. })));
+    }
+
+    #[test]
+    fn failures_name_the_service() {
+        let mut s = store();
+        let mut engine = SyncEngine::default();
+        let id = event_on(&mut s, DAV, "https://dav.example.com/i/", "x");
+        engine.event_changed(&mut s, &id);
+        engine.outbox.clear();
+        let cal = CalRef::new(DAV, "https://dav.example.com/i/");
+        engine.handle(&mut s, Msg::SaveFailed { local_id: id, calendar: cal, error: "x".into(), kind: Failure::Retry }, None, today());
+        assert!(engine.notices.contains(&Notice::Status { text: offline("iCloud"), error: true }));
+    }
+
+    #[test]
+    fn signing_out_of_one_account_keeps_the_rest() {
+        let mut s = store();
+        let mut engine = SyncEngine::default();
+        event_on(&mut s, GOOGLE, "me@gmail.com", "g1");
+        let gone = event_on(&mut s, DAV, "https://dav.example.com/i/", "i1");
+        let gone_ev = s.event(&gone).unwrap().clone();
+        engine.event_deleted(&mut s, &gone_ev, true);
+        s.sync_state.insert(CalRef::new(DAV, "https://dav.example.com/i/").local_id(), Default::default());
+        s.sync_state.insert(CalRef::google("me@gmail.com").local_id(), Default::default());
+        engine.sync(&s, today());
+
+        engine.disconnect(&mut s, DAV);
+        assert_eq!(s.caldav.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), [DAV2]);
+        assert!(s.calendars.iter().all(|c| c.account() != Some(DAV)));
+        assert!(s.pending_deletes.is_empty());
+        assert_eq!(s.sync_state.len(), 1);
+        assert!(s.google.is_connected());
+        assert!(engine.notices.contains(&Notice::Status { text: "Disconnected from iCloud".into(), error: false }));
+
+        // Its sync, still out, is dropped when it returns.
+        engine.handle(&mut s, Msg::Synced { account: DAV.into(), calendars: vec![cal("https://dav.example.com/i/")], changes: vec![] }, None, today());
+        assert!(s.calendars.iter().all(|c| c.account() != Some(DAV)), "not brought back");
+    }
+
+    #[test]
+    fn adding_a_caldav_account_waits_for_the_server() {
+        let mut s = Store::with_defaults();
+        let mut engine = SyncEngine::default();
+        engine.connect_caldav(dav_account(DAV, "iCloud"));
+        assert!(engine.is_connecting());
+        assert!(s.caldav.is_empty(), "not added before the server accepts it");
+        assert!(matches!(engine.outbox.pop(), Some(Cmd::ConnectCalDav { .. })));
+
+        engine.handle(&mut s, Msg::Connected { account: DAV.into(), refresh_token: None }, None, today());
+        assert_eq!(s.caldav.len(), 1);
+        assert!(!engine.is_connecting());
+        assert_eq!(syncs(&mut engine), [DAV], "first sync right away");
+
+        engine.connect_caldav(dav_account(DAV2, "Fastmail"));
+        engine.outbox.clear();
+        engine.handle(&mut s, Msg::ConnectFailed { account: DAV2.into(), error: "nope".into() }, None, today());
+        assert_eq!(s.caldav.len(), 1);
+        assert!(!engine.is_connecting());
+        // A stray reply for an account nobody is adding is ignored.
+        engine.handle(&mut s, Msg::Connected { account: "caldav-9".into(), refresh_token: None }, None, today());
+        assert_eq!(s.caldav.len(), 1);
+    }
+}

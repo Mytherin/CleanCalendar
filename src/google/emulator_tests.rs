@@ -33,9 +33,6 @@ fn endpoints() -> Endpoints {
     Endpoints::at(&std::env::var(EMULATOR_ENV).unwrap_or_else(|_| "http://127.0.0.1:4000".into()))
 }
 
-fn no_browser(_: &str) -> Result<()> {
-    panic!("only sign-in opens a browser")
-}
 
 /// Signs in as the seeded user. Instead of a browser, a background thread
 /// picks the user on the emulator's sign-in page and follows its redirect

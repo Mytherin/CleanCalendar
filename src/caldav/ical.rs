@@ -831,9 +831,9 @@ pub fn vtimezone(tz: Tz, tzid: &str, year: i32) -> Component {
         let next = t + Duration::days(1);
         let cur = offset_at(next);
         if cur.0 != prev.0 || cur.1 != prev.1 {
-            // Find the minute it changed.
+            // Find the second it changed.
             let (mut lo, mut hi) = (t, next);
-            while hi - lo > Duration::minutes(1) {
+            while hi - lo > Duration::seconds(1) {
                 let mid = lo + (hi - lo) / 2;
                 if offset_at(mid).0 == prev.0 && offset_at(mid).1 == prev.1 {
                     lo = mid;
