@@ -134,12 +134,27 @@ impl SyncEngine {
     /// applies if nobody changed it meanwhile (their change wins). Otherwise
     /// (moved to another calendar) the old copy is removed unconditionally.
     pub fn event_deleted(&mut self, store: &mut Store, ev: &Event, user_deleted: bool) {
-        if let (Some(gcal), Some(rid)) = (store.google_calendar_of(ev), ev.remote_id.clone()) {
-            let etag = if user_deleted { ev.etag.clone() } else { None };
-            self.queue_delete(store, PendingDelete { google_calendar_id: gcal, remote_id: rid, etag });
+        let Some(gcal) = store.google_calendar_of(ev) else { return };
+        // Our own upload of an edit is still out: once it lands, Google's
+        // etag is newer than ours, and an If-Match delete would fail as if
+        // someone else had changed the event. The newer version is ours.
+        let saving = self.in_flight.contains(&format!("save:{}", ev.id));
+        match ev.remote_id.clone() {
+            Some(rid) => {
+                let etag = if user_deleted && !saving { ev.etag.clone() } else { None };
+                self.queue_delete(store, PendingDelete { google_calendar_id: gcal, remote_id: rid, etag });
+            }
+            // Never confirmed. If an upload is in flight, `on_saved` notices
+            // the event is gone and deletes the copy it created. Otherwise an
+            // earlier create may still have reached Google (only its reply
+            // was lost): delete it by the id it asked for (a 404 is fine).
+            None if !saving => {
+                if let Some(rid) = google::client_event_id(&ev.id) {
+                    self.queue_delete(store, PendingDelete { google_calendar_id: gcal, remote_id: rid, etag: None });
+                }
+            }
+            None => {}
         }
-        // Never uploaded: if an upload is in flight, `on_saved` notices the
-        // event is gone and deletes the copy it created.
     }
 
     /// Call when the user deleted a whole repeating series that Google sent
@@ -294,6 +309,18 @@ impl SyncEngine {
             return;
         }
         let new_id = google::local_event_id(&gcal, &remote_id);
+        if new_id != local_id {
+            // A sync may already have brought Google's copy of this event
+            // (the create landed but an earlier reply was lost). Two events
+            // with one id can't be saved, so keep one: ours, unless theirs
+            // was edited here since.
+            store.events.retain(|e| !(e.id == new_id && !e.pending));
+            if store.event(&new_id).is_some() {
+                store.events.retain(|e| e.id != local_id);
+                self.notices.push(Notice::Renamed { from: local_id, to: new_id });
+                return;
+            }
+        }
         let ev = store.event_mut(&local_id).unwrap();
         ev.remote_id = Some(remote_id);
         ev.id = new_id.clone();
@@ -491,9 +518,21 @@ fn apply_changes(store: &mut Store, changes: Vec<CalendarChanges>, dragging: Opt
         }
         let mut index: HashMap<String, usize> =
             store.events.iter().enumerate().map(|(i, e)| (e.id.clone(), i)).collect();
+        // New events whose upload hasn't been confirmed: the create may have
+        // reached Google even though its reply didn't reach us. Their copy
+        // from Google is the same event; the confirmation renames ours.
+        let uploading: HashSet<String> = store
+            .events
+            .iter()
+            .filter(|e| e.calendar_id == cal_id && e.remote_id.is_none())
+            .filter_map(|e| google::client_event_id(&e.id))
+            .collect();
         for ev in ch.events {
             let being_deleted = |id: &Option<String>| id.as_ref().is_some_and(|r| deleting.contains(r));
             if being_deleted(&ev.remote_id) || being_deleted(&ev.recurring_id) {
+                continue;
+            }
+            if ev.remote_id.as_ref().is_some_and(|r| uploading.contains(r)) {
                 continue;
             }
             match index.get(&ev.id) {
@@ -930,6 +969,63 @@ mod tests {
         assert!(!ev.pending);
         assert_eq!(ev.base, None);
         assert!(sent(&mut engine).is_empty());
+    }
+
+    #[test]
+    fn a_create_whose_reply_was_lost_never_ends_up_twice() {
+        // The create reaches Google but its reply is lost (Retry); a sync then
+        // brings Google's copy before the retried create is confirmed.
+        let mut store = store_with(vec![new_gev("local:abc12", "lunch")]);
+        let mut engine = SyncEngine::default();
+        engine.event_changed(&mut store, "local:abc12");
+        sent(&mut engine);
+        engine.handle(&mut store, save_failed("local:abc12", Failure::Retry), None, today());
+
+        engine.handle(&mut store, synced(changes(false, vec![gev("abc12", "lunch")], &[], Some("t1"))), None, today());
+        assert_eq!(titles(&store), ["lunch"], "Google's copy of our pending create isn't shown twice");
+
+        // Even if a copy did slip in, the confirmation leaves one event.
+        store.events.push(gev("abc12", "lunch"));
+        engine.handle(&mut store, saved("local:abc12", 1, "abc12"), None, today());
+        let id = google::local_event_id(CAL, "abc12");
+        assert_eq!(store.events.iter().filter(|e| e.id == id).count(), 1);
+        assert_eq!(store.events.len(), 1);
+    }
+
+    #[test]
+    fn deleting_right_after_an_edit_deletes_it() {
+        let id = google::local_event_id(CAL, "a");
+        let mut ev = gev("a", "Standup");
+        ev.etag = Some("e0".into());
+        let mut store = store_with(vec![ev]);
+        let mut engine = SyncEngine::default();
+        edit(&mut store, &mut engine, &id, "Standup (moved)");
+        sent(&mut engine);
+
+        // Deleted while the edit's upload is still out: that upload changes
+        // Google's etag, so the delete must not depend on the old one.
+        let ev = store.event(&id).unwrap().clone();
+        store.events.clear();
+        engine.event_deleted(&mut store, &ev, true);
+        match &engine.outbox[0] {
+            Cmd::Delete { etag, .. } => assert_eq!(etag, &None),
+            _ => panic!("expected a delete"),
+        }
+    }
+
+    #[test]
+    fn deleting_a_new_event_whose_create_reply_was_lost_deletes_it_on_google() {
+        let mut store = store_with(vec![new_gev("local:abc12", "lunch")]);
+        let mut engine = SyncEngine::default();
+        engine.event_changed(&mut store, "local:abc12");
+        sent(&mut engine);
+        engine.handle(&mut store, save_failed("local:abc12", Failure::Retry), None, today());
+
+        let ev = store.event("local:abc12").unwrap().clone();
+        store.events.clear();
+        engine.event_deleted(&mut store, &ev, true);
+        assert_eq!(sent(&mut engine), [Sent::Delete("abc12".into())], "the id the create asked for");
+        assert_eq!(store.pending_deletes.len(), 1);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, Time
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
-use crate::dates::{add_months, day_short, first_of_month, midnight, week_index};
+use crate::dates::{day_short, first_of_month, midnight, week_index};
 use crate::model::Event;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,32 +128,42 @@ impl Recurrence {
     /// month or year counted in steps of `interval` from `first`. Months and
     /// years without the start's day (the 31st, 29 February) are skipped, as
     /// in RFC 5545.
+    ///
+    /// Periods beyond the dates chrono can represent (a remote rule with an
+    /// absurd INTERVAL) produce nothing rather than overflowing.
     fn period(&self, first: NaiveDateTime, k: i64, out: &mut Vec<NaiveDateTime>) {
-        let step = k * self.interval.max(1) as i64;
+        let Some(step) = k.checked_mul(self.interval.max(1) as i64) else { return };
         let time = first.time();
+        let days_later = |d: NaiveDate, n: i64| Duration::try_days(n).and_then(|n| d.checked_add_signed(n));
         match self.freq {
-            Freq::Daily => out.push(first + Duration::days(step)),
+            Freq::Daily => {
+                if let Some(d) = days_later(first.date(), step) {
+                    out.push(d.and_time(time));
+                }
+            }
             Freq::Weekly => {
                 // Weeks start on Monday here, like RFC 5545's default WKST.
                 let monday = first.date() - Duration::days(first.weekday().num_days_from_monday() as i64);
-                let week = monday + Duration::weeks(step);
+                let Some(week) = step.checked_mul(7).and_then(|n| days_later(monday, n)) else { return };
                 let mut days = self.days_of_week(first.date());
                 days.sort_by_key(|d| d.num_days_from_monday());
                 for d in days {
-                    let t = (week + Duration::days(d.num_days_from_monday() as i64)).and_time(time);
+                    let Some(day) = days_later(week, d.num_days_from_monday() as i64) else { continue };
+                    let t = day.and_time(time);
                     if t >= first {
                         out.push(t);
                     }
                 }
             }
             Freq::Monthly => {
-                let month = add_months(first_of_month(first.date()), step as i32);
-                if let Some(d) = month.with_day(first.day()) {
+                let Ok(step) = u32::try_from(step) else { return };
+                let month = first_of_month(first.date()).checked_add_months(chrono::Months::new(step));
+                if let Some(d) = month.and_then(|m| m.with_day(first.day())) {
                     out.push(d.and_time(time));
                 }
             }
             Freq::Yearly => {
-                let year = first.year() + step as i32;
+                let Some(year) = i32::try_from(step).ok().and_then(|s| first.year().checked_add(s)) else { return };
                 if let Some(d) = NaiveDate::from_ymd_opt(year, first.month(), first.day()) {
                     out.push(d.and_time(time));
                 }
@@ -581,6 +591,18 @@ mod tests {
         let ev = series(at(d(2024, 2, 29), 8, 0), 15, Recurrence::new(Freq::Yearly));
         let got: Vec<NaiveDate> = starts(&ev, d(2024, 1, 1), d(2033, 1, 1)).iter().map(|t| t.date()).collect();
         assert_eq!(got, [d(2024, 2, 29), d(2028, 2, 29), d(2032, 2, 29)]);
+    }
+
+    #[test]
+    fn an_absurd_interval_from_google_does_not_overflow() {
+        for freq in Freq::ALL {
+            let mut rule = Recurrence::new(freq);
+            rule.interval = u32::MAX;
+            let ev = series(at(d(2026, 11, 14), 9, 0), 60, rule);
+            let far = NaiveDate::MAX.and_hms_opt(0, 0, 0).unwrap();
+            let shown = occurrences(&ev, at(d(2026, 1, 1), 0, 0), far);
+            assert_eq!(shown.len(), 1, "{freq:?}: just the first");
+        }
     }
 
     #[test]
