@@ -467,6 +467,22 @@ fn removing_an_occurrence_adds_an_exdate_and_drops_its_override() {
 }
 
 #[test]
+fn an_invitation_to_one_occurrence_can_be_edited() {
+    let c = ics("BEGIN:VEVENT\r\nUID:inv\r\nSUMMARY:Planning\r\nORGANIZER:mailto:boss@example.com\r\n\
+        RECURRENCE-ID:20261114T150000Z\r\nDTSTART:20261114T150000Z\r\nDTEND:20261114T160000Z\r\nEND:VEVENT\r\n");
+    let mut ev = events(&cal(), "/inv.ics", Some("\"e1\""), &c, year().0, year().1).remove(0);
+    let rid = ev.remote_id.clone().unwrap();
+    let (_, key) = split_remote_id(&rid);
+    assert!(key.is_some(), "shown as an occurrence: {rid}");
+    ev.base = Some(ev.fields());
+    ev.notes = "bring the numbers".into();
+    let out = write(&put(Some(c), &ev, "inv", key).expect("editable without a series"));
+    assert!(out.contains("DESCRIPTION:bring the numbers"), "{out}");
+    assert!(out.contains("ORGANIZER:mailto:boss@example.com"), "the rest is kept");
+    assert_eq!(out.matches("BEGIN:VEVENT").count(), 1, "no series invented: {out}");
+}
+
+#[test]
 fn all_day_series_occurrences_use_dates() {
     let mut c = ics("BEGIN:VEVENT\r\nUID:bday\r\nSUMMARY:Birthday\r\nDTSTART;VALUE=DATE:20261120\r\nRRULE:FREQ=YEARLY\r\nEND:VEVENT\r\n");
     let evs = events(&cal(), "/b.ics", None, &c, year().0, year().1);

@@ -904,8 +904,15 @@ pub fn put(existing: Option<Component>, ev: &Event, uid: &str, key: Option<&str>
         }
         Some(k) => {
             let t = parse_key(k).ok_or_else(|| anyhow!("bad occurrence key {k}"))?;
-            let m = master(&cal).ok_or_else(|| anyhow!("the series is gone"))?.clone();
-            let s = m.prop("DTSTART").and_then(Series::of).ok_or_else(|| anyhow!("series without a start"))?;
+            // As in `find`: a resource may hold only overrides and no series
+            // (an invitation to one occurrence of someone's series); those
+            // can still be edited.
+            let series_like = master(&cal).or_else(|| cal.events().next()).cloned();
+            let s = series_like
+                .as_ref()
+                .and_then(|m| m.prop("DTSTART"))
+                .and_then(Series::of)
+                .ok_or_else(|| anyhow!("series without a start"))?;
             let existing = cal.subs.iter().position(|c| {
                 c.name == "VEVENT" && c.prop("RECURRENCE-ID").and_then(when).is_some_and(|w| s.wall(w) == t)
             });
@@ -913,6 +920,7 @@ pub fn put(existing: Option<Component>, ev: &Event, uid: &str, key: Option<&str>
                 Some(i) => i,
                 None => {
                     // A new override: the series' details, for this occurrence.
+                    let m = master(&cal).ok_or_else(|| anyhow!("the series is gone"))?;
                     let mut v = m.clone();
                     for name in ["RRULE", "RDATE", "EXDATE", "EXRULE", "DTSTART", "DTEND", "DURATION"] {
                         v.remove(name);
