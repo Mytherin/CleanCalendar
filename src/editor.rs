@@ -12,6 +12,7 @@ use eframe::egui::{self, Align, Align2, Color32, Key, Layout, Order, Pos2, Rect,
 
 use crate::dates::*;
 use crate::model::{looks_like_email, Attendee, Event, Response, Store};
+use crate::places;
 use crate::recurrence::{self, Freq, Recurrence, RepeatEnd};
 use crate::theme::{self, Palette, RED};
 
@@ -86,6 +87,15 @@ pub struct Editor {
     focus_title: bool,
     /// The search text in the time zone picker.
     zone_filter: String,
+    /// Suggestions for what's typed in the location field.
+    places: places::Lookup,
+    /// Where the suggestions were drawn last frame, so a click on them
+    /// doesn't count as leaving the field.
+    places_rect: Option<Rect>,
+    /// The "Download location data" hint was dismissed (Esc, or clicked).
+    places_hint_hidden: bool,
+    /// "Download location data…" was clicked: the app opens Settings.
+    pub open_location_settings: bool,
 }
 
 impl Editor {
@@ -107,6 +117,10 @@ impl Editor {
             size: Vec2::new(POPOVER_W, 260.0),
             focus_title: is_new,
             zone_filter: String::new(),
+            places: places::Lookup::default(),
+            places_rect: None,
+            places_hint_hidden: false,
+            open_location_settings: false,
         };
         ed.fields_from_draft();
         ed
@@ -819,6 +833,187 @@ fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
     });
 }
 
+/// A row's text cut to one line, with "…" if it doesn't fit.
+fn one_line(ui: &egui::Ui, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap.max_width = max_w.max(1.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    ui.fonts(|f| f.layout_job(job))
+}
+
+/// A map pin that opens the location in Google Maps.
+fn maps_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+    let color = if resp.hovered() { RED } else { p.secondary };
+    let c = rect.center() - Vec2::new(0.0, 2.5);
+    let painter = ui.painter();
+    painter.circle_filled(c, 5.5, color);
+    let tip = Pos2::new(c.x, rect.bottom() - 1.5);
+    painter.add(egui::Shape::convex_polygon(
+        vec![Pos2::new(c.x - 4.6, c.y + 2.6), Pos2::new(c.x + 4.6, c.y + 2.6), tip],
+        color,
+        Stroke::NONE,
+    ));
+    painter.circle_filled(c, 2.1, p.card);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open in Google Maps")
+}
+
+/// One row of the suggestions list; returns whether it was clicked.
+fn suggestion_row(ui: &mut egui::Ui, p: &Palette, title: &str, detail: &str, title_color: Color32, selected: bool) -> bool {
+    let w = ui.available_width();
+    let h = if detail.is_empty() { 24.0 } else { 36.0 };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+    if selected || resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, p.selection);
+    }
+    let x = rect.left() + 6.0;
+    let title_g = one_line(ui, title, theme::font(13.5), title_color, w - 12.0);
+    let title_y = if detail.is_empty() { rect.center().y - title_g.size().y / 2.0 } else { rect.top() + 3.0 };
+    ui.painter().galley(Pos2::new(x, title_y), title_g, title_color);
+    if !detail.is_empty() {
+        let detail_g = one_line(ui, detail, theme::font(11.5), p.secondary, w - 12.0);
+        ui.painter().galley(Pos2::new(x, rect.top() + 19.0), detail_g, p.secondary);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// Puts a picked suggestion in the location field, with the cursor at its end.
+fn take_suggestion(ui: &egui::Ui, id: egui::Id, ed: &mut Editor, label: String) {
+    let end = label.chars().count();
+    ed.draft.location = label;
+    ed.places.clear();
+    ed.places_rect = None;
+    let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(end))));
+    state.store(ui.ctx(), id);
+}
+
+/// The location field. While typing it suggests places from the location
+/// data downloaded in Settings (searched on this computer only), or offers
+/// to download some; the pin opens the location in Google Maps.
+fn location_row(ui: &mut egui::Ui, ed: &mut Editor, p: &Palette, read_only: bool) {
+    let lib = places::library();
+    lib.set_context(ui.ctx());
+    let id = ui.make_persistent_id("location-input");
+
+    // Keys for the list, taken before the field sees them.
+    let n = ed.places.suggestions.len();
+    if ui.memory(|m| m.has_focus(id)) && ed.places_rect.is_some() {
+        let (down, up, esc) = ui.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, Key::ArrowDown),
+                i.consume_key(egui::Modifiers::NONE, Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, Key::Escape),
+            )
+        });
+        let sel = &mut ed.places.selected;
+        if down && n > 0 {
+            *sel = Some(sel.map_or(0, |s| (s + 1).min(n - 1)));
+        }
+        if up {
+            *sel = sel.and_then(|s| s.checked_sub(1));
+        }
+        let picked = sel.filter(|_| ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter)));
+        if let Some(label) = picked.and_then(|i| ed.places.suggestions.get(i)).map(places::Suggestion::label) {
+            take_suggestion(ui, id, ed, label);
+        }
+        if esc {
+            ed.places.clear();
+            ed.places_hint_hidden = true;
+        }
+    }
+
+    let has_location = !ed.draft.location.trim().is_empty();
+    let field = ui
+        .horizontal(|ui| {
+            let button_w = if has_location { 20.0 + ui.spacing().item_spacing.x } else { 0.0 };
+            let field = ui.add_enabled(
+                !read_only,
+                egui::TextEdit::singleline(&mut ed.draft.location)
+                    .id(id)
+                    .hint_text(RichText::new("Add Location").color(p.placeholder))
+                    .text_color(p.text)
+                    .frame(false)
+                    .desired_width(ui.available_width() - button_w),
+            );
+            if has_location && maps_button(ui, p).clicked() {
+                if let Err(e) = open::that(places::google_maps_url(&ed.draft.location)) {
+                    ed.error = Some(format!("Could not open Google Maps: {e}"));
+                }
+            }
+            field
+        })
+        .inner;
+    if read_only {
+        return;
+    }
+    if field.gained_focus() {
+        lib.warm();
+    }
+    if field.changed() {
+        ed.places.typed(&ed.draft.location);
+        ed.places_hint_hidden = false;
+    }
+    ed.places.poll(ui.ctx(), lib);
+
+    // Shown while the field has focus, or the pointer is on the list (a
+    // click on it takes the focus away before it counts as a click).
+    let over_list = ed.places_rect.is_some_and(|r| ui.ctx().pointer_hover_pos().is_some_and(|pos| r.contains(pos)));
+    let typed = ed.draft.location.trim().chars().count() >= 2;
+    let no_data = typed && !ed.places_hint_hidden && !lib.has_regions();
+    if !(field.has_focus() || over_list) || (ed.places.suggestions.is_empty() && !no_data) {
+        if !field.has_focus() && !over_list {
+            ed.places.clear();
+        }
+        ed.places_rect = None;
+        return;
+    }
+
+    // As wide as the card's contents (the field and the pin).
+    let width = ui.max_rect().width() + 12.0;
+    let mut picked = None;
+    let area = egui::Area::new(id.with("suggestions"))
+        .order(Order::Tooltip)
+        .fixed_pos(field.rect.left_bottom() + Vec2::new(-6.0, 6.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).fill(p.popover).inner_margin(egui::Margin::same(4.0)).show(ui, |ui| {
+                ui.set_width(width);
+                ui.spacing_mut().item_spacing = Vec2::new(0.0, 1.0);
+                if ed.places.suggestions.is_empty() {
+                    if lib.is_downloading() {
+                        suggestion_row(ui, p, "Location data is downloading…", "Suggestions will appear once it's ready", p.secondary, false);
+                    } else if suggestion_row(
+                        ui,
+                        p,
+                        "Download location data…",
+                        "Get suggestions as you type, found offline",
+                        theme::ACCENT,
+                        false,
+                    ) {
+                        ed.open_location_settings = true;
+                        ed.places_hint_hidden = true;
+                    }
+                } else {
+                    for (i, s) in ed.places.suggestions.iter().enumerate() {
+                        if suggestion_row(ui, p, &s.title, &s.detail, p.text, ed.places.selected == Some(i)) {
+                            picked = Some(s.label());
+                        }
+                    }
+                    // OpenStreetMap's license asks for this wherever its data is shown.
+                    ui.add_space(2.0);
+                    ui.label(RichText::new("© OpenStreetMap contributors").color(p.tertiary).size(10.0));
+                }
+            });
+        });
+    ed.places_rect = Some(area.response.rect);
+    if let Some(label) = picked {
+        take_suggestion(ui, id, ed, label);
+        field.request_focus();
+    }
+}
+
 /// Draws the editor's contents into `ui`.
 pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> Outcome {
     let read_only = store.calendar(&ed.draft.calendar_id).is_some_and(|c| c.read_only);
@@ -847,14 +1042,8 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| calendar_chip(ui, ed, store, p, read_only));
             });
             divider(ui, p);
-            ui.add(
-                egui::TextEdit::singleline(&mut ed.draft.location)
-                    .hint_text(RichText::new("Add Location").color(p.placeholder))
-                    .text_color(p.text)
-                    .frame(false)
-                    .desired_width(f32::INFINITY),
-            );
         });
+        location_row(ui, ed, p, read_only);
     });
 
     // When: a summary line that expands into editable fields.
