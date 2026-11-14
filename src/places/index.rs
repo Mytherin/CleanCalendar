@@ -393,22 +393,48 @@ impl Index {
         offsets.iter().map(|&o| get_varint(&self.postings, &mut (o as usize)).unwrap_or(0)).sum()
     }
 
-    /// The entries (id << 1 | in name) under these words.
+    /// The entries (id << 1 | in name) under these words, in id order. Ids
+    /// follow the ranking, so when there are more than `MAX_CANDIDATES`
+    /// (a short prefix of a big country) the best ones are kept: the
+    /// words' lists are merged, not read one word after another (which
+    /// kept whichever words came first alphabetically).
     fn postings(&self, offsets: &[u64]) -> Vec<u64> {
-        let mut out = Vec::new();
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        struct List {
+            pos: usize,
+            left: u64,
+            v: u64,
+        }
+        let next = |l: &mut List| -> Option<u64> {
+            if l.left == 0 {
+                return None;
+            }
+            l.left -= 1;
+            let d = get_varint(&self.postings, &mut l.pos)?;
+            // A damaged list: stop rather than wrap into nonsense ids.
+            l.v = l.v.checked_add(d)?;
+            Some(l.v)
+        };
+        let mut lists: Vec<List> = Vec::with_capacity(offsets.len());
+        let mut heap = BinaryHeap::new();
         for &o in offsets {
             let mut pos = o as usize;
-            let Some(n) = get_varint(&self.postings, &mut pos) else { continue };
-            let mut v = 0u64;
-            for _ in 0..n {
-                let Some(d) = get_varint(&self.postings, &mut pos) else { break };
-                // A damaged list: stop rather than wrap into nonsense ids.
-                let Some(next) = v.checked_add(d) else { break };
-                v = next;
-                out.push(v);
-                if out.len() >= MAX_CANDIDATES {
-                    return out;
-                }
+            let Some(left) = get_varint(&self.postings, &mut pos) else { continue };
+            let mut l = List { pos, left, v: 0 };
+            if let Some(v) = next(&mut l) {
+                heap.push(Reverse((v, lists.len())));
+                lists.push(l);
+            }
+        }
+        let mut out = Vec::new();
+        while let Some(Reverse((v, i))) = heap.pop() {
+            out.push(v);
+            if out.len() >= MAX_CANDIDATES {
+                break;
+            }
+            if let Some(v) = next(&mut lists[i]) {
+                heap.push(Reverse((v, i)));
             }
         }
         out
@@ -571,6 +597,19 @@ mod tests {
         let bos = hits.iter().find(|h| h.suggestion.title == "Amsterdamse Bos").expect("found");
         assert_eq!(bos.rank.0, 1, "matched by its name: {hits:?}");
         assert_eq!(merge_flags(vec![4, 5, 6, 9]), [5, 6, 9]);
+    }
+
+    #[test]
+    fn a_prefixs_entries_come_in_ranking_order_across_its_words() {
+        // "am" covers several words ("amsterdam", "amsterdamseweg"): their
+        // entries are merged by id (the ranking), so a cut-off at
+        // MAX_CANDIDATES keeps the best ones.
+        let (_dir, idx) = sample();
+        let offs = idx.words_with_prefix("am");
+        assert!(offs.len() >= 2, "several words");
+        let got = idx.postings(&offs);
+        assert!(got.windows(2).all(|w| w[0] <= w[1]), "in id order: {got:?}");
+        assert_eq!(got.len() as u64, idx.posting_count(&offs), "nothing lost");
     }
 
     #[test]
