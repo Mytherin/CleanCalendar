@@ -42,8 +42,26 @@ fn draw_text(ui: &Ui, painter: &egui::Painter, pos: Pos2, text: &str, font: Font
     w
 }
 
-/// One line of text starting at `x`, vertically centered in `rect` using the
-/// font's real line height (fixed offsets drift when the UI font changes).
+/// Distance from the top of a one-line galley in `font` to the middle of its
+/// capital letters. Centering the line box instead leaves text visibly low:
+/// fonts like Segoe UI reserve much more room above the caps than below the
+/// baseline. Measured from the real "H" glyph so it tracks the loaded font.
+fn cap_middle(ui: &Ui, font: FontId) -> f32 {
+    let g = ui.fonts(|f| f.layout_no_wrap("H".to_owned(), font, Color32::WHITE));
+    match g.rows.first().and_then(|r| r.glyphs.first()) {
+        Some(h) if h.uv_rect.size.y > 0.0 => h.pos.y + h.uv_rect.offset.y + h.uv_rect.size.y / 2.0,
+        _ => g.size().y / 2.0,
+    }
+}
+
+/// Top y at which to place a one-line galley in `font` so its capitals are
+/// vertically centered on `center_y`.
+fn text_top_for_center(ui: &Ui, font: FontId, center_y: f32) -> f32 {
+    (center_y - cap_middle(ui, font)).round()
+}
+
+/// One line of text starting at `x`, vertically centered in `rect` on the
+/// font's real cap height (fixed offsets drift when the UI font changes).
 fn draw_text_centered(
     ui: &Ui,
     painter: &egui::Painter,
@@ -54,8 +72,8 @@ fn draw_text_centered(
     color: Color32,
     max_w: f32,
 ) {
+    let y = text_top_for_center(ui, font.clone(), rect.center().y);
     let g = text_galley(ui, text, font, color, max_w);
-    let y = (rect.center().y - g.size().y / 2.0).round();
     painter.galley(Pos2::new(x, y), g, color);
 }
 
@@ -349,16 +367,13 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
         painter.rect_filled(bar, 1.5, if selected { Color32::WHITE } else { color });
         let time = fmt_time(ev.start.time());
         let time_font = theme::font(11.0);
-        let tw = text_galley(ui, &time, time_font.clone(), p.secondary, 100.0).size().x;
+        let time_color = if selected { Color32::WHITE } else { p.secondary };
+        let time_g = text_galley(ui, &time, time_font.clone(), time_color, 100.0);
+        let tw = time_g.size().x;
         let show_time = r.width() > tw + 60.0;
         if show_time {
-            painter.text(
-                Pos2::new(r.right() - 4.0, r.center().y),
-                Align2::RIGHT_CENTER,
-                &time,
-                time_font,
-                if selected { Color32::WHITE } else { p.secondary },
-            );
+            let y = text_top_for_center(ui, time_font, r.center().y);
+            painter.galley(Pos2::new(r.right() - 4.0 - tw, y), time_g, time_color);
         }
         let max_w = r.width() - 16.0 - if show_time { tw + 8.0 } else { 0.0 };
         draw_text_centered(ui, &painter, r.left() + 11.0, r, &ev.title, theme::font(12.5), text_color, max_w);
