@@ -1,0 +1,1138 @@
+{
+  "countries": [
+    {
+      "id": "afghanistan",
+      "name": "Afghanistan",
+      "file": "afghanistan.places",
+      "bytes": 312078,
+      "entries": 13884,
+      "updated": "2026-11-14",
+      "sha256": "2720c6f77bf73220b85673af0192b91b35c96f83b8ac9edfde2448ec9a19d4c9"
+    },
+    {
+      "id": "albania",
+      "name": "Albania",
+      "file": "albania.places",
+      "bytes": 579103,
+      "entries": 38007,
+      "updated": "2026-11-14",
+      "sha256": "19a72e07a55c3d90027ca33b9cc45f21279236eadd167ff55facb7f882f78c4e"
+    },
+    {
+      "id": "algeria",
+      "name": "Algeria",
+      "file": "algeria.places",
+      "bytes": 1841474,
+      "entries": 95185,
+      "updated": "2026-11-14",
+      "sha256": "083a4219340dd6ff77ee653f65e3ecc410a2aef72c7368f354f4a40e01236b77"
+    },
+    {
+      "id": "andorra",
+      "name": "Andorra",
+      "file": "andorra.places",
+      "bytes": 49351,
+      "entries": 2404,
+      "updated": "2026-11-14",
+      "sha256": "b2b228d1a658bf9363b682915236b886adf185945f159179187d91b7fcb36347"
+    },
+    {
+      "id": "angola",
+      "name": "Angola",
+      "file": "angola.places",
+      "bytes": 370789,
+      "entries": 22278,
+      "updated": "2026-11-14",
+      "sha256": "4dc09d3f10aa674e7780199c47d80bbd44691aaa75103d3358ec7548f03dfbfc"
+    },
+    {
+      "id": "antarctica",
+      "name": "Antarctica",
+      "file": "antarctica.places",
+      "bytes": 22638,
+      "entries": 853,
+      "updated": "2026-11-14",
+      "sha256": "75e609665e8f512e3605040c1f1caff782b90f7198a11746970c563aeb5ea6c6"
+    },
+    {
+      "id": "argentina",
+      "name": "Argentina",
+      "file": "argentina.places",
+      "bytes": 6306468,
+      "entries": 535415,
+      "updated": "2026-11-14",
+      "sha256": "0ff8da5e783d163c099e5ef83b39ac650fc11bae21b3740153b5b7b8384755de"
+    },
+    {
+      "id": "armenia",
+      "name": "Armenia",
+      "file": "armenia.places",
+      "bytes": 397023,
+      "entries": 24928,
+      "updated": "2026-11-14",
+      "sha256": "daa3be7d1a3ac42b08b94b893698416e0997ac704bbf1bf6b4ce8d21aab27e78"
+    },
+    {
+      "id": "australia",
+      "name": "Australia",
+      "file": "australia.places",
+      "bytes": 8888604,
+      "entries": 810361,
+      "updated": "2026-11-14",
+      "sha256": "d792e1c6ad9bbf9fcc3988ca8e0efc319aabfc4bda27616a2834d640f401fef7"
+    },
+    {
+      "id": "austria",
+      "name": "Austria",
+      "file": "austria.places",
+      "bytes": 6377351,
+      "entries": 453966,
+      "updated": "2026-11-14",
+      "sha256": "ba881d4eff42945cb937b12ceac3e16b55617d41deb288e4f368a6cccf6b802e"
+    },
+    {
+      "id": "azerbaijan",
+      "name": "Azerbaijan",
+      "file": "azerbaijan.places",
+      "bytes": 779778,
+      "entries": 63369,
+      "updated": "2026-11-14",
+      "sha256": "2b70cf7a9d6562cd6a2069c0291514d6a8b11a9b6092d523b177aee9e5cbccd5"
+    },
+    {
+      "id": "bahamas",
+      "name": "Bahamas",
+      "file": "bahamas.places",
+      "bytes": 130884,
+      "entries": 7939,
+      "updated": "2026-11-14",
+      "sha256": "f1e2cf4d4fe191b3211a4b151f337b4dad4ccbbec50c366f0fefad79e9c4e1cd"
+    },
+    {
+      "id": "bangladesh",
+      "name": "Bangladesh",
+      "file": "bangladesh.places",
+      "bytes": 2358606,
+      "entries": 116821,
+      "updated": "2026-11-14",
+      "sha256": "6f8355f18b25e824e832f1f1143692383fa36dfe158688e5a28fa2fe13e93df0"
+    },
+    {
+      "id": "belarus",
+      "name": "Belarus",
+      "file": "belarus.places",
+      "bytes": 2364364,
+      "entries": 192166,
+      "updated": "2026-11-14",
+      "sha256": "cfb3dedc98148c951246cb1e8fd5c0fac2ef634b723504b1c021658bf3b2a8cb"
+    },
+    {
+      "id": "belgium",
+      "name": "Belgium",
+      "file": "belgium.places",
+      "bytes": 5605508,
+      "entries": 386847,
+      "updated": "2026-11-14",
+      "sha256": "bb27a837f9d05cdb59fb602784aaf5c573b1003f73c50b6730058796b9e88480"
+    },
+    {
+      "id": "belize",
+      "name": "Belize",
+      "file": "belize.places",
+      "bytes": 214801,
+      "entries": 12597,
+      "updated": "2026-11-14",
+      "sha256": "faed480e250180bc0c62e60242bef2108fda2e34481a89c2b65c25034c70be23"
+    },
+    {
+      "id": "benin",
+      "name": "Benin",
+      "file": "benin.places",
+      "bytes": 477499,
+      "entries": 29358,
+      "updated": "2026-11-14",
+      "sha256": "a71d8546245b79d83632034d4cd0ceda6da88503868b060719aed48586acd94c"
+    },
+    {
+      "id": "bhutan",
+      "name": "Bhutan",
+      "file": "bhutan.places",
+      "bytes": 176145,
+      "entries": 10381,
+      "updated": "2026-11-14",
+      "sha256": "ec712830f16c5845894fc5fc8a3f245429a30080be3cf08bcac0698eddc0b7c5"
+    },
+    {
+      "id": "bolivia",
+      "name": "Bolivia",
+      "file": "bolivia.places",
+      "bytes": 1547924,
+      "entries": 109166,
+      "updated": "2026-11-14",
+      "sha256": "1d09185b405c858465bb35a247561162dc3fbd1da00d0834c4012e0ae4210cfc"
+    },
+    {
+      "id": "bosnia-herzegovina",
+      "name": "Bosnia-Herzegovina",
+      "file": "bosnia-herzegovina.places",
+      "bytes": 776742,
+      "entries": 52490,
+      "updated": "2026-11-14",
+      "sha256": "ef9a1c3471688ea9a17ad9e5fc8c056c4b5f5a32396c91d43e817f8e69408b64"
+    },
+    {
+      "id": "botswana",
+      "name": "Botswana",
+      "file": "botswana.places",
+      "bytes": 136299,
+      "entries": 8298,
+      "updated": "2026-11-14",
+      "sha256": "14614c19006539197d0e55c7f9db41d366ae8bb1390b6e122208d812e76d4812"
+    },
+    {
+      "id": "brazil",
+      "name": "Brazil",
+      "file": "brazil.places",
+      "bytes": 26039922,
+      "entries": 2226088,
+      "updated": "2026-11-14",
+      "sha256": "8c4f0ecb1ff16825a0ccfbbb34ccc4db72e7e4c13dbbcbaa3b25b1d3f20bf4bf"
+    },
+    {
+      "id": "bulgaria",
+      "name": "Bulgaria",
+      "file": "bulgaria.places",
+      "bytes": 1435113,
+      "entries": 115032,
+      "updated": "2026-11-14",
+      "sha256": "298d7c36f81d9429f67e46a3576eaa7612e77f9d7c527b4630e51872c800a7e8"
+    },
+    {
+      "id": "burkina-faso",
+      "name": "Burkina Faso",
+      "file": "burkina-faso.places",
+      "bytes": 355416,
+      "entries": 24340,
+      "updated": "2026-11-14",
+      "sha256": "6ad59afe948824d19b7e811cf04ff7fe0f6fd3bfd3f4ef24407a1579ba0a96b0"
+    },
+    {
+      "id": "burundi",
+      "name": "Burundi",
+      "file": "burundi.places",
+      "bytes": 86462,
+      "entries": 5101,
+      "updated": "2026-11-14",
+      "sha256": "1c78a3cae5f1ec39a3a68aadd1dec3f0dafa7582dcdd28d8656205052fc0d488"
+    },
+    {
+      "id": "cambodia",
+      "name": "Cambodia",
+      "file": "cambodia.places",
+      "bytes": 403465,
+      "entries": 19896,
+      "updated": "2026-11-14",
+      "sha256": "18e49dfee29d5bc6e535fef8b392050e8888b069ba6c40e4747d5eae7654bdba"
+    },
+    {
+      "id": "cameroon",
+      "name": "Cameroon",
+      "file": "cameroon.places",
+      "bytes": 714384,
+      "entries": 47990,
+      "updated": "2026-11-14",
+      "sha256": "6b98139cdc052eb3ba26f127e15db73258f0149a48f3b1b28efbbb98d60df82c"
+    },
+    {
+      "id": "canada",
+      "name": "Canada",
+      "file": "canada.places",
+      "bytes": 11447543,
+      "entries": 959770,
+      "updated": "2026-11-14",
+      "sha256": "ee4f8677d0344ef55bd4fb2ba50fd514be6ce68f1e73b93bf9f84cb3e1789703"
+    },
+    {
+      "id": "cape-verde",
+      "name": "Cape Verde",
+      "file": "cape-verde.places",
+      "bytes": 90787,
+      "entries": 5006,
+      "updated": "2026-11-14",
+      "sha256": "b19fb1533a92bfbb07250b2eaff3bfa7225e5aded91fd33395cf68c3f25a792f"
+    },
+    {
+      "id": "central-african-republic",
+      "name": "Central African Republic",
+      "file": "central-african-republic.places",
+      "bytes": 104764,
+      "entries": 6713,
+      "updated": "2026-11-14",
+      "sha256": "18f8290db3945b4697918f3ebcd13605602846bebfce53b0bc3d8b2a117160c3"
+    },
+    {
+      "id": "chad",
+      "name": "Chad",
+      "file": "chad.places",
+      "bytes": 413676,
+      "entries": 24889,
+      "updated": "2026-11-14",
+      "sha256": "a3db65e64fef483d13803056d85b05bdb4b3dabb0f8f4a7beb58d14e3caae582"
+    },
+    {
+      "id": "chile",
+      "name": "Chile",
+      "file": "chile.places",
+      "bytes": 3554212,
+      "entries": 307371,
+      "updated": "2026-11-14",
+      "sha256": "d7bb8c96dcbaa996fc26609a12384824e025ad504a810cf624eb924ab3e9e8bf"
+    },
+    {
+      "id": "china",
+      "name": "China",
+      "file": "china.places",
+      "bytes": 22241638,
+      "entries": 1485172,
+      "updated": "2026-11-14",
+      "sha256": "3984ccb034db21541122579ccad0855cb51384e4084f4b2ca59101a5e755ad7b"
+    },
+    {
+      "id": "colombia",
+      "name": "Colombia",
+      "file": "colombia.places",
+      "bytes": 3408012,
+      "entries": 306580,
+      "updated": "2026-11-14",
+      "sha256": "a2275488a58e3e11ac75b9d2bdfd6d6a55f0f9ca63b61f1627ea96477b406903"
+    },
+    {
+      "id": "congo-democratic-republic",
+      "name": "Congo (Democratic Republic/Kinshasa)",
+      "file": "congo-democratic-republic.places",
+      "bytes": 797319,
+      "entries": 53696,
+      "updated": "2026-11-14",
+      "sha256": "a8e8b65671673f75231609ec9adfccffa1879671d4a60ce07c6c3af0d5ec0d5b"
+    },
+    {
+      "id": "congo-brazzaville",
+      "name": "Congo (Republic/Brazzaville)",
+      "file": "congo-brazzaville.places",
+      "bytes": 146996,
+      "entries": 8540,
+      "updated": "2026-11-14",
+      "sha256": "a86f5e988c5303e16cc69defc35f17be770822e8f6178ab69459841fbc5a0bb0"
+    },
+    {
+      "id": "cook-islands",
+      "name": "Cook Islands",
+      "file": "cook-islands.places",
+      "bytes": 17126,
+      "entries": 823,
+      "updated": "2026-11-14",
+      "sha256": "316664a927c93935166959cdc24527192b1d690af8b681d6f77682660344ae95"
+    },
+    {
+      "id": "costa-rica",
+      "name": "Costa Rica",
+      "file": "costa-rica.places",
+      "bytes": 1218573,
+      "entries": 107369,
+      "updated": "2026-11-14",
+      "sha256": "9104da2990dd005cfce09dab77fe9d388617efcae5e3ecd8dec7c2d95090587e"
+    },
+    {
+      "id": "croatia",
+      "name": "Croatia",
+      "file": "croatia.places",
+      "bytes": 1809998,
+      "entries": 133278,
+      "updated": "2026-11-14",
+      "sha256": "1ef6f9759618e065c4590b2f04edc6ab516895311cbc3d3aa8bedda31da29be8"
+    },
+    {
+      "id": "cuba",
+      "name": "Cuba",
+      "file": "cuba.places",
+      "bytes": 1113698,
+      "entries": 89456,
+      "updated": "2026-11-14",
+      "sha256": "8ba79cac1941677ca3baa612c9771fd56620e86e474449dd3211cf68e8af672e"
+    },
+    {
+      "id": "cyprus",
+      "name": "Cyprus",
+      "file": "cyprus.places",
+      "bytes": 741067,
+      "entries": 47599,
+      "updated": "2026-11-14",
+      "sha256": "6a5d0379653938c1ad53621e9ba104f4863633ff5008dcf1d2cdb8ea5e4aa1f0"
+    },
+    {
+      "id": "czech-republic",
+      "name": "Czech Republic",
+      "file": "czech-republic.places",
+      "bytes": 4246527,
+      "entries": 340601,
+      "updated": "2026-11-14",
+      "sha256": "e52e8a2552b9afce08bb71052c7d771870d08307b8bb4b7198ca71cde7a6088f"
+    },
+    {
+      "id": "denmark",
+      "name": "Denmark",
+      "file": "denmark.places",
+      "bytes": 2561195,
+      "entries": 231871,
+      "updated": "2026-11-14",
+      "sha256": "024f4d357c603b470d0e28d5690bfa910db70c080a6b29063845d052798b7c34"
+    },
+    {
+      "id": "djibouti",
+      "name": "Djibouti",
+      "file": "djibouti.places",
+      "bytes": 44807,
+      "entries": 1368,
+      "updated": "2026-11-14",
+      "sha256": "dd1a9d03e2e8c174118d5e55a5c301c326f04c86b7245f18392d38f6d683829a"
+    },
+    {
+      "id": "east-timor",
+      "name": "East Timor",
+      "file": "east-timor.places",
+      "bytes": 146195,
+      "entries": 8192,
+      "updated": "2026-11-14",
+      "sha256": "230928c462d462f5ff05708a13d871363defaf76a6dde80ac319ede7c7a026a0"
+    },
+    {
+      "id": "ecuador",
+      "name": "Ecuador",
+      "file": "ecuador.places",
+      "bytes": 2698317,
+      "entries": 197517,
+      "updated": "2026-11-14",
+      "sha256": "1b71e136f92ea14b151038368154a42595d0423ac19b0d3b3164d74929c186cb"
+    },
+    {
+      "id": "egypt",
+      "name": "Egypt",
+      "file": "egypt.places",
+      "bytes": 1867685,
+      "entries": 196186,
+      "updated": "2026-11-14",
+      "sha256": "447acac2ac538244af38455d1e8a0740e1681e9f77df4e26761fafa0cec523f9"
+    },
+    {
+      "id": "el-salvador",
+      "name": "El Salvador",
+      "file": "el-salvador.places",
+      "bytes": 534814,
+      "entries": 42012,
+      "updated": "2026-11-14",
+      "sha256": "abcb1467806ab268668179f5c15e0212bc51849850e38a87e45416d53c4d3e39"
+    },
+    {
+      "id": "equatorial-guinea",
+      "name": "Equatorial Guinea",
+      "file": "equatorial-guinea.places",
+      "bytes": 25022,
+      "entries": 1169,
+      "updated": "2026-11-14",
+      "sha256": "f4e1eae861a8bac285b86a26b7a16edfa76cf93d59b7f6030e0c9784644f7022"
+    },
+    {
+      "id": "eritrea",
+      "name": "Eritrea",
+      "file": "eritrea.places",
+      "bytes": 63820,
+      "entries": 1971,
+      "updated": "2026-11-14",
+      "sha256": "49bf24788d9a8be4a4aa388cb7663c2cdc21f602f4048795d36e79837f9ef213"
+    },
+    {
+      "id": "estonia",
+      "name": "Estonia",
+      "file": "estonia.places",
+      "bytes": 713514,
+      "entries": 56631,
+      "updated": "2026-11-14",
+      "sha256": "ad929f3028055864db52e1bada1d59985c24c51611e04d15628c419d373809c9"
+    },
+    {
+      "id": "ethiopia",
+      "name": "Ethiopia",
+      "file": "ethiopia.places",
+      "bytes": 414508,
+      "entries": 21975,
+      "updated": "2026-11-14",
+      "sha256": "99d4f0623b85ec48fa9a7d30b17a4a3e2bd03271eabc91445a7a825b2da6e7ad"
+    },
+    {
+      "id": "faroe-islands",
+      "name": "Faroe Islands",
+      "file": "faroe-islands.places",
+      "bytes": 60030,
+      "entries": 3634,
+      "updated": "2026-11-14",
+      "sha256": "ddcefaa6dbc19c5fbf0f06f1b4622cbbc1d1dc3074a03b9ad77ec565f713fb90"
+    },
+    {
+      "id": "fiji",
+      "name": "Fiji",
+      "file": "fiji.places",
+      "bytes": 142930,
+      "entries": 9596,
+      "updated": "2026-11-14",
+      "sha256": "75d1cf0939fbe4b6230a8d0cb6c1d23cfd4a013eb78c77a8819e30448928f4c5"
+    },
+    {
+      "id": "finland",
+      "name": "Finland",
+      "file": "finland.places",
+      "bytes": 4022992,
+      "entries": 321129,
+      "updated": "2026-11-14",
+      "sha256": "fb7647bee715aa5e5a01f288bf569c0492a046df78ee3fdfd4fe56baf3be4d24"
+    },
+    {
+      "id": "france",
+      "name": "France",
+      "file": "france.places",
+      "bytes": 39250757,
+      "entries": 3638396,
+      "updated": "2026-11-14",
+      "sha256": "eab7f2d7ac849d2cc17178258c3d47433a4cc1dfb80d423ec8c89469518474e7"
+    },
+    {
+      "id": "gabon",
+      "name": "Gabon",
+      "file": "gabon.places",
+      "bytes": 124016,
+      "entries": 6206,
+      "updated": "2026-11-14",
+      "sha256": "f66a8afbcb37e5a5380c5553314e7d30be01fcd4603410bcba2cbc82a011ede8"
+    },
+    {
+      "id": "gcc-states",
+      "name": "GCC States",
+      "file": "gcc-states.places",
+      "bytes": 2980874,
+      "entries": 223841,
+      "updated": "2026-11-14",
+      "sha256": "1a048b20ae9861acbe77b5103db42ba1853d159f09523071e7d0ebc7edc804c8"
+    },
+    {
+      "id": "georgia",
+      "name": "Georgia",
+      "file": "georgia.places",
+      "bytes": 871077,
+      "entries": 53090,
+      "updated": "2026-11-14",
+      "sha256": "8f09369009d46f56cbc1a9ddb3dc41c29a5acf380167591f14cbe796c0a9cb36"
+    },
+    {
+      "id": "germany",
+      "name": "Germany",
+      "file": "germany.places",
+      "bytes": 43112021,
+      "entries": 3350058,
+      "updated": "2026-11-14",
+      "sha256": "3170ff9775b614aa21726ccd0fa52243dd27a4c7234900dfa03c8e1187e58637"
+    },
+    {
+      "id": "ghana",
+      "name": "Ghana",
+      "file": "ghana.places",
+      "bytes": 807549,
+      "entries": 50864,
+      "updated": "2026-11-14",
+      "sha256": "b44b888814218b425db6dc2b4b5505f9756ceea03db812e5f014e7cc5735382a"
+    },
+    {
+      "id": "greece",
+      "name": "Greece",
+      "file": "greece.places",
+      "bytes": 3300998,
+      "entries": 240227,
+      "updated": "2026-11-14",
+      "sha256": "56d97770010c23ea5755f8090944d6c856b9cda535e6fea11382b670fde66563"
+    },
+    {
+      "id": "greenland",
+      "name": "Greenland",
+      "file": "greenland.places",
+      "bytes": 68606,
+      "entries": 3806,
+      "updated": "2026-11-14",
+      "sha256": "498e93d3bd4b4dcf8d1aef54a04b560f0f533a4d0a43d030b3eb1b25c741bb53"
+    },
+    {
+      "id": "guatemala",
+      "name": "Guatemala",
+      "file": "guatemala.places",
+      "bytes": 698602,
+      "entries": 51999,
+      "updated": "2026-11-14",
+      "sha256": "8bed4e558b9b53ecda9080c4a0d451d2ebd05e4c84b18483c80ae9f875b79b10"
+    },
+    {
+      "id": "guinea",
+      "name": "Guinea",
+      "file": "guinea.places",
+      "bytes": 328689,
+      "entries": 21655,
+      "updated": "2026-11-14",
+      "sha256": "c08c74242944376202af1a9003ecd4b4f25038502e4d11c568c24834534609dd"
+    },
+    {
+      "id": "guinea-bissau",
+      "name": "Guinea-Bissau",
+      "file": "guinea-bissau.places",
+      "bytes": 33574,
+      "entries": 1698,
+      "updated": "2026-11-14",
+      "sha256": "60e73afc3874e30d40e24b990a9d5d15aa23bb440451c84946c48a226ccc84b0"
+    },
+    {
+      "id": "guyana",
+      "name": "Guyana",
+      "file": "guyana.places",
+      "bytes": 145073,
+      "entries": 8272,
+      "updated": "2026-11-14",
+      "sha256": "0b2ca9c8b9a310ba40194c828799e3b99c8d4a6d21d5baa7c02843f12ad1aa8a"
+    },
+    {
+      "id": "guyane",
+      "name": "Guyane",
+      "file": "guyane.places",
+      "bytes": 175143,
+      "entries": 9427,
+      "updated": "2026-11-14",
+      "sha256": "1cab973e2f62bb66d8322294bf3f8bbf6cd484fd1ae2d58f7e9c97d195e6e90f"
+    },
+    {
+      "id": "haiti-and-domrep",
+      "name": "Haiti and Dominican Republic",
+      "file": "haiti-and-domrep.places",
+      "bytes": 1417053,
+      "entries": 97036,
+      "updated": "2026-11-14",
+      "sha256": "4dda4f8b7e7035c2ad25cb8d4cf63333d0127d10b74291092fc11e61899d4067"
+    },
+    {
+      "id": "honduras",
+      "name": "Honduras",
+      "file": "honduras.places",
+      "bytes": 416147,
+      "entries": 33590,
+      "updated": "2026-11-14",
+      "sha256": "674fd8c9e2a52418ccc8b0063d56437a707dfbd9d04516e0c250b2ce17aa175b"
+    },
+    {
+      "id": "hungary",
+      "name": "Hungary",
+      "file": "hungary.places",
+      "bytes": 3309900,
+      "entries": 287302,
+      "updated": "2026-11-14",
+      "sha256": "6aa2f54be5192937a3987645c1397f8f2877fa3956fb6a0182837174f1a7654a"
+    },
+    {
+      "id": "iceland",
+      "name": "Iceland",
+      "file": "iceland.places",
+      "bytes": 295910,
+      "entries": 20209,
+      "updated": "2026-11-14",
+      "sha256": "dbed1136fcc76ab47d867c78b40ae757ba8484d5ce0d0c8c46e88d244844f8dd"
+    },
+    {
+      "id": "india",
+      "name": "India",
+      "file": "india.places",
+      "bytes": 17739863,
+      "entries": 1129059,
+      "updated": "2026-11-14",
+      "sha256": "0c7068d928ec951e527fae74e2ff952659159f7305dee721e92cc4a0843a3a39"
+    },
+    {
+      "id": "indonesia",
+      "name": "Indonesia (with East Timor)",
+      "file": "indonesia.places",
+      "bytes": 9028991,
+      "entries": 725419,
+      "updated": "2026-11-14",
+      "sha256": "e3e19dc6c367119f1b6efd77774097af8ed66f8eb05ae348f09c66a36758fbaa"
+    },
+    {
+      "id": "iran",
+      "name": "Iran",
+      "file": "iran.places",
+      "bytes": 7253396,
+      "entries": 724576,
+      "updated": "2026-11-14",
+      "sha256": "74bfeac0e753ba2eba706592b9e80f01e1f5612571d4f476150bbc448ebcb5f6"
+    },
+    {
+      "id": "iraq",
+      "name": "Iraq",
+      "file": "iraq.places",
+      "bytes": 2521197,
+      "entries": 171295,
+      "updated": "2026-11-14",
+      "sha256": "f5583fbf8b214945cee2bd456587914b69773940480a17e3fee633bcbaa68552"
+    },
+    {
+      "id": "ireland-and-northern-ireland",
+      "name": "Ireland and Northern Ireland",
+      "file": "ireland-and-northern-ireland.places",
+      "bytes": 2574551,
+      "entries": 201591,
+      "updated": "2026-11-14",
+      "sha256": "161522ec3f426bfb1277fea2cd635e6f51879e587ee803d6c0b4bb72d5233b81"
+    },
+    {
+      "id": "israel-and-palestine",
+      "name": "Israel and Palestine",
+      "file": "israel-and-palestine.places",
+      "bytes": 1368043,
+      "entries": 103382,
+      "updated": "2026-11-14",
+      "sha256": "e2d80e8b1f7660eed7e176f5371a27352c5c033c8108ba4072d2eb75bce01ea9"
+    },
+    {
+      "id": "italy",
+      "name": "Italy",
+      "file": "italy.places",
+      "bytes": 20935832,
+      "entries": 1799641,
+      "updated": "2026-11-14",
+      "sha256": "c037adcd4a5a7054d585a700d9fdc6e5039c70524b6a675435bd2884841e8156"
+    },
+    {
+      "id": "ivory-coast",
+      "name": "Ivory Coast",
+      "file": "ivory-coast.places",
+      "bytes": 864997,
+      "entries": 55521,
+      "updated": "2026-11-14",
+      "sha256": "73f6dc1ed7be2af9570828d6dd0dc937a6a6cf2683eac9b16002404caf3b5d4e"
+    },
+    {
+      "id": "jamaica",
+      "name": "Jamaica",
+      "file": "jamaica.places",
+      "bytes": 301243,
+      "entries": 21603,
+      "updated": "2026-11-14",
+      "sha256": "8af69fcdda1e065c625e6cbf4183f9bceb490c1696ce09d90adcdfc29a1a57d8"
+    },
+    {
+      "id": "japan",
+      "name": "Japan",
+      "file": "japan.places",
+      "bytes": 26399327,
+      "entries": 1632352,
+      "updated": "2026-11-14",
+      "sha256": "54316038470935809bfbd0778159cbe76357105c4fb0c74b271927db0a839b39"
+    },
+    {
+      "id": "jordan",
+      "name": "Jordan",
+      "file": "jordan.places",
+      "bytes": 325039,
+      "entries": 18709,
+      "updated": "2026-11-14",
+      "sha256": "4d2c4aeb10a5557543d1c6ffe52639014dfe13634dc98d01ca7ca0c036ca57e2"
+    },
+    {
+      "id": "kazakhstan",
+      "name": "Kazakhstan",
+      "file": "kazakhstan.places",
+      "bytes": 1609730,
+      "entries": 121360,
+      "updated": "2026-11-14",
+      "sha256": "3db9e4a9ad53386a9a2841ab4e6729e9287db42b7fcff18863637a618d93da35"
+    },
+    {
+      "id": "kenya",
+      "name": "Kenya",
+      "file": "kenya.places",
+      "bytes": 1087277,
+      "entries": 68570,
+      "updated": "2026-11-14",
+      "sha256": "9551ea901f95af0e7b12e35a9ceebe500b3d8095f5cabb9aa5c590e27311dbfb"
+    },
+    {
+      "id": "kiribati",
+      "name": "Kiribati",
+      "file": "kiribati.places",
+      "bytes": 17810,
+      "entries": 822,
+      "updated": "2026-11-14",
+      "sha256": "88c2f92939d03b2b6d6ff43c2b267a7581d5e2c8e7144163041b972ed7b51111"
+    },
+    {
+      "id": "kyrgyzstan",
+      "name": "Kyrgyzstan",
+      "file": "kyrgyzstan.places",
+      "bytes": 588847,
+      "entries": 37626,
+      "updated": "2026-11-14",
+      "sha256": "d6533449d7bb642f560d569a425ec31142b1407d3da3d97a9b7af1f6d1d2982b"
+    },
+    {
+      "id": "laos",
+      "name": "Laos",
+      "file": "laos.places",
+      "bytes": 337055,
+      "entries": 17396,
+      "updated": "2026-11-14",
+      "sha256": "8421fbec80a0d31cb335ac01305ab76f2f502819be1fed8e9f0d0753109611eb"
+    },
+    {
+      "id": "latvia",
+      "name": "Latvia",
+      "file": "latvia.places",
+      "bytes": 1312461,
+      "entries": 128045,
+      "updated": "2026-11-14",
+      "sha256": "c54f6d97867dd4675963aa88b744a93080f9b76cb00c1a29cfe3537333b41a0e"
+    },
+    {
+      "id": "lebanon",
+      "name": "Lebanon",
+      "file": "lebanon.places",
+      "bytes": 343277,
+      "entries": 20704,
+      "updated": "2026-11-14",
+      "sha256": "bef74d7740264c080a3684c696770155620fd6f0dfda67f9c73a5ef74ae823a8"
+    },
+    {
+      "id": "lesotho",
+      "name": "Lesotho",
+      "file": "lesotho.places",
+      "bytes": 189189,
+      "entries": 11475,
+      "updated": "2026-11-14",
+      "sha256": "9b30d519a0d710f0cf8490cc56f0e580f2fcff80d801ade338d91a4cac3faf4f"
+    },
+    {
+      "id": "liberia",
+      "name": "Liberia",
+      "file": "liberia.places",
+      "bytes": 336116,
+      "entries": 21910,
+      "updated": "2026-11-14",
+      "sha256": "bb43f23d56e8dcbb84a7783c3960820dc371448590afdb02287862418aba095c"
+    },
+    {
+      "id": "libya",
+      "name": "Libya",
+      "file": "libya.places",
+      "bytes": 587214,
+      "entries": 33754,
+      "updated": "2026-11-14",
+      "sha256": "3f5e65c31794be3f6e5d4f0e82730221bb62d4d029e329b092a3315918073201"
+    },
+    {
+      "id": "liechtenstein",
+      "name": "Liechtenstein",
+      "file": "liechtenstein.places",
+      "bytes": 41400,
+      "entries": 2062,
+      "updated": "2026-11-14",
+      "sha256": "244c7e728cd46ec48d22387e6d3d11bfac70de5f4878ab87e450166eaeb18f1a"
+    },
+    {
+      "id": "lithuania",
+      "name": "Lithuania",
+      "file": "lithuania.places",
+      "bytes": 1233261,
+      "entries": 102153,
+      "updated": "2026-11-14",
+      "sha256": "a3a693c022c46fb020fe606fbb2205c03cb6366c0b7051b13f7f95c7dd88f70a"
+    },
+    {
+      "id": "luxembourg",
+      "name": "Luxembourg",
+      "file": "luxembourg.places",
+      "bytes": 440870,
+      "entries": 27223,
+      "updated": "2026-11-14",
+      "sha256": "f976adf50903ee2cdcbbb83d60595cd4189e89a24f6e4429a416d6d08ce1e169"
+    },
+    {
+      "id": "macedonia",
+      "name": "Macedonia",
+      "file": "macedonia.places",
+      "bytes": 311830,
+      "entries": 18412,
+      "updated": "2026-11-14",
+      "sha256": "62e9d3be1cdda3346599eef93d2278d8bc850c9d344d352372fe55114fafca0e"
+    },
+    {
+      "id": "madagascar",
+      "name": "Madagascar",
+      "file": "madagascar.places",
+      "bytes": 578583,
+      "entries": 41260,
+      "updated": "2026-11-14",
+      "sha256": "391884b1ffd18b128dc0b7f337bcadad6028656f02dc2c41e84a47d211549b06"
+    },
+    {
+      "id": "malawi",
+      "name": "Malawi",
+      "file": "malawi.places",
+      "bytes": 164347,
+      "entries": 10448,
+      "updated": "2026-11-14",
+      "sha256": "f0088d24cfda4c10190c77c402de9393904ae683033aa521be63492a37684a60"
+    },
+    {
+      "id": "malaysia-singapore-brunei",
+      "name": "Malaysia, Singapore, and Brunei",
+      "file": "malaysia-singapore-brunei.places",
+      "bytes": 4187061,
+      "entries": 354820,
+      "updated": "2026-11-14",
+      "sha256": "2addba32038cfb7f8bb915aaf9337a68e713a0a0c81768d2e6dca12f23c81f44"
+    },
+    {
+      "id": "maldives",
+      "name": "Maldives",
+      "file": "maldives.places",
+      "bytes": 120980,
+      "entries": 7759,
+      "updated": "2026-11-14",
+      "sha256": "320e08eb198ccedadacd44b17610cc349cabe254350d503b2e539ec5197d1d7c"
+    },
+    {
+      "id": "mali",
+      "name": "Mali",
+      "file": "mali.places",
+      "bytes": 689330,
+      "entries": 44598,
+      "updated": "2026-11-14",
+      "sha256": "e8d2c600cd783401127c470268fb9ef9e4e37e2ae133fc1bd097a0d98b4b08df"
+    },
+    {
+      "id": "malta",
+      "name": "Malta",
+      "file": "malta.places",
+      "bytes": 271591,
+      "entries": 16576,
+      "updated": "2026-11-14",
+      "sha256": "5e3aea1c51ae36e9f25195221e9a5658953481aee0a5bf67b6ca711ea680b4d0"
+    },
+    {
+      "id": "marshall-islands",
+      "name": "Marshall Islands",
+      "file": "marshall-islands.places",
+      "bytes": 11607,
+      "entries": 494,
+      "updated": "2026-11-14",
+      "sha256": "b2c337da797346b60bd9e8a230d924c405598e04ce1db014d51b7dc817d6b4c0"
+    },
+    {
+      "id": "mauritania",
+      "name": "Mauritania",
+      "file": "mauritania.places",
+      "bytes": 146044,
+      "entries": 5992,
+      "updated": "2026-11-14",
+      "sha256": "7a3311d8fc21b9280adb8eb0c3fd6106ea008bb78428478abf7ba79ea7e6c47d"
+    },
+    {
+      "id": "mauritius",
+      "name": "Mauritius",
+      "file": "mauritius.places",
+      "bytes": 261111,
+      "entries": 15273,
+      "updated": "2026-11-14",
+      "sha256": "2bfb0fe28b33cf827e47468216cf2f04facd9ae6e3ec23a22c1762b6538a68bd"
+    },
+    {
+      "id": "mexico",
+      "name": "Mexico",
+      "file": "mexico.places",
+      "bytes": 12090571,
+      "entries": 1261130,
+      "updated": "2026-11-14",
+      "sha256": "759f6e076ffc4b0c2b3a76f4488a5cfd80cbf30c893dda56ead36978e9edca7b"
+    },
+    {
+      "id": "micronesia",
+      "name": "Micronesia",
+      "file": "micronesia.places",
+      "bytes": 15973,
+      "entries": 694,
+      "updated": "2026-11-14",
+      "sha256": "fd17e057edcf62f533200ec624b3dd80211f8068133a36a9bc454745205562a3"
+    },
+    {
+      "id": "moldova",
+      "name": "Moldova",
+      "file": "moldova.places",
+      "bytes": 848260,
+      "entries": 75549,
+      "updated": "2026-11-14",
+      "sha256": "0924758399c5ca38febbaee6d148de40c7be5ae394206726597982fd0eac292f"
+    },
+    {
+      "id": "monaco",
+      "name": "Monaco",
+      "file": "monaco.places",
+      "bytes": 33620,
+      "entries": 1573,
+      "updated": "2026-11-14",
+      "sha256": "bf85f581d11e40f0d16dd2dd6782ca3e186fbc4f7016fdb0d4da869683e7b3f2"
+    },
+    {
+      "id": "mongolia",
+      "name": "Mongolia",
+      "file": "mongolia.places",
+      "bytes": 361657,
+      "entries": 22031,
+      "updated": "2026-11-14",
+      "sha256": "6ee814d1842dc1061d3008a71b2134d2189c6179e35f19e3414a393fc82da135"
+    },
+    {
+      "id": "montenegro",
+      "name": "Montenegro",
+      "file": "montenegro.places",
+      "bytes": 283937,
+      "entries": 17619,
+      "updated": "2026-11-14",
+      "sha256": "025ad8895789f34f751292a0ef9e23cefa11859e296f2152e3aad4c425710a5f"
+    },
+    {
+      "id": "morocco",
+      "name": "Morocco",
+      "file": "morocco.places",
+      "bytes": 1699517,
+      "entries": 88488,
+      "updated": "2026-11-14",
+      "sha256": "305712fae68f831440fe9b9ca10e0e983986de4f69401bef2538616d033c06a5"
+    },
+    {
+      "id": "mozambique",
+      "name": "Mozambique",
+      "file": "mozambique.places",
+      "bytes": 247158,
+      "entries": 15359,
+      "updated": "2026-11-14",
+      "sha256": "55e2e232f826ae0621a6cee04b9f2ac6278464acc24b9f920a54beaa2f3a3037"
+    },
+    {
+      "id": "myanmar",
+      "name": "Myanmar (a.k.a. Burma)",
+      "file": "myanmar.places",
+      "bytes": 1622636,
+      "entries": 96766,
+      "updated": "2026-11-14",
+      "sha256": "6b1a13e21eb3763ab9f0bca3839dab7a80c48a20bb61d6babfa864f0611c87d3"
+    },
+    {
+      "id": "namibia",
+      "name": "Namibia",
+      "file": "namibia.places",
+      "bytes": 302006,
+      "entries": 18706,
+      "updated": "2026-11-14",
+      "sha256": "b0a0d4441f38c27b70cb9da670f893b5766d834df98a3f9da04fbcbe09d3575f"
+    },
+    {
+      "id": "nauru",
+      "name": "Nauru",
+      "file": "nauru.places",
+      "bytes": 4337,
+      "entries": 157,
+      "updated": "2026-11-14",
+      "sha256": "386b86d81aa22abc1843e9d564c5a4ac9c00994c02251467eada8054e9305bb1"
+    },
+    {
+      "id": "nepal",
+      "name": "Nepal",
+      "file": "nepal.places",
+      "bytes": 2265052,
+      "entries": 130872,
+      "updated": "2026-11-14",
+      "sha256": "c1cf810c9fdef4ad0b80cd045c6fc88eda322cde7a918759efd373626451c18a"
+    },
+    {
+      "id": "netherlands",
+      "name": "Netherlands",
+      "file": "netherlands.places",
+      "bytes": 7250616,
+      "entries": 546328,
+      "updated": "2026-11-14",
+      "sha256": "eaeb4edc1beaba6470078be19b726c8ea7be04b50b0b9ce5543382d06547106b"
+    },
+    {
+      "id": "new-caledonia",
+      "name": "New Caledonia",
+      "file": "new-caledonia.places",
+      "bytes": 166188,
+      "entries": 9086,
+      "updated": "2026-11-14",
+      "sha256": "28fa6ae4fdcf06161fb28ce2733f1f167072386fbd79b16106fd2f3c7860361b"
+    },
+    {
+      "id": "new-zealand",
+      "name": "New Zealand",
+      "file": "new-zealand.places",
+      "bytes": 2228048,
+      "entries": 171573,
+      "updated": "2026-11-14",
+      "sha256": "5ef0da7d0586095bd300bd597b08e320ce79f0f2474d696bfe44e598c68e2877"
+    },
+    {
+      "id": "nicaragua",
+      "name": "Nicaragua",
+      "file": "nicaragua.places",
+      "bytes": 551710,
+      "entries": 40537,
+      "updated": "2026-11-14",
+      "sha256": "2355a1569d91dd4e21029fbfec5b80f1f5b1d1974d81b51d8d3588a7c917edea"
+    },
+    {
+      "id": "niger",
+      "name": "Niger",
+      "file": "niger.places",
+      "bytes": 455786,
+      "entries": 29877,
+      "updated": "2026-11-14",
+      "sha256": "0953d8fadc90fe312d8d6584a40d02d4d86e7f57b2064644519cd1dcad49f938"
+    },
+    {
+      "id": "nigeria",
+      "name": "Nigeria",
+      "file": "nigeria.places",
+      "bytes": 1110522,
+      "entries": 68198,
+      "updated": "2026-11-14",
+      "sha256": "74d17c550bfb3a6e7495f9cdbe0d3125c96021a5c338146db9e5025c36e86308"
+    },
+    {
+      "id": "niue",
+      "name": "Niue",
+      "file": "niue.places",
+      "bytes": 6025,
+      "entries": 253,
+      "updated": "2026-11-14",
+      "sha256": "67ab4c206b75a3b3030adb0bfee8907122701777123800b6fd4e470f50a55c2c"
+    },
+    {
+      "id": "north-korea",
+      "name": "North Korea",
+      "file": "north-korea.places",
+      "bytes": 147307,
+      "entries": 9022,
+      "updated": "2026-11-14",
+      "sha256": "e8784ab47a9685323adc6f173b45ef778853e898e7dd42331fd13061e34639a9"
+    }
+  ]
+}
