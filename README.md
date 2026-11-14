@@ -55,8 +55,10 @@ Google requires every app to have its own OAuth client:
   After the first full download, each calendar syncs incrementally using Google's sync tokens, so only changed events are fetched.
   A full re-download runs weekly, when Google expires a token, or after Google rejects a change.
   The full download covers 6 months back to 12 months ahead.
-- **Conflicts:**
-  - If you edit an event that someone else deleted on Google, their delete wins.
+- **Conflicts:** every upload says which version of the event it was based on (Google's `etag`), so an edit can never silently overwrite a newer change made elsewhere. Instead:
+  - **Both sides edited the event:** the edits are merged field by field (title, location, notes, time). If both changed the same field, your edit wins and the app tells you.
+  - **An edit always beats a delete.** If you edit an event that was deleted elsewhere, your version is recreated. If you delete an event that was edited elsewhere, it isn't deleted and comes back with their change.
+  - **A retried create can't duplicate an event:** new events get their Google id up front, so a retry after a lost reply finds the event already there.
   - If Google rejects an edit (for example, no permission), the app goes back to Google's version.
   - Recurring events are edited one occurrence at a time.
 
@@ -73,7 +75,9 @@ Set `CLEANCALENDAR_DATA=<dir>` to use a different folder.
 |---|---|
 | `src/main.rs` | Window setup |
 | `src/app.rs` | App state, toolbar, sidebar, event editor, Google dialog, sync merge |
-| `src/views.rs` | Month grid, day/week time grid (incl. drag interactions), year view, mini-month |
+| `src/views.rs` | Painting: month grid, day/week time grid, year view, mini-month |
+| `src/layout.rs` | Pure geometry: where events and cells go, and what each screen area means to the pointer |
+| `src/interact.rs` | Pointer interaction (clicks, double-clicks, drags) as a testable state machine |
 | `src/sync.rs` | Sync bookkeeping (no UI, no I/O): what to upload, retries, merging Google's changes |
 | `src/google.rs` | OAuth flow, Calendar v3 REST client, background worker thread |
 | `src/model.rs` | `Calendar`, `Event`, and the JSON `Store` |
@@ -82,13 +86,40 @@ Set `CLEANCALENDAR_DATA=<dir>` to use a different folder.
 
 ## Tests
 
-`cargo test` runs everything offline:
+There are three levels of tests.
 
-- **`src/sync.rs`** replays sync scenarios step by step against the `SyncEngine`: offline edits retried until confirmed, editing during an upload, deleting before the first upload finishes, events deleted on Google, rejected edits, weekly full syncs, overlapping sync requests.
-- **`src/google/http_tests.rs`** runs the real HTTP client against a scripted local fake server. It covers access-token caching, paging, full vs. incremental (sync-token) requests, falling back to a full sync on `410 Gone`, percent-encoded calendar ids, POST vs. PATCH bodies, all-day dates, and how errors are classified.
-- Unit tests for dates, the week-view layout, and parsing Google's JSON.
+**1. Offline: `cargo test`.** Runs everything that needs no network:
+- **`src/sync.rs`** replays sync scenarios step by step against the `SyncEngine`:
+  - offline edits retried until confirmed, editing during an upload, deleting before the first upload finishes;
+  - conflicts: merging, same-field clashes, edit vs. delete in both directions;
+  - rejected edits, weekly full syncs, overlapping sync requests.
+- **`src/google/http_tests.rs`** runs the real HTTP client against a scripted local fake server:
+  - access-token caching, paging, and full vs. incremental (sync-token) requests, including the fallback to a full sync on `410 Gone`;
+  - `If-Match` and `412` conflicts, and duplicate-proof creates;
+  - percent-encoded calendar ids, request bodies, and how errors are classified.
+- **`src/interact.rs` and `src/layout.rs`** drive the pointer state machine against real layouts.
+- Unit tests for dates and for parsing Google's JSON.
 
-Nothing here talks to Google. Sign-in and live sync still need a manual or live check against a real account.
+**2. Against a Google emulator.** These are `#[ignore]`d by default. They run the real sign-in flow (with a script standing in for the browser), the HTTP client and the sync engine against [`emulate`](https://www.npmjs.com/package/emulate):
+
+```sh
+npx emulate@0.13.1 --service google --seed testdata/emulate-seed.yaml   # listens on 127.0.0.1:4000
+CLEANCALENDAR_GOOGLE_URL=http://127.0.0.1:4000 cargo test emulator_tests -- --ignored
+```
+
+The emulator can't update events (`PATCH`) or issue sync tokens, so edits and conflicts are covered by the other two levels. A canary test fails once the emulator gains `PATCH`.
+
+You can also point the app itself at the emulator: run it with `CLEANCALENDAR_GOOGLE_URL=http://127.0.0.1:4000` and a separate `CLEANCALENDAR_DATA` folder, then sign in as the seeded user.
+
+**3. Against real Google.** These are `#[ignore]`d too. They play two copies of the app ("laptop" and "phone") against one account to create real conflicts. Each test works in a temporary calendar that it deletes afterwards. You need an OAuth client of type *Desktop app*, and a Google account that is a test user of it. Keep the credentials out of the repo:
+
+```sh
+export CLEANCALENDAR_LIVE_CLIENT_ID=...  CLEANCALENDAR_LIVE_CLIENT_SECRET=...
+# once: opens the browser to approve access, saves the token to the file
+CLEANCALENDAR_LIVE_TOKEN_FILE=/path/outside/repo cargo test live_sign_in -- --ignored --nocapture
+export CLEANCALENDAR_LIVE_REFRESH_TOKEN=$(cat /path/outside/repo)
+cargo test live_tests -- --ignored --test-threads 1 --skip live_sign_in
+```
 
 ## Ideas for next steps
 
