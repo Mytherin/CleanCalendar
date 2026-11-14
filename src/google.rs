@@ -679,7 +679,7 @@ pub fn local_calendar_id(google_calendar_id: &str) -> String {
 /// The Google id to request for a new event, derived from its local id
 /// ("local:<uuid hex>"). Google accepts lowercase base32hex (a–v, 0–9),
 /// 5–1024 characters, which hex UUIDs satisfy.
-fn client_event_id(local_id: &str) -> Option<String> {
+pub fn client_event_id(local_id: &str) -> Option<String> {
     let id = local_id.strip_prefix("local:")?;
     let ok = (5..=1024).contains(&id.len()) && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='v'));
     ok.then(|| id.to_owned())
@@ -771,11 +771,21 @@ fn event_to_json(ev: &Event) -> Value {
 }
 
 fn to_rfc3339(t: NaiveDateTime) -> String {
-    Local
-        .from_local_datetime(&t)
-        .earliest()
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(|| t.and_utc().to_rfc3339())
+    to_rfc3339_in(t, &Local)
+}
+
+/// Wall time `t` in `zone` as RFC 3339. A time skipped by a daylight-saving
+/// change (02:30 on the night clocks go forward) is moved forward an hour,
+/// as `recurrence::convert` does, rather than being sent as UTC.
+fn to_rfc3339_in<Z: TimeZone>(t: NaiveDateTime, zone: &Z) -> String
+where
+    Z::Offset: std::fmt::Display,
+{
+    let at = |t| zone.from_local_datetime(&t).earliest();
+    match at(t).or_else(|| at(t + chrono::Duration::hours(1))) {
+        Some(dt) => dt.to_rfc3339(),
+        None => t.and_utc().to_rfc3339(),
+    }
 }
 
 fn parse_hex(s: &str) -> Option<[u8; 3]> {
@@ -790,6 +800,14 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_in_a_skipped_hour_move_forward_instead_of_becoming_utc() {
+        let ny: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let t = |h, m| NaiveDate::from_ymd_opt(2027, 3, 14).unwrap().and_hms_opt(h, m, 0).unwrap();
+        assert_eq!(to_rfc3339_in(t(2, 30), &ny), "2027-03-14T03:30:00-04:00");
+        assert_eq!(to_rfc3339_in(t(1, 30), &ny), "2027-03-14T01:30:00-05:00");
+    }
 
     #[test]
     fn parses_all_day_and_timed_events() {
