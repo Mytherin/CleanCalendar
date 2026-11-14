@@ -38,6 +38,9 @@ pub struct SyncEngine {
     /// Uploads handed out and not answered yet ("save:<event id>",
     /// "del:<remote id>"), so retries don't queue duplicates.
     in_flight: HashSet<String>,
+    /// What each upload in flight sent, by local event id: once Google
+    /// confirms it, that's the version Google has (the merge base).
+    sent: HashMap<String, EventFields>,
     /// A sync is with the worker.
     running: bool,
     /// Another sync was asked for while one was running.
@@ -175,6 +178,7 @@ impl SyncEngine {
         let Some(gcal) = store.google_calendar_of(&ev) else { return };
         let Some(creds) = creds(store) else { return };
         if self.in_flight.insert(format!("save:{id}")) {
+            self.sent.insert(id.to_owned(), ev.fields());
             self.outbox.push(Cmd::Save { creds, google_calendar_id: gcal, event: ev });
         }
     }
@@ -212,6 +216,7 @@ impl SyncEngine {
         store.pending_deletes.clear();
         store.sync_state.clear();
         self.in_flight.clear();
+        self.sent.clear();
         let gone: HashSet<String> =
             store.calendars.iter().filter(|c| c.google_id().is_some()).map(|c| c.id.clone()).collect();
         store.calendars.retain(|c| !gone.contains(&c.id));
@@ -222,6 +227,16 @@ impl SyncEngine {
     /// Processes one reply from the worker. `dragging` is the id of an event
     /// the user is dragging right now; a sync won't overwrite it.
     pub fn handle(&mut self, store: &mut Store, msg: Msg, dragging: Option<&str>, today: NaiveDate) {
+        // A reply to a request made before signing out: applying it would
+        // bring back the Google calendars that were just removed.
+        let signing_in = matches!(msg, Msg::Connected { .. } | Msg::ConnectFailed(_));
+        if !signing_in && !store.google.is_connected() {
+            if matches!(msg, Msg::Synced { .. } | Msg::SyncFailed(_)) {
+                self.running = false;
+                self.again = false;
+            }
+            return;
+        }
         match msg {
             Msg::Connected { refresh_token } => {
                 store.google.refresh_token = Some(refresh_token);
@@ -249,6 +264,7 @@ impl SyncEngine {
             }
             Msg::SaveConflict { local_id, server } => {
                 self.in_flight.remove(&format!("save:{local_id}"));
+                self.sent.remove(&local_id);
                 self.resolve_save_conflict(store, &local_id, server);
             }
             Msg::DeleteConflict { remote_id, google_calendar_id, server } => {
@@ -300,6 +316,7 @@ impl SyncEngine {
         today: NaiveDate,
     ) {
         self.in_flight.remove(&format!("save:{local_id}"));
+        let sent = self.sent.remove(&local_id);
         let still_there =
             store.event(&local_id).is_some_and(|ev| store.google_calendar_of(ev).as_deref() == Some(gcal.as_str()));
         if !still_there {
@@ -328,10 +345,13 @@ impl SyncEngine {
         if ev.rev == rev {
             ev.pending = false;
             ev.base = None;
-        } else {
-            // Edited again meanwhile: what Google has now is what we sent.
-            // (`base` stays the older snapshot; merging against it only
-            // makes our side win more often, never loses their changes.)
+        } else if sent.is_some() {
+            // Edited again meanwhile: what Google has now is what we sent,
+            // so that's what the next edit is based on. (With the older
+            // snapshot, a field we already uploaded would count as still
+            // changed on our side and overwrite a newer change from
+            // another device.)
+            ev.base = sent;
         }
         // A new series: Google expands it into occurrences, which replace
         // our copy (see `apply_changes`). Fetch them now.
@@ -358,6 +378,7 @@ impl SyncEngine {
         today: NaiveDate,
     ) {
         self.in_flight.remove(&format!("save:{local_id}"));
+        self.sent.remove(&local_id);
         let title = store.event(&local_id).map(|e| e.title.clone()).unwrap_or_default();
         match kind {
             // Stays pending; the next sync retries it.
@@ -981,6 +1002,45 @@ mod tests {
         assert!(!ev.pending);
         assert_eq!(ev.base, None);
         assert!(sent(&mut engine).is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_upload_becomes_the_base_for_the_next_merge() {
+        // We upload a new title; while it's out, we edit the notes. Then
+        // another device changes the title again.
+        let id = google::local_event_id(CAL, "a");
+        let mut store = store_with(vec![gev("a", "Standup")]);
+        let mut engine = SyncEngine::default();
+        edit(&mut store, &mut engine, &id, "Standup (ours)");
+        engine.before_change(&mut store, &id);
+        store.event_mut(&id).unwrap().notes = "bring slides".into();
+        engine.event_changed(&mut store, &id);
+        engine.handle(&mut store, saved(&id, 1, "a"), None, today());
+        sent(&mut engine);
+
+        let server = theirs(|e| e.title = "Standup (theirs, newer)".into());
+        engine.handle(&mut store, conflict(Some(server)), None, today());
+        let ev = store.event(&id).unwrap();
+        assert_eq!(ev.title, "Standup (theirs, newer)", "our title was already on Google; theirs is newer");
+        assert_eq!(ev.notes, "bring slides", "our unsent edit is kept");
+    }
+
+    #[test]
+    fn replies_arriving_after_signing_out_are_ignored() {
+        let mut store = store_with(vec![]);
+        let mut engine = SyncEngine::default();
+        assert!(engine.sync(&store, today()));
+        sent(&mut engine);
+        engine.disconnect(&mut store);
+
+        engine.handle(&mut store, synced(changes(true, vec![gev("a", "Standup")], &[], Some("t"))), None, today());
+        assert!(store.calendars.iter().all(|c| c.google_id().is_none()), "Google calendars stay gone");
+        assert!(store.events.is_empty());
+        assert!(store.google.account_email.is_none());
+
+        // Signing in again syncs normally.
+        engine.handle(&mut store, Msg::Connected { refresh_token: "r2".into() }, None, today());
+        assert!(sent(&mut engine).iter().any(|s| matches!(s, Sent::Sync(_))));
     }
 
     #[test]
