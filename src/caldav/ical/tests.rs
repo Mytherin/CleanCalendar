@@ -167,6 +167,20 @@ fn a_character_split_by_another_clients_fold_is_joined_back() {
 }
 
 #[test]
+fn calendar_data_indented_by_a_pretty_printing_server_still_parses() {
+    // Inside an XML reply, some servers indent the whole text block. Read
+    // naively, every line looks like a continuation and the event is lost.
+    let text = "\n      BEGIN:VCALENDAR\n      VERSION:2.0\n      BEGIN:VEVENT\n      UID:i\n      \
+        SUMMARY:A long title that was\n        folded\n      DTSTART:20261114T090000Z\n      \
+        END:VEVENT\n      END:VCALENDAR\n    ";
+    let c = parse(text).unwrap();
+    let evs = events(&cal(), "/cal/home/i.ics", None, &c, year().0, year().1);
+    assert_eq!(evs.len(), 1);
+    // The fold's first space goes; the second was part of the title.
+    assert_eq!(evs[0].title, "A long title that was folded");
+}
+
+#[test]
 fn durations() {
     assert_eq!(parse_duration("PT1H30M"), Some(Duration::minutes(90)));
     assert_eq!(parse_duration("P2D"), Some(Duration::days(2)));
