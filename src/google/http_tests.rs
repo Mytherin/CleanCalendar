@@ -307,6 +307,7 @@ fn local_event(remote_id: Option<&str>) -> Event {
         all_day: false,
         location: "Cafe".into(),
         notes: "bring cash".into(),
+        attendees: Vec::new(),
         remote_id: remote_id.map(str::to_owned),
         recurring_id: None,
         pending: true,
@@ -338,6 +339,47 @@ fn new_events_are_posted_and_existing_ones_patched() {
     assert_eq!(body["location"], "Cafe");
     assert_eq!(body["description"], "bring cash");
     assert!(body["start"]["dateTime"].as_str().unwrap().starts_with("2026-11-14T09:00:00"));
+}
+
+#[test]
+fn invitees_are_sent_only_when_the_guest_list_changes() {
+    use crate::model::{Attendee, Response};
+    let server = FakeServer::start(|r| match r.path.as_str() {
+        "/token" => token_ok(),
+        _ => (200, json!({"id": "e1"})),
+    });
+    let mut c = server.client();
+
+    // A new event with a guest: invited, and Google emails them.
+    let mut ev = local_event(None);
+    ev.attendees = vec![Attendee::new("ann@example.com")];
+    c.save_event("primary", &ev).unwrap();
+
+    // Retitled, same guests (Ann has accepted meanwhile): the list is left
+    // alone so the PATCH can't overwrite anything, but guests are notified.
+    let mut edited = local_event(Some("e1"));
+    edited.attendees = vec![Attendee { response: Response::Accepted, ..Attendee::new("ann@example.com") }];
+    edited.base = Some(edited.fields());
+    edited.title = "Lunch!".into();
+    c.save_event("primary", &edited).unwrap();
+
+    // Bob added: the new list is sent.
+    let mut invited = edited.clone();
+    invited.attendees.push(Attendee::new("bob@example.com"));
+    c.save_event("primary", &invited).unwrap();
+
+    // No guests before or after: no emails.
+    c.save_event("primary", &local_event(None)).unwrap();
+
+    let reqs = server.api_requests();
+    assert_eq!(reqs[0].json()["attendees"], json!([{"email": "ann@example.com", "responseStatus": "needsAction"}]));
+    assert_eq!(reqs[0].q("sendUpdates"), Some("all"));
+    assert!(reqs[1].json().get("attendees").is_none());
+    assert_eq!(reqs[1].q("sendUpdates"), Some("all"));
+    let sent: Vec<_> = reqs[2].json()["attendees"].as_array().unwrap().iter().map(|a| a["email"].clone()).collect();
+    assert_eq!(sent, [json!("ann@example.com"), json!("bob@example.com")]);
+    assert!(reqs[3].json().get("attendees").is_none());
+    assert_eq!(reqs[3].q("sendUpdates"), None);
 }
 
 #[test]

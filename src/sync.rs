@@ -415,8 +415,18 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
     let take_loc = take_ours("location", base.location.clone(), ours.location.clone(), theirs.location.clone());
     let take_notes = take_ours("notes", base.notes.clone(), ours.notes.clone(), theirs.notes.clone());
     let take_when = take_ours("time", when(base), when(ours), when(theirs));
+    // Who is invited is compared by address; replies are only ever made on
+    // the server, so they don't count as our change.
+    let emails = |f: &EventFields| f.attendees.iter().map(|a| a.email.to_lowercase()).collect::<Vec<_>>();
+    let take_invitees = take_ours("invitees", emails(base).join(","), emails(ours).join(","), emails(theirs).join(","));
 
     let from = |take_ours: bool| if take_ours { ours } else { theirs };
+    let mut attendees = from(take_invitees).attendees.clone();
+    for a in &mut attendees {
+        if let Some(t) = theirs.attendees.iter().find(|t| t.email.eq_ignore_ascii_case(&a.email)) {
+            a.response = t.response;
+        }
+    }
     let merged = EventFields {
         title: from(take_title).title.clone(),
         location: from(take_loc).location.clone(),
@@ -426,6 +436,7 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
         all_day: from(take_when).all_day,
         recurrence: from(take_when).recurrence.clone(),
         time_zone: from(take_when).time_zone.clone(),
+        attendees,
     };
     (merged, clashes)
 }
@@ -551,6 +562,7 @@ mod tests {
             all_day: false,
             location: String::new(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: Some(rid.into()),
             recurring_id: None,
             pending: false,
@@ -1014,6 +1026,26 @@ mod tests {
         let (m, clashes) = merge_fields(&base, &ours, &theirs);
         assert_eq!((m.start, m.all_day), (ours.start, false));
         assert_eq!(clashes, ["time"]);
+    }
+
+    #[test]
+    fn merging_invitees_keeps_their_replies() {
+        use crate::model::{Attendee, Response};
+        let mut base = gev("a", "T").fields();
+        base.attendees = vec![Attendee::new("ann@example.com")];
+        // We invite Bob; meanwhile Ann accepts on Google.
+        let mut ours = base.clone();
+        ours.attendees.push(Attendee::new("bob@example.com"));
+        let mut theirs = base.clone();
+        theirs.attendees[0].response = Response::Accepted;
+        let (m, clashes) = merge_fields(&base, &ours, &theirs);
+        let got: Vec<_> = m.attendees.iter().map(|a| (a.email.as_str(), a.response)).collect();
+        assert_eq!(got, [("ann@example.com", Response::Accepted), ("bob@example.com", Response::NeedsAction)]);
+        assert!(clashes.is_empty());
+
+        // A reply alone isn't a change of ours: theirs is kept as is.
+        let (m, _) = merge_fields(&base, &base, &theirs);
+        assert_eq!(m.attendees, theirs.attendees);
     }
 
     #[test]

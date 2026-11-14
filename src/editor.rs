@@ -11,7 +11,7 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, Order, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
 use crate::dates::*;
-use crate::model::{Event, Store};
+use crate::model::{looks_like_email, Attendee, Event, Response, Store};
 use crate::recurrence::{self, Freq, Recurrence, RepeatEnd};
 use crate::theme::{self, Palette, RED};
 
@@ -65,6 +65,9 @@ pub struct Editor {
     /// The date section is expanded into editable fields.
     editing_when: bool,
     error: Option<String>,
+    /// What's typed in the "Add Invitees" field, not yet added.
+    invitee_input: String,
+    invitee_error: Option<String>,
     /// The popover's size last frame, to place it before it's measured.
     size: Vec2,
     focus_title: bool,
@@ -85,6 +88,8 @@ impl Editor {
             scope: Scope::AllEvents,
             editing_when: false,
             error: None,
+            invitee_input: String::new(),
+            invitee_error: None,
             size: Vec2::new(POPOVER_W, 260.0),
             focus_title: is_new,
             zone_filter: String::new(),
@@ -141,7 +146,19 @@ impl Editor {
         if ev.title.trim().is_empty() {
             ev.title = "New Event".into();
         }
+        // An address typed but not yet confirmed with Enter still counts.
+        let (typed, _) = split_addresses(&self.invitee_input);
+        add_invitees(&mut ev.attendees, typed);
         Ok(ev)
+    }
+
+    /// Moves complete addresses from the input field into the guest list;
+    /// anything that isn't an address stays in the field.
+    fn take_invitees(&mut self) {
+        let (good, bad) = split_addresses(&self.invitee_input);
+        add_invitees(&mut self.draft.attendees, good);
+        self.invitee_error = (!bad.is_empty()).then(|| format!("\u{201C}{bad}\u{201D} isn't an email address."));
+        self.invitee_input = bad;
     }
 
     /// Keeps the draft's times in step with the fields, for the live preview.
@@ -153,6 +170,25 @@ impl Editor {
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
+        }
+    }
+}
+
+/// Splits typed text at commas, semicolons, and spaces into email
+/// addresses and whatever else is left (rejoined with ", ").
+fn split_addresses(text: &str) -> (Vec<String>, String) {
+    let (good, bad): (Vec<&str>, Vec<&str>) = text
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .partition(|s| looks_like_email(s));
+    (good.into_iter().map(str::to_owned).collect(), bad.join(", "))
+}
+
+/// Adds addresses to a guest list, skipping ones already on it.
+fn add_invitees(list: &mut Vec<Attendee>, emails: Vec<String>) {
+    for email in emails {
+        if !list.iter().any(|a| a.email.eq_ignore_ascii_case(&email)) {
+            list.push(Attendee::new(&email));
         }
     }
 }
@@ -606,6 +642,119 @@ fn calendar_chip(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
     });
 }
 
+/// A small round badge for an invitee's reply, drawn like macOS: a hollow
+/// ring while waiting, a green tick, an orange "?" or a red cross.
+fn response_badge(ui: &mut egui::Ui, response: Response, p: &Palette) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+    let c = rect.center();
+    let painter = ui.painter();
+    let white = Stroke::new(1.6_f32, Color32::WHITE);
+    let tip = match response {
+        Response::NeedsAction => {
+            painter.circle_stroke(c, 6.0, Stroke::new(1.2_f32, p.tertiary));
+            "No response yet"
+        }
+        Response::Accepted => {
+            painter.circle_filled(c, 7.0, Color32::from_rgb(0x34, 0xC7, 0x59));
+            painter.line_segment([c + Vec2::new(-3.0, 0.2), c + Vec2::new(-0.8, 2.5)], white);
+            painter.line_segment([c + Vec2::new(-0.8, 2.5), c + Vec2::new(3.2, -2.5)], white);
+            "Accepted"
+        }
+        Response::Tentative => {
+            painter.circle_filled(c, 7.0, Color32::from_rgb(0xFF, 0x95, 0x00));
+            painter.text(c, Align2::CENTER_CENTER, "?", theme::bold_font(10.0), Color32::WHITE);
+            "Maybe"
+        }
+        Response::Declined => {
+            painter.circle_filled(c, 7.0, RED);
+            painter.line_segment([c + Vec2::new(-2.5, -2.5), c + Vec2::new(2.5, 2.5)], white);
+            painter.line_segment([c + Vec2::new(-2.5, 2.5), c + Vec2::new(2.5, -2.5)], white);
+            "Declined"
+        }
+    };
+    resp.on_hover_text(tip);
+}
+
+/// The guest list and the "Add Invitees" field. Invitations go out through
+/// Google, so on a local calendar the card only appears if the event already
+/// has guests (e.g. it was moved off a Google calendar), with a note.
+fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette, read_only: bool) {
+    let on_google = store.calendar(&ed.draft.calendar_id).is_some_and(|c| c.google_id().is_some());
+    let has_guests = ed.draft.attendees.iter().any(|a| !a.resource);
+    if !has_guests && (read_only || !on_google) {
+        return;
+    }
+    card(ui, p, |ui| {
+        let mut remove = None;
+        for (i, a) in ed.draft.attendees.iter().enumerate().filter(|(_, a)| !a.resource) {
+            ui.horizontal(|ui| {
+                response_badge(ui, a.response, p);
+                let mut text = RichText::new(a.label()).color(p.text);
+                if a.response == Response::Declined {
+                    text = text.strikethrough();
+                }
+                let label = ui.label(text);
+                if !a.name.is_empty() {
+                    label.on_hover_text(&a.email);
+                }
+                let role = if a.organizer {
+                    "organizer"
+                } else if a.is_self {
+                    "you"
+                } else if a.optional {
+                    "optional"
+                } else {
+                    ""
+                };
+                if !role.is_empty() {
+                    ui.label(RichText::new(role).color(p.secondary).small());
+                }
+                if !read_only && !a.organizer {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let x = ui.add(egui::Label::new(RichText::new("\u{2715}").color(p.tertiary)).sense(Sense::click()));
+                        if x.on_hover_text("Remove").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+            });
+        }
+        if let Some(i) = remove {
+            ed.draft.attendees.remove(i);
+        }
+        if !read_only {
+            if has_guests {
+                divider(ui, p);
+            }
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut ed.invitee_input)
+                    .id_source("invitee-input")
+                    .hint_text(RichText::new("Add Invitees").color(p.placeholder))
+                    .text_color(p.text)
+                    .frame(false)
+                    .desired_width(f32::INFINITY),
+            );
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let separated = field.changed() && ed.invitee_input.ends_with([',', ';']);
+            if entered || separated {
+                ed.take_invitees();
+                if entered {
+                    // Stay in the field for the next address.
+                    field.request_focus();
+                }
+            } else if field.changed() {
+                ed.invitee_error = None;
+            }
+        }
+        if let Some(err) = &ed.invitee_error {
+            ui.label(RichText::new(err).color(RED).small());
+        }
+        if !on_google && has_guests {
+            ui.label(RichText::new("Invitations are only sent for events on a Google calendar.").color(p.secondary).small());
+        }
+    });
+}
+
 /// Draws the editor's contents into `ui`.
 pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> Outcome {
     let read_only = store.calendar(&ed.draft.calendar_id).is_some_and(|c| c.read_only);
@@ -691,6 +840,8 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
             ui.label(RichText::new(err).color(RED).small());
         }
     });
+
+    invitees_card(ui, ed, store, p, read_only);
 
     // Notes.
     card(ui, p, |ui| {
@@ -826,4 +977,57 @@ pub fn inspector(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette)
         return Outcome::Cancel;
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor() -> Editor {
+        let start = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap().and_hms_opt(9, 0, 0).unwrap();
+        let ev = Event {
+            id: "local:1".into(),
+            calendar_id: "google:primary".into(),
+            title: "Lunch".into(),
+            start,
+            end: start + Duration::hours(1),
+            all_day: false,
+            location: String::new(),
+            notes: String::new(),
+            attendees: vec![Attendee::new("ann@example.com")],
+            remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
+            etag: None,
+            base: None,
+            recurrence: None,
+            time_zone: None,
+        };
+        Editor::new(ev, true, Placement::Inspector)
+    }
+
+    fn emails(list: &[Attendee]) -> Vec<&str> {
+        list.iter().map(|a| a.email.as_str()).collect()
+    }
+
+    #[test]
+    fn typed_addresses_are_added_once_and_junk_stays_in_the_field() {
+        let mut ed = editor();
+        ed.invitee_input = "bob@example.com, oops; ANN@example.com carol@example.org".into();
+        ed.take_invitees();
+        assert_eq!(emails(&ed.draft.attendees), ["ann@example.com", "bob@example.com", "carol@example.org"]);
+        assert_eq!(ed.invitee_input, "oops");
+        assert!(ed.invitee_error.is_some());
+    }
+
+    #[test]
+    fn an_address_left_in_the_field_is_saved() {
+        let mut ed = editor();
+        ed.invitee_input = "dave@example.com".into();
+        let ev = ed.result().unwrap();
+        assert_eq!(emails(&ev.attendees), ["ann@example.com", "dave@example.com"]);
+        ed.invitee_input = "not an address".into();
+        assert_eq!(emails(&ed.result().unwrap().attendees), ["ann@example.com"]);
+    }
 }
