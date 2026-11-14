@@ -50,7 +50,7 @@ pub struct Paths {
 
 /// The app's folder name inside the OS's data and cache folders. Linux
 /// convention is lowercase.
-const APP_DIR: &str = if cfg!(any(windows, target_os = "macos")) { "CleanCalendar" } else { "cleancalendar" };
+pub(crate) const APP_DIR: &str = if cfg!(any(windows, target_os = "macos")) { "CleanCalendar" } else { "cleancalendar" };
 
 impl Paths {
     /// `CLEANCALENDAR_DATA=<dir>` puts everything in one folder; otherwise the
