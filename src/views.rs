@@ -1,21 +1,27 @@
 //! The calendar views: month grid, day/week time grid, year overview, and
 //! the sidebar mini-month.
+//!
+//! The month and day/week views only paint here. Where things go comes from
+//! `layout.rs`, and what the pointer does comes from `interact.rs`;
+//! [`drive_pointer`] is the thin adapter that feeds egui's input to it.
 
 use std::sync::Arc;
 
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, Duration, Local, NaiveDate};
 use eframe::egui::{
-    self, text::LayoutJob, Align2, Color32, CursorIcon, FontId, Galley, Pos2, Rect, Sense, Stroke, Ui, Vec2,
+    self, text::LayoutJob, Align2, Color32, CursorIcon, FontId, Galley, PointerButton, Pos2, Rect, Sense, Stroke, Ui,
+    Vec2,
 };
 
-use crate::app::{Action, App, Drag, View};
+use crate::app::{Action, App, View};
 use crate::dates::*;
+use crate::interact::{Cursor, Input};
+use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GUTTER, HOUR_H};
 use crate::model::Event;
 use crate::theme::{self, Palette, RED};
 
-pub const HOUR_H: f32 = 48.0;
-const GUTTER: f32 = 58.0;
-const BANNER_H: f32 = 20.0;
+/// Seconds the pointer must rest on an event before its tooltip shows.
+const TOOLTIP_DELAY: f32 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -44,44 +50,8 @@ fn is_read_only(app: &App, ev: &Event) -> bool {
     app.store.calendar(&ev.calendar_id).is_some_and(|c| c.read_only)
 }
 
-/// Visible events overlapping [first, first + n days).
-fn events_in(app: &App, first: NaiveDate, n: i64) -> Vec<Event> {
-    let a = midnight(first);
-    let b = midnight(first + Duration::days(n));
-    let mut v: Vec<Event> = app
-        .store
-        .events
-        .iter()
-        .filter(|e| app.store.is_visible(&e.calendar_id))
-        .filter(|e| e.start < b && (e.end > a || (e.end <= e.start && e.start >= a)))
-        .cloned()
-        .collect();
-    v.sort_by(|x, y| x.start.cmp(&y.start).then(y.duration().cmp(&x.duration())));
-    v
-}
-
-/// Packs banner (all-day / multi-day) events into lanes across a run of days.
-/// Returns (event index, first column, last column, lane).
-fn banner_lanes(events: &[Event], first: NaiveDate, ndays: i64) -> Vec<(usize, i64, i64, usize)> {
-    let mut lanes: Vec<i64> = Vec::new(); // last occupied column per lane
-    let mut out = Vec::new();
-    for (i, ev) in events.iter().enumerate().filter(|(_, e)| e.is_banner()) {
-        let c0 = (ev.start.date() - first).num_days().max(0);
-        let c1 = (last_day(ev.start, ev.end) - first).num_days().min(ndays - 1);
-        if c1 < 0 || c0 >= ndays {
-            continue;
-        }
-        let lane = match lanes.iter().position(|&end| end < c0) {
-            Some(l) => l,
-            None => {
-                lanes.push(-1);
-                lanes.len() - 1
-            }
-        };
-        lanes[lane] = c1;
-        out.push((i, c0, c1, lane));
-    }
-    out
+fn is_selected(app: &App, ev: &Event) -> bool {
+    app.selected.as_deref() == Some(ev.id.as_str())
 }
 
 fn day_number_badge(painter: &egui::Painter, center: Pos2, text: &str, is_today: bool, font: FontId, color: Color32) {
@@ -112,161 +82,6 @@ fn draw_banner(ui: &Ui, painter: &egui::Painter, rect: Rect, ev: &Event, color: 
     );
 }
 
-// ---------------------------------------------------------------------------
-// Month
-
-pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
-    let first = first_of_month(app.date);
-    let grid_start = start_of_week(first);
-    let last = first + Duration::days(days_in_month(first) as i64 - 1);
-    let weeks = (last - grid_start).num_days() / 7 + 1;
-
-    let rect = ui.available_rect_before_wrap();
-    ui.allocate_rect(rect, Sense::hover());
-    let painter = ui.painter_at(rect);
-    let header_h = 26.0;
-    let cell_w = rect.width() / 7.0;
-    let cell_h = (rect.height() - header_h) / weeks as f32;
-
-    for i in 0..7 {
-        let x = rect.left() + (i as f32 + 1.0) * cell_w - 8.0;
-        painter.text(
-            Pos2::new(x, rect.top() + header_h / 2.0),
-            Align2::RIGHT_CENTER,
-            weekday_short(i),
-            theme::font(12.0),
-            p.secondary,
-        );
-    }
-    painter.hline(rect.x_range(), rect.top() + header_h, Stroke::new(1.0_f32, p.grid));
-
-    let events = events_in(app, grid_start, weeks * 7);
-    let row_h = 18.0;
-
-    for w in 0..weeks {
-        let week_start = grid_start + Duration::days(w * 7);
-        let top = rect.top() + header_h + w as f32 * cell_h;
-        let lanes = banner_lanes(&events, week_start, 7);
-        let max_rows = (((cell_h - 30.0) / row_h).floor() as usize).max(1);
-
-        // Cells: background, numbers, and click targets.
-        for d in 0..7 {
-            let day = week_start + Duration::days(d);
-            let cell = Rect::from_min_size(Pos2::new(rect.left() + d as f32 * cell_w, top), Vec2::new(cell_w, cell_h));
-            if d == 0 || d == 6 {
-                painter.rect_filled(cell, 0.0, p.weekend);
-            }
-            painter.hline(cell.x_range(), cell.bottom(), Stroke::new(1.0_f32, p.grid));
-            if d > 0 {
-                painter.vline(cell.left(), cell.y_range(), Stroke::new(1.0_f32, p.grid));
-            }
-            let in_month = day.month() == first.month();
-            let label = if day.day() == 1 { day.format("%b %-d").to_string() } else { day.day().to_string() };
-            let color = if in_month { p.text } else { p.tertiary };
-            let font = theme::font(14.0);
-            let w = text_galley(ui, &label, font.clone(), color, 200.0).size().x;
-            let center = Pos2::new(cell.right() - 10.0 - w / 2.0, cell.top() + 14.0);
-            day_number_badge(&painter, center, &label, day == app.today, font, color);
-
-            let resp = ui.interact(cell, ui.id().with(("cell", day)), Sense::click());
-            if resp.double_clicked() {
-                let start = midnight(day) + Duration::hours(9);
-                app.actions.push(Action::New { start, end: start + Duration::hours(1), all_day: false });
-            } else if resp.clicked() {
-                app.actions.push(Action::Select(None));
-                let num = Rect::from_center_size(center, Vec2::new(w + 12.0, 22.0));
-                if resp.interact_pointer_pos().is_some_and(|pos| num.contains(pos)) {
-                    app.actions.push(Action::GoTo(day, View::Day));
-                }
-            }
-        }
-
-        // Banners spanning across the week row.
-        let mut used = [0usize; 7];
-        let mut hidden = [0usize; 7];
-        for &(i, c0, c1, lane) in &lanes {
-            for c in c0..=c1 {
-                used[c as usize] = used[c as usize].max(lane + 1);
-            }
-            if lane + 1 >= max_rows {
-                for c in c0..=c1 {
-                    hidden[c as usize] += 1;
-                }
-                continue;
-            }
-            let ev = &events[i];
-            let r = Rect::from_min_max(
-                Pos2::new(rect.left() + c0 as f32 * cell_w + 3.0, top + 28.0 + lane as f32 * row_h),
-                Pos2::new(rect.left() + (c1 + 1) as f32 * cell_w - 3.0, top + 28.0 + lane as f32 * row_h + row_h - 2.0),
-            );
-            let selected = app.selected.as_deref() == Some(ev.id.as_str());
-            draw_banner(ui, &painter, r, ev, event_color(app, ev), selected, p);
-            event_click(app, ui, r, ev, ("mb", w));
-        }
-
-        // Timed events in each day cell.
-        for d in 0..7 {
-            let day = week_start + Duration::days(d);
-            let left = rect.left() + d as f32 * cell_w;
-            let timed: Vec<&Event> = events.iter().filter(|e| !e.is_banner() && e.occurs_on(day)).collect();
-            let mut row = used[d as usize];
-            let mut more = hidden[d as usize];
-            for (k, ev) in timed.iter().enumerate() {
-                let remaining = timed.len() - k;
-                if row + 1 >= max_rows && remaining > 1 || row >= max_rows {
-                    more += remaining;
-                    break;
-                }
-                let r = Rect::from_min_size(
-                    Pos2::new(left + 3.0, top + 28.0 + row as f32 * row_h),
-                    Vec2::new(cell_w - 6.0, row_h - 2.0),
-                );
-                let color = event_color(app, ev);
-                let selected = app.selected.as_deref() == Some(ev.id.as_str());
-                if selected {
-                    painter.rect_filled(r, 4.0, color);
-                }
-                let text_color = if selected { Color32::WHITE } else { p.text };
-                painter.circle_filled(Pos2::new(r.left() + 6.0, r.center().y), 3.5, if selected { Color32::WHITE } else { color });
-                let time = fmt_time(ev.start.time());
-                let tw = text_galley(ui, &time, theme::font(11.0), p.secondary, 100.0).size().x;
-                let show_time = r.width() > tw + 60.0;
-                if show_time {
-                    painter.text(
-                        Pos2::new(r.right() - 4.0, r.center().y),
-                        Align2::RIGHT_CENTER,
-                        &time,
-                        theme::font(11.0),
-                        if selected { Color32::WHITE } else { p.secondary },
-                    );
-                }
-                let max_w = r.width() - 16.0 - if show_time { tw + 8.0 } else { 0.0 };
-                draw_text(ui, &painter, Pos2::new(r.left() + 13.0, r.top() + 1.5), &ev.title, theme::font(12.0), text_color, max_w);
-                event_click(app, ui, r, ev, ("mt", day));
-                row += 1;
-            }
-            if more > 0 {
-                let pos = Pos2::new(left + 10.0, top + 28.0 + row.min(max_rows - 1) as f32 * row_h + 1.0);
-                let r = Rect::from_min_size(pos, Vec2::new(cell_w - 20.0, row_h - 2.0));
-                painter.text(pos, Align2::LEFT_TOP, format!("{more} more"), theme::bold_font(11.5), p.secondary);
-                if ui.interact(r, ui.id().with(("more", day)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                    app.actions.push(Action::GoTo(day, View::Day));
-                }
-            }
-        }
-    }
-}
-
-fn event_click(app: &mut App, ui: &Ui, r: Rect, ev: &Event, salt: impl std::hash::Hash) {
-    let resp = ui.interact(r, ui.id().with(("ev", &ev.id, salt)), Sense::click());
-    if resp.double_clicked() {
-        app.actions.push(Action::Open(ev.id.clone()));
-    } else if resp.clicked() {
-        app.actions.push(Action::Select(Some(ev.id.clone())));
-    }
-    resp.on_hover_text(hover_text(ev));
-}
-
 fn hover_text(ev: &Event) -> String {
     let when = if ev.all_day {
         let last = last_day(ev.start, ev.end);
@@ -295,30 +110,198 @@ fn hover_text(ev: &Event) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Pointer adapter
+
+/// Feeds this frame's pointer events to the interaction state machine, queues
+/// the resulting actions, and shows hover feedback. `hits` must describe what
+/// is drawn this frame.
+fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
+    let ctx = ui.ctx().clone();
+    let layer = ui.layer_id();
+    // Presses over windows or popups on top of this view aren't ours.
+    let ours = |pos: Pos2| ctx.layer_id_at(pos).map_or(true, |l| l == layer);
+    let (events, time, any_down, latest) =
+        ctx.input(|i| (i.events.clone(), i.time, i.pointer.any_down(), i.pointer.latest_pos()));
+
+    let mut actions = Vec::new();
+    let mut released = false;
+    for event in events {
+        let input = match event {
+            egui::Event::PointerMoved(pos) => Input::Move { pos },
+            egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, .. } => {
+                if !ours(pos) {
+                    continue;
+                }
+                Input::Press { pos }
+            }
+            egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, .. } => {
+                released = true;
+                Input::Release { pos, time }
+            }
+            _ => continue,
+        };
+        actions.extend(app.pointer.handle(input, hits));
+    }
+    // The release happened somewhere we didn't hear about (e.g. outside the window).
+    if app.pointer.is_active() && !any_down && !released {
+        if let Some(pos) = latest {
+            actions.extend(app.pointer.handle(Input::Release { pos, time }, hits));
+        }
+    }
+
+    let hover = ctx.input(|i| i.pointer.hover_pos()).filter(|&pos| ours(pos));
+    let target = hover.and_then(|pos| hits.hit(pos));
+    if let Some(cursor) = app.pointer.cursor(target) {
+        ctx.set_cursor_icon(match cursor {
+            Cursor::Grabbing => CursorIcon::Grabbing,
+            Cursor::ResizeVertical => CursorIcon::ResizeVertical,
+            Cursor::PointingHand => CursorIcon::PointingHand,
+        });
+    }
+    if let (false, Some(Target::Event { id, .. })) = (app.pointer.is_active(), target) {
+        let still = ctx.input(|i| i.pointer.time_since_last_movement());
+        if still < TOOLTIP_DELAY {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(TOOLTIP_DELAY - still));
+        } else if let Some(ev) = app.store.event(id) {
+            let text = hover_text(ev);
+            egui::show_tooltip_at_pointer(&ctx, layer, egui::Id::new(("event-tip", id)), |ui| ui.label(text));
+        }
+    }
+
+    if !actions.is_empty() {
+        // Actions apply after this frame is drawn; show their effect promptly.
+        ctx.request_repaint();
+    }
+    app.actions.extend(actions);
+}
+
+// ---------------------------------------------------------------------------
+// Month
+
+fn month_label(day: NaiveDate) -> String {
+    if day.day() == 1 {
+        day.format("%b %-d").to_string()
+    } else {
+        day.day().to_string()
+    }
+}
+
+pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
+    let rect = ui.available_rect_before_wrap();
+    ui.allocate_rect(rect, Sense::hover());
+    let (grid_start, weeks) = layout::month_span(app.date);
+    let events = layout::events_in(&app.store, grid_start, weeks * 7);
+    let number_font = theme::font(14.0);
+    let number_w = |day: NaiveDate| text_galley(ui, &month_label(day), number_font.clone(), p.text, 200.0).size().x;
+    let lay = layout::month(&events, app.date, rect, &number_w);
+
+    drive_pointer(app, ui, &lay.hits);
+
+    let painter = ui.painter_at(rect);
+    for i in 0..7 {
+        let x = rect.left() + (i as f32 + 1.0) * lay.cell_w - 8.0;
+        painter.text(
+            Pos2::new(x, rect.top() + lay.header_h / 2.0),
+            Align2::RIGHT_CENTER,
+            weekday_short(i),
+            theme::font(12.0),
+            p.secondary,
+        );
+    }
+    painter.hline(rect.x_range(), rect.top() + lay.header_h, Stroke::new(1.0_f32, p.grid));
+
+    for cell in &lay.cells {
+        let wd = cell.day.weekday().num_days_from_sunday();
+        if wd == 0 || wd == 6 {
+            painter.rect_filled(cell.rect, 0.0, p.weekend);
+        }
+        painter.hline(cell.rect.x_range(), cell.rect.bottom(), Stroke::new(1.0_f32, p.grid));
+        if wd > 0 {
+            painter.vline(cell.rect.left(), cell.rect.y_range(), Stroke::new(1.0_f32, p.grid));
+        }
+        let color = if cell.in_month { p.text } else { p.tertiary };
+        day_number_badge(&painter, cell.number.center(), &month_label(cell.day), cell.day == app.today, number_font.clone(), color);
+    }
+
+    for b in &lay.banners {
+        let ev = &events[b.ev];
+        draw_banner(ui, &painter, b.rect, ev, event_color(app, ev), is_selected(app, ev), p);
+    }
+
+    for row in &lay.rows {
+        let (ev, r) = (&events[row.ev], row.rect);
+        let color = event_color(app, ev);
+        let selected = is_selected(app, ev);
+        if selected {
+            painter.rect_filled(r, 4.0, color);
+        }
+        let text_color = if selected { Color32::WHITE } else { p.text };
+        painter.circle_filled(Pos2::new(r.left() + 6.0, r.center().y), 3.5, if selected { Color32::WHITE } else { color });
+        let time = fmt_time(ev.start.time());
+        let tw = text_galley(ui, &time, theme::font(11.0), p.secondary, 100.0).size().x;
+        let show_time = r.width() > tw + 60.0;
+        if show_time {
+            painter.text(
+                Pos2::new(r.right() - 4.0, r.center().y),
+                Align2::RIGHT_CENTER,
+                &time,
+                theme::font(11.0),
+                if selected { Color32::WHITE } else { p.secondary },
+            );
+        }
+        let max_w = r.width() - 16.0 - if show_time { tw + 8.0 } else { 0.0 };
+        draw_text(ui, &painter, Pos2::new(r.left() + 13.0, r.top() + 1.5), &ev.title, theme::font(12.0), text_color, max_w);
+    }
+
+    for &(_, more, r) in &lay.more {
+        painter.text(r.min, Align2::LEFT_TOP, format!("{more} more"), theme::bold_font(11.5), p.secondary);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Day / Week time grid
 
 pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
     let first = if ndays == 7 { start_of_week(app.date) } else { app.date };
-    let days: Vec<NaiveDate> = (0..ndays).map(|i| first + Duration::days(i)).collect();
-    let events = events_in(app, first, ndays);
+    let events = layout::events_in(&app.store, first, ndays);
 
     let full = ui.available_rect_before_wrap();
-    let col_w = (full.width() - GUTTER) / ndays as f32;
-    let col_x = |i: i64| full.left() + GUTTER + i as f32 * col_w;
+    let (header, _) = ui.allocate_exact_size(Vec2::new(full.width(), DAY_HEADER_H), Sense::hover());
+    let lane_h = layout::allday_height(&events, first, ndays);
+    let (allday, _) = ui.allocate_exact_size(Vec2::new(full.width(), lane_h), Sense::hover());
+    // Header and all-day lane stay put; paint them with the outer painter.
+    let outer = ui.painter().clone();
 
-    // ---- Column headers
-    let header_h = 34.0;
-    let (header, _) = ui.allocate_exact_size(Vec2::new(full.width(), header_h), Sense::hover());
-    let painter = ui.painter();
-    for (i, day) in days.iter().enumerate() {
-        let x = col_x(i as i64);
-        let is_today = *day == app.today;
+    // Our own pointer handling does drags, so the scroll area must not.
+    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).drag_to_scroll(false);
+    if let Some(off) = app.scroll_to.take() {
+        scroll = scroll.vertical_scroll_offset(off);
+    }
+    scroll.show(ui, |ui| {
+        let (grid, _) = ui.allocate_exact_size(Vec2::new(full.width(), layout::grid_height()), Sense::hover());
+        let rects = WeekRects { header, allday, grid, grid_clip: ui.clip_rect().intersect(grid) };
+        let lay = layout::week(&events, first, ndays, rects, &|ev| !is_read_only(app, ev));
+
+        drive_pointer(app, ui, &lay.hits);
+
+        paint_day_headers(app, ui, &outer, &lay, p);
+        paint_allday(app, ui, &outer, &lay, &events, p);
+        paint_hour_grid(app, ui, &lay, &events, p);
+    });
+}
+
+fn paint_day_headers(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayout, p: &Palette) {
+    let g = &lay.geom;
+    let cy = lay.rects.header.center().y;
+    for i in 0..lay.ndays {
+        let day = lay.first + Duration::days(i);
+        let x = g.col_x(i);
+        let is_today = day == app.today;
         let wd = weekday_short(day.weekday().num_days_from_sunday() as usize);
         let num = day.day().to_string();
         let color = if is_today { RED } else { p.text };
         let font = theme::font(15.0);
-        let cy = header.center().y;
-        if ndays == 1 {
+        if lay.ndays == 1 {
             let x0 = x + 8.0;
             let w = draw_text(ui, painter, Pos2::new(x0, cy - 9.0), wd, font.clone(), color, 100.0);
             let nw = text_galley(ui, &num, font.clone(), color, 50.0).size().x;
@@ -326,314 +309,118 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
         } else {
             let label_w = text_galley(ui, wd, font.clone(), color, 100.0).size().x;
             let nw = text_galley(ui, &num, font.clone(), color, 50.0).size().x;
-            let total = label_w + 6.0 + nw;
-            let x0 = x + (col_w - total) / 2.0;
+            let x0 = x + (g.col_w - (label_w + 6.0 + nw)) / 2.0;
             painter.text(Pos2::new(x0, cy), Align2::LEFT_CENTER, wd, font.clone(), color);
             day_number_badge(painter, Pos2::new(x0 + label_w + 6.0 + nw / 2.0, cy), &num, is_today, font, color);
-            let hdr_cell = Rect::from_min_size(Pos2::new(x, header.top()), Vec2::new(col_w, header_h));
-            if ui.interact(hdr_cell, ui.id().with(("hdr", i)), Sense::click()).double_clicked() {
-                app.actions.push(Action::GoTo(*day, View::Day));
-            }
         }
     }
+}
 
-    // ---- All-day lane
-    let lanes = banner_lanes(&events, first, ndays);
-    let n_lanes = lanes.iter().map(|l| l.3 + 1).max().unwrap_or(0).max(1);
-    let lane_h = n_lanes as f32 * BANNER_H + 6.0;
-    let (allday, allday_resp) = ui.allocate_exact_size(Vec2::new(full.width(), lane_h), Sense::click());
-    let painter = ui.painter();
-    painter.hline(full.x_range(), allday.top(), Stroke::new(1.0_f32, p.grid));
-    painter.hline(full.x_range(), allday.bottom(), Stroke::new(1.0_f32, p.grid_strong));
+fn paint_allday(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayout, events: &[Event], p: &Palette) {
+    let r = lay.rects.allday;
+    let x_range = lay.rects.header.x_range();
+    painter.hline(x_range, r.top(), Stroke::new(1.0_f32, p.grid));
+    painter.hline(x_range, r.bottom(), Stroke::new(1.0_f32, p.grid_strong));
     painter.text(
-        Pos2::new(allday.left() + GUTTER - 8.0, allday.top() + 12.0),
+        Pos2::new(r.left() + GUTTER - 8.0, r.top() + 12.0),
         Align2::RIGHT_CENTER,
         "all-day",
         theme::font(11.0),
         p.secondary,
     );
-    for i in 1..ndays {
-        painter.vline(col_x(i), allday.y_range(), Stroke::new(1.0_f32, p.grid));
+    for i in 1..lay.ndays {
+        painter.vline(lay.geom.col_x(i), r.y_range(), Stroke::new(1.0_f32, p.grid));
     }
-    if allday_resp.double_clicked() {
-        if let Some(pos) = allday_resp.interact_pointer_pos() {
-            let i = (((pos.x - col_x(0)) / col_w).floor() as i64).clamp(0, ndays - 1);
-            let day = first + Duration::days(i);
-            app.actions.push(Action::New { start: midnight(day), end: midnight(day) + Duration::days(1), all_day: true });
-        }
-    } else if allday_resp.clicked() {
-        app.actions.push(Action::Select(None));
+    for b in &lay.banners {
+        let ev = &events[b.ev];
+        draw_banner(ui, painter, b.rect, ev, event_color(app, ev), is_selected(app, ev), p);
     }
-    for &(i, c0, c1, lane) in &lanes {
-        let ev = &events[i];
-        let r = Rect::from_min_max(
-            Pos2::new(col_x(c0) + 2.0, allday.top() + 3.0 + lane as f32 * BANNER_H),
-            Pos2::new(col_x(c1 + 1) - 2.0, allday.top() + 3.0 + lane as f32 * BANNER_H + BANNER_H - 2.0),
-        );
-        let selected = app.selected.as_deref() == Some(ev.id.as_str());
-        draw_banner(ui, ui.painter(), r, ev, event_color(app, ev), selected, p);
-        event_click(app, ui, r, ev, "allday");
-    }
+}
 
-    // ---- Scrolling hour grid
-    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-    if let Some(off) = app.scroll_to.take() {
-        scroll = scroll.vertical_scroll_offset(off);
-    }
-    scroll.show(ui, |ui| {
-        let (grid, bg) = ui.allocate_exact_size(Vec2::new(full.width(), 24.0 * HOUR_H + 12.0), Sense::click_and_drag());
-        let top = grid.top() + 6.0;
-        let painter = ui.painter_at(grid);
+fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &Palette) {
+    let grid = lay.rects.grid;
+    let g = &lay.geom;
+    let painter = ui.painter_at(grid);
 
-        for (i, day) in days.iter().enumerate() {
-            let wd = day.weekday().num_days_from_sunday();
-            if ndays > 1 && (wd == 0 || wd == 6) {
-                painter.rect_filled(
-                    Rect::from_min_size(Pos2::new(col_x(i as i64), grid.top()), Vec2::new(col_w, grid.height())),
-                    0.0,
-                    p.weekend,
-                );
-            }
-        }
-        let now = Local::now().naive_local();
-        let now_y = top + minute_of_day(now) as f32 / 60.0 * HOUR_H;
-        let today_col = days.iter().position(|d| *d == app.today);
-        for h in 0..=24 {
-            let y = top + h as f32 * HOUR_H;
-            painter.hline((grid.left() + GUTTER - 4.0)..=grid.right(), y, Stroke::new(1.0_f32, p.grid));
-            let near_now = today_col.is_some() && (y - now_y).abs() < 10.0;
-            if h > 0 && h < 24 && !near_now {
-                painter.text(
-                    Pos2::new(grid.left() + GUTTER - 8.0, y),
-                    Align2::RIGHT_CENTER,
-                    fmt_hour(h),
-                    theme::font(11.0),
-                    p.secondary,
-                );
-            }
-        }
-        for i in 0..ndays {
-            painter.vline(col_x(i), grid.y_range(), Stroke::new(1.0_f32, p.grid));
-        }
-
-        let pointer_time = |pos: Pos2| -> NaiveDateTime {
-            let i = (((pos.x - col_x(0)) / col_w).floor() as i64).clamp(0, ndays - 1);
-            let mins = (((pos.y - top) / HOUR_H) * 60.0).clamp(0.0, 24.0 * 60.0 - 1.0) as i64;
-            midnight(first + Duration::days(i)) + Duration::minutes(mins)
-        };
-
-        // Background interactions: click to deselect, double-click or drag to create.
-        if bg.double_clicked() {
-            if let Some(pos) = bg.interact_pointer_pos() {
-                let t = pointer_time(pos);
-                let start = midnight(t.date()) + Duration::minutes(minute_of_day(t) / 30 * 30);
-                app.actions.push(Action::New { start, end: start + Duration::hours(1), all_day: false });
-            }
-        } else if bg.clicked() {
-            app.actions.push(Action::Select(None));
-        }
-        if bg.drag_started() {
-            if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
-                let t = snap(pointer_time(origin));
-                app.drag = Some(Drag::Create { anchor: t, current: t });
-            }
-        }
-        if let (Some(Drag::Create { anchor, current }), Some(pos)) = (&mut app.drag, bg.interact_pointer_pos()) {
-            let t = snap(pointer_time(pos));
-            *current = if t.date() == anchor.date() { t } else { midnight(anchor.date()) + Duration::minutes(minute_of_day(t)) };
-        }
-        if bg.drag_stopped() {
-            if let Some(Drag::Create { anchor, current }) = app.drag.take() {
-                let (mut s, mut e) = if current < anchor { (current, anchor) } else { (anchor, current) };
-                if e - s < Duration::minutes(15) {
-                    s = anchor;
-                    e = anchor + Duration::hours(1);
-                }
-                app.actions.push(Action::New { start: s, end: e, all_day: false });
-            }
-        }
-
-        // Timed events, laid out side by side when they overlap.
-        let timed: Vec<&Event> = events.iter().filter(|e| !e.is_banner()).collect();
-        for (i, day) in days.iter().enumerate() {
-            let segs = layout_day(&timed, *day);
-            for seg in segs {
-                let ev = seg.ev;
-                let x0 = col_x(i as i64) + 1.0 + seg.col as f32 * (col_w - 6.0) / seg.cols as f32;
-                let w = (col_w - 6.0) / seg.cols as f32 - 1.0;
-                let y0 = top + seg.start_min as f32 / 60.0 * HOUR_H + 1.0;
-                let y1 = (top + seg.end_min as f32 / 60.0 * HOUR_H - 1.0).max(y0 + 16.0);
-                let r = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x0 + w, y1));
-                let color = event_color(app, ev);
-                let selected = app.selected.as_deref() == Some(ev.id.as_str());
-                draw_timed(ui, &painter, r, ev, color, selected, p);
-
-                let resp = ui.interact(r, ui.id().with(("tev", &ev.id, i)), Sense::click_and_drag());
-                let editable = !is_read_only(app, ev);
-                let near_bottom = |pos: Pos2| pos.y > r.bottom() - 6.0 && seg.ends_here;
-                if editable && resp.hovered() {
-                    if let Some(pos) = resp.hover_pos() {
-                        if near_bottom(pos) {
-                            ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
-                        }
-                    }
-                }
-                if resp.double_clicked() {
-                    app.actions.push(Action::Open(ev.id.clone()));
-                } else if resp.clicked() {
-                    app.actions.push(Action::Select(Some(ev.id.clone())));
-                }
-                if editable && resp.drag_started() {
-                    let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(r.center());
-                    app.selected = Some(ev.id.clone());
-                    app.begin_edit(&ev.id);
-                    app.drag = Some(if near_bottom(origin) {
-                        Drag::Resize { id: ev.id.clone() }
-                    } else {
-                        Drag::Move { id: ev.id.clone(), grab: pointer_time(origin) - ev.start }
-                    });
-                }
-                if resp.drag_stopped() {
-                    if let Some(Drag::Move { id, .. } | Drag::Resize { id }) = app.drag.take() {
-                        app.actions.push(Action::Committed(id));
-                    }
-                }
-                resp.on_hover_text(hover_text(ev));
-            }
-        }
-
-        // Apply an in-progress move/resize directly to the event.
-        if let Some(pos) = ui.ctx().pointer_latest_pos() {
-            match &app.drag {
-                Some(Drag::Move { id, grab }) => {
-                    ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-                    let new_start = snap(pointer_time(pos) - *grab);
-                    if let Some(ev) = app.store.event_mut(id) {
-                        let len = ev.end - ev.start;
-                        ev.start = new_start;
-                        ev.end = new_start + len;
-                    }
-                }
-                Some(Drag::Resize { id }) => {
-                    ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
-                    if let Some(ev) = app.store.event_mut(id) {
-                        ev.end = snap(pointer_time(pos)).max(ev.start + Duration::minutes(15));
-                    }
-                }
-                _ => {}
-            }
-        }
-        // A drag that ended outside any widget (e.g. released over another one).
-        if app.drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
-            match app.drag.take() {
-                Some(Drag::Move { id, .. } | Drag::Resize { id }) => app.actions.push(Action::Committed(id)),
-                Some(other) => app.drag = Some(other),
-                None => {}
-            }
-        }
-
-        // Ghost block while drag-creating.
-        if let Some(Drag::Create { anchor, current }) = &app.drag {
-            let (s, e) = if current < anchor { (*current, *anchor) } else { (*anchor, *current) };
-            if let Some(i) = days.iter().position(|d| *d == s.date()) {
-                let y0 = top + minute_of_day(s) as f32 / 60.0 * HOUR_H;
-                let y1 = (top + minute_of_day(e) as f32 / 60.0 * HOUR_H).max(y0 + HOUR_H / 4.0);
-                let r = Rect::from_min_max(Pos2::new(col_x(i as i64) + 1.0, y0), Pos2::new(col_x(i as i64) + col_w - 5.0, y1));
-                let ghost = Event {
-                    id: String::new(),
-                    calendar_id: String::new(),
-                    title: "New Event".into(),
-                    start: s,
-                    end: e.max(s + Duration::minutes(15)),
-                    all_day: false,
-                    location: String::new(),
-                    notes: String::new(),
-                    remote_id: None,
-                    recurring_id: None,
-                    pending: false,
-                    rev: 0,
-                    etag: None,
-                    base: None,
-                };
-                draw_timed(ui, &painter, r, &ghost, theme::ACCENT, false, p);
-            }
-        }
-
-        // Current time indicator.
-        if let Some(i) = today_col {
-            let x0 = col_x(i as i64);
-            painter.hline((grid.left() + GUTTER)..=grid.right(), now_y, Stroke::new(1.0_f32, RED.gamma_multiply(0.35)));
-            painter.hline(x0..=x0 + col_w, now_y, Stroke::new(2.0_f32, RED));
-            painter.circle_filled(Pos2::new(x0, now_y), 4.0, RED);
-            painter.text(
-                Pos2::new(grid.left() + GUTTER - 8.0, now_y),
-                Align2::RIGHT_CENTER,
-                fmt_time(now.time()).replace(" AM", "").replace(" PM", ""),
-                theme::bold_font(11.0),
-                RED,
+    for i in 0..lay.ndays {
+        let wd = (lay.first + Duration::days(i)).weekday().num_days_from_sunday();
+        if lay.ndays > 1 && (wd == 0 || wd == 6) {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(g.col_x(i), grid.top()), Vec2::new(g.col_w, grid.height())),
+                0.0,
+                p.weekend,
             );
         }
-    });
-}
-
-struct Segment<'a> {
-    ev: &'a Event,
-    start_min: i64,
-    end_min: i64,
-    col: usize,
-    cols: usize,
-    ends_here: bool,
-}
-
-/// Clips events to `day` and assigns side-by-side columns to overlapping ones.
-fn layout_day<'a>(events: &[&'a Event], day: NaiveDate) -> Vec<Segment<'a>> {
-    let ds = midnight(day);
-    let de = ds + Duration::days(1);
-    let mut segs: Vec<Segment> = events
-        .iter()
-        .filter(|e| e.occurs_on(day))
-        .map(|e| {
-            let s = e.start.max(ds);
-            let end = e.end.min(de);
-            let start_min = (s - ds).num_minutes();
-            let end_min = ((end - ds).num_minutes()).max(start_min + 15);
-            Segment { ev: e, start_min, end_min, col: 0, cols: 1, ends_here: e.end <= de }
-        })
-        .collect();
-    segs.sort_by_key(|s| (s.start_min, -s.end_min));
-
-    let mut cluster_start = 0;
-    let mut cluster_end = i64::MIN;
-    let mut col_ends: Vec<i64> = Vec::new();
-    for i in 0..=segs.len() {
-        let new_cluster = i == segs.len() || segs[i].start_min >= cluster_end;
-        if new_cluster && i > cluster_start {
-            let n = col_ends.len().max(1);
-            for s in &mut segs[cluster_start..i] {
-                s.cols = n;
-            }
-        }
-        if i == segs.len() {
-            break;
-        }
-        if new_cluster {
-            cluster_start = i;
-            col_ends.clear();
-            cluster_end = i64::MIN;
-        }
-        let col = match col_ends.iter().position(|&end| end <= segs[i].start_min) {
-            Some(c) => c,
-            None => {
-                col_ends.push(0);
-                col_ends.len() - 1
-            }
-        };
-        col_ends[col] = segs[i].end_min;
-        segs[i].col = col;
-        cluster_end = cluster_end.max(segs[i].end_min);
     }
-    segs
+    let now = Local::now().naive_local();
+    let now_y = g.y_of(minute_of_day(now));
+    let today_col = (0..lay.ndays).find(|&i| lay.first + Duration::days(i) == app.today);
+    for h in 0..=24u32 {
+        let y = g.y_of(h as i64 * 60);
+        painter.hline((grid.left() + GUTTER - 4.0)..=grid.right(), y, Stroke::new(1.0_f32, p.grid));
+        let near_now = today_col.is_some() && (y - now_y).abs() < 10.0;
+        if h > 0 && h < 24 && !near_now {
+            painter.text(
+                Pos2::new(grid.left() + GUTTER - 8.0, y),
+                Align2::RIGHT_CENTER,
+                fmt_hour(h),
+                theme::font(11.0),
+                p.secondary,
+            );
+        }
+    }
+    for i in 0..lay.ndays {
+        painter.vline(g.col_x(i), grid.y_range(), Stroke::new(1.0_f32, p.grid));
+    }
+
+    for t in &lay.timed {
+        let ev = &events[t.ev];
+        draw_timed(ui, &painter, t.rect, ev, event_color(app, ev), is_selected(app, ev), p);
+    }
+
+    // Ghost block while drag-creating.
+    if let Some((s, e)) = app.pointer.ghost() {
+        let i = (s.date() - lay.first).num_days();
+        if (0..lay.ndays).contains(&i) {
+            let y0 = g.y_of(minute_of_day(s));
+            let y1 = g.y_of(minute_of_day(s) + (e - s).num_minutes()).max(y0 + HOUR_H / 4.0);
+            let r = Rect::from_min_max(Pos2::new(g.col_x(i) + 1.0, y0), Pos2::new(g.col_x(i) + g.col_w - 5.0, y1));
+            let ghost = Event {
+                id: String::new(),
+                calendar_id: String::new(),
+                title: "New Event".into(),
+                start: s,
+                end: e,
+                all_day: false,
+                location: String::new(),
+                notes: String::new(),
+                remote_id: None,
+                recurring_id: None,
+                pending: false,
+                rev: 0,
+                etag: None,
+                base: None,
+            };
+            draw_timed(ui, &painter, r, &ghost, theme::ACCENT, false, p);
+        }
+    }
+
+    // Current time indicator.
+    if let Some(i) = today_col {
+        let x0 = g.col_x(i);
+        painter.hline((grid.left() + GUTTER)..=grid.right(), now_y, Stroke::new(1.0_f32, RED.gamma_multiply(0.35)));
+        painter.hline(x0..=x0 + g.col_w, now_y, Stroke::new(2.0_f32, RED));
+        painter.circle_filled(Pos2::new(x0, now_y), 4.0, RED);
+        painter.text(
+            Pos2::new(grid.left() + GUTTER - 8.0, now_y),
+            Align2::RIGHT_CENTER,
+            fmt_time(now.time()).replace(" AM", "").replace(" PM", ""),
+            theme::bold_font(11.0),
+            RED,
+        );
+    }
 }
+
 
 fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Color32, selected: bool, p: &Palette) {
     painter.rect_filled(r, 4.0, p.event_fill(color, selected));
@@ -764,40 +551,3 @@ pub fn mini_month(
     clicked
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ev(id: &str, s: (u32, u32), e: (u32, u32)) -> Event {
-        let day = NaiveDate::from_ymd_opt(2026, 11, 10).unwrap();
-        Event {
-            id: id.into(),
-            calendar_id: "c".into(),
-            title: id.into(),
-            start: day.and_hms_opt(s.0, s.1, 0).unwrap(),
-            end: day.and_hms_opt(e.0, e.1, 0).unwrap(),
-            all_day: false,
-            location: String::new(),
-            notes: String::new(),
-            remote_id: None,
-            recurring_id: None,
-            pending: false,
-            rev: 0,
-            etag: None,
-            base: None,
-        }
-    }
-
-    #[test]
-    fn overlapping_events_share_columns() {
-        let a = ev("a", (13, 0), (14, 30));
-        let b = ev("b", (13, 30), (14, 15));
-        let c = ev("c", (16, 0), (17, 0));
-        let all = [&a, &b, &c];
-        let segs = layout_day(&all, NaiveDate::from_ymd_opt(2026, 11, 10).unwrap());
-        let get = |id: &str| segs.iter().find(|s| s.ev.id == id).unwrap();
-        assert_eq!((get("a").col, get("a").cols), (0, 2));
-        assert_eq!((get("b").col, get("b").cols), (1, 2));
-        assert_eq!((get("c").col, get("c").cols), (0, 1));
-    }
-}
