@@ -313,6 +313,8 @@ fn local_event(remote_id: Option<&str>) -> Event {
         rev: 3,
         etag: None,
         base: None,
+        recurrence: None,
+        time_zone: None,
     }
 }
 

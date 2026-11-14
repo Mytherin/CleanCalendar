@@ -184,6 +184,8 @@ impl Device {
             rev: 0,
             etag: None,
             base: None,
+            recurrence: None,
+            time_zone: None,
         });
         self.engine.event_changed(&mut self.store, &id);
         id

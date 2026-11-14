@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::model::Event;
+use crate::recurrence;
 
 /// Where sign-in, token, and Calendar API requests go.
 #[derive(Clone, Debug, PartialEq)]
@@ -703,6 +704,11 @@ fn event_from_json(cal_id: &str, v: &Value) -> Option<Event> {
     let remote_id = v["id"].as_str()?.to_owned();
     let (start, all_day) = parse_when(&v["start"])?;
     let (end, _) = parse_when(&v["end"]).unwrap_or((start, all_day));
+    let time_zone = if all_day { None } else { v["start"]["timeZone"].as_str().map(str::to_owned) };
+    let recurrence = v["recurrence"].as_array().and_then(|lines| {
+        let lines: Vec<String> = lines.iter().filter_map(|l| l.as_str().map(str::to_owned)).collect();
+        recurrence::from_rrule(&lines, all_day, time_zone.as_deref().and_then(recurrence::parse_zone))
+    });
     Some(Event {
         id: local_event_id(cal_id, &remote_id),
         calendar_id: local_calendar_id(cal_id),
@@ -718,6 +724,8 @@ fn event_from_json(cal_id: &str, v: &Value) -> Option<Event> {
         rev: 0,
         etag: v["etag"].as_str().map(str::to_owned),
         base: None,
+        recurrence,
+        time_zone,
     })
 }
 
@@ -731,20 +739,35 @@ fn parse_when(v: &Value) -> Option<(NaiveDateTime, bool)> {
 }
 
 fn event_to_json(ev: &Event) -> Value {
+    // Google needs a zone to repeat a timed event in; a floating series
+    // repeats in this computer's zone.
+    let zone = match (&ev.time_zone, &ev.recurrence) {
+        _ if ev.all_day => None,
+        (Some(z), _) => Some(z.clone()),
+        (None, Some(_)) => recurrence::local_zone_name(),
+        (None, None) => None,
+    };
     let when = |t: NaiveDateTime| {
         if ev.all_day {
             json!({ "date": t.date().format("%Y-%m-%d").to_string() })
         } else {
-            json!({ "dateTime": to_rfc3339(t) })
+            match &zone {
+                Some(z) => json!({ "dateTime": to_rfc3339(t), "timeZone": z }),
+                None => json!({ "dateTime": to_rfc3339(t) }),
+            }
         }
     };
-    json!({
+    let mut body = json!({
         "summary": ev.title,
         "location": ev.location,
         "description": ev.notes,
         "start": when(ev.start),
         "end": when(ev.end),
-    })
+    });
+    if let Some(rule) = &ev.recurrence {
+        body["recurrence"] = json!(recurrence::to_rrule(rule, ev, zone.as_deref().unwrap_or("UTC")));
+    }
+    body
 }
 
 fn to_rfc3339(t: NaiveDateTime) -> String {
@@ -786,6 +809,33 @@ mod tests {
 
         let cancelled = json!({"id": "z", "status": "cancelled"});
         assert!(event_from_json("c", &cancelled).is_none());
+    }
+
+    #[test]
+    fn time_zones_and_repeat_rules_round_trip() {
+        let v = json!({"id": "s", "summary": "Standup",
+            "start": {"dateTime": "2026-11-16T09:00:00-05:00", "timeZone": "America/New_York"},
+            "end": {"dateTime": "2026-11-16T09:15:00-05:00", "timeZone": "America/New_York"},
+            "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10"]});
+        let ev = event_from_json("c", &v).unwrap();
+        assert_eq!(ev.time_zone.as_deref(), Some("America/New_York"));
+        let rule = ev.recurrence.as_ref().unwrap();
+        assert_eq!((rule.freq, rule.end), (recurrence::Freq::Weekly, recurrence::RepeatEnd::Count(10)));
+
+        let body = event_to_json(&ev);
+        assert_eq!(body["start"]["timeZone"], "America/New_York");
+        assert_eq!(body["end"]["timeZone"], "America/New_York");
+        assert_eq!(body["recurrence"], json!(["RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10"]));
+        // The same instant, whatever this computer's zone is.
+        let sent = DateTime::parse_from_rfc3339(body["start"]["dateTime"].as_str().unwrap()).unwrap();
+        assert_eq!(sent, DateTime::parse_from_rfc3339("2026-11-16T09:00:00-05:00").unwrap());
+
+        // A plain event doesn't name a zone, and an all-day one never does.
+        let plain = json!({"id": "p", "start": {"dateTime": "2026-11-14T18:00:00Z"}, "end": {"dateTime": "2026-11-14T19:00:00Z"}});
+        let plain = event_from_json("c", &plain).unwrap();
+        assert!(plain.time_zone.is_none() && plain.recurrence.is_none());
+        assert!(event_to_json(&plain)["start"].get("timeZone").is_none());
+        assert!(event_to_json(&plain).get("recurrence").is_none());
     }
 
     #[test]

@@ -7,11 +7,12 @@
 //! (or moving on to another event in the inspector) keeps the changes, and
 //! Esc discards them.
 
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, Order, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
 use crate::dates::*;
 use crate::model::{Event, Store};
+use crate::recurrence::{self, Freq, Recurrence, RepeatEnd};
 use crate::theme::{self, Palette, RED};
 
 pub const POPOVER_W: f32 = 320.0;
@@ -35,7 +36,17 @@ pub enum Outcome {
     Done,
     /// Discard the changes and close.
     Cancel,
+    /// Delete the event, or just this occurrence of a repeating one.
     Delete,
+    /// Delete every occurrence of the repeating event.
+    DeleteSeries,
+}
+
+/// What a change to one occurrence of a repeating event applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    ThisEvent,
+    AllEvents,
 }
 
 pub struct Editor {
@@ -44,6 +55,9 @@ pub struct Editor {
     pub draft: Event,
     pub is_new: bool,
     pub placement: Placement,
+    /// For an occurrence of a repeating event: what the changes apply to.
+    pub scope: Scope,
+    /// The date/time fields, in the event's time zone (if it has one).
     start_date: NaiveDate,
     start_time: NaiveTime,
     end_date: NaiveDate,
@@ -54,6 +68,8 @@ pub struct Editor {
     /// The popover's size last frame, to place it before it's measured.
     size: Vec2,
     focus_title: bool,
+    /// The search text in the time zone picker.
+    zone_filter: String,
 }
 
 impl Editor {
@@ -66,22 +82,37 @@ impl Editor {
             draft,
             is_new,
             placement,
+            scope: Scope::AllEvents,
             editing_when: false,
             error: None,
             size: Vec2::new(POPOVER_W, 260.0),
             focus_title: is_new,
+            zone_filter: String::new(),
         };
         ed.fields_from_draft();
         ed
     }
 
+    /// An occurrence of a repeating event stored here.
+    fn is_occurrence(&self) -> bool {
+        self.draft.recurrence.is_some() && recurrence::split_occurrence(&self.draft.id).is_some()
+    }
+
+    /// One of a series whose rule can't be edited here: Google sends its
+    /// series as separate occurrences, and a changed occurrence is on its own.
+    fn in_fixed_series(&self) -> bool {
+        self.draft.recurrence.is_none() && self.draft.recurring_id.is_some()
+    }
+
     fn fields_from_draft(&mut self) {
         let d = &self.draft;
-        let last = if d.all_day { d.end - Duration::days(1) } else { d.end };
-        self.start_date = d.start.date();
-        self.start_time = d.start.time();
-        self.end_date = last.date().max(d.start.date());
-        self.end_time = d.end.time();
+        let zone = recurrence::zone_of(d);
+        let (start, end) = (recurrence::to_zone(d.start, zone), recurrence::to_zone(d.end, zone));
+        let last = if d.all_day { end - Duration::days(1) } else { end };
+        self.start_date = start.date();
+        self.start_time = start.time();
+        self.end_date = last.date().max(start.date());
+        self.end_time = end.time();
     }
 
     /// Updates the times from outside (e.g. the event was dragged while the
@@ -99,8 +130,10 @@ impl Editor {
             ev.start = midnight(self.start_date);
             ev.end = midnight(self.end_date.max(self.start_date)) + Duration::days(1);
         } else {
-            ev.start = self.start_date.and_time(self.start_time);
-            ev.end = self.end_date.and_time(self.end_time);
+            // The fields are in the event's zone; the event keeps local times.
+            let zone = recurrence::zone_of(&ev);
+            ev.start = recurrence::from_zone(self.start_date.and_time(self.start_time), zone);
+            ev.end = recurrence::from_zone(self.end_date.and_time(self.end_time), zone);
         }
         if ev.end < ev.start {
             return Err("The event ends before it starts.".into());
@@ -172,6 +205,29 @@ fn when_summary(ed: &Editor) -> (String, String) {
     }
 }
 
+/// Lines under the date summary: the time zone (with the local time, when
+/// that's different) and how the event repeats.
+fn when_details(ed: &Editor) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let (Some(zone), false) = (&ed.draft.time_zone, ed.draft.all_day) {
+        let mut line = zone_label(zone);
+        if let Ok(ev) = ed.result() {
+            let shown = ed.start_date.and_time(ed.start_time);
+            if ev.start != shown {
+                let day = if ev.start.date() != shown.date() { format!("{} ", ev.start.format("%a %-d %b")) } else { String::new() };
+                line += &format!(" \u{00B7} {day}{} here", fmt_time_range(ev.start.time(), ev.end.time()));
+            }
+        }
+        lines.push(line);
+    }
+    if let Some(rule) = &ed.draft.recurrence {
+        lines.push(rule.describe(ed.start_date));
+    } else if ed.in_fixed_series() {
+        lines.push("Part of a repeating series".into());
+    }
+    lines
+}
+
 /// Size of the date and time buttons in the "starts"/"ends" rows. Both are
 /// fixed so the two rows' clocks line up with each other.
 const DATE_BUTTON: Vec2 = Vec2::new(112.0, 26.0);
@@ -195,6 +251,185 @@ fn time_button(ui: &mut egui::Ui, id: &str, t: &mut NaiveTime) {
             }
         });
     });
+}
+
+/// A button that drops down a menu, built like [`time_button`]. The menu
+/// closes when one of its items is clicked.
+fn menu_button(ui: &mut egui::Ui, id: &str, label: &str, size: Vec2, menu: impl FnOnce(&mut egui::Ui)) {
+    let resp = ui.add_sized(size, egui::Button::new(label).truncate());
+    let popup_id = ui.make_persistent_id(id);
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    egui::popup::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+        ui.set_min_width(size.x);
+        menu(ui);
+    });
+}
+
+/// "America/New York" for "America/New_York".
+fn zone_label(name: &str) -> String {
+    name.replace('_', " ")
+}
+
+/// The time zone picker: "Floating" (the event keeps its wall time wherever
+/// you are), this computer's zone, then every zone, with a search field.
+fn zone_button(ui: &mut egui::Ui, ed: &mut Editor) {
+    let label = ed.draft.time_zone.as_deref().map_or("Floating".into(), zone_label);
+    let size = Vec2::new(DATE_BUTTON.x + TIME_BUTTON.x + 8.0, DATE_BUTTON.y);
+    let resp = ui.add_sized(size, egui::Button::new(label).truncate());
+    let popup_id = ui.make_persistent_id("zone-picker");
+    let opened = resp.clicked();
+    if opened {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+        ed.zone_filter.clear();
+    }
+    egui::popup::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_min_width(size.x.max(240.0));
+        let search = ui.add(egui::TextEdit::singleline(&mut ed.zone_filter).hint_text("Search").desired_width(f32::INFINITY));
+        if opened {
+            search.request_focus();
+        }
+        let filter = ed.zone_filter.trim().to_lowercase().replace('_', " ");
+        let matches = |name: &str| filter.is_empty() || name.to_lowercase().replace('_', " ").contains(&filter);
+        let mut chosen: Option<Option<String>> = None;
+        egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            if matches("floating") && ui.selectable_label(ed.draft.time_zone.is_none(), "Floating").clicked() {
+                chosen = Some(None);
+            }
+            let local = recurrence::local_zone_name();
+            if let Some(local) = local.as_deref().filter(|n| matches(n)) {
+                let current = ed.draft.time_zone.as_deref() == Some(local);
+                if ui.selectable_label(current, format!("{} (this computer)", zone_label(local))).clicked() {
+                    chosen = Some(Some(local.to_owned()));
+                }
+                ui.separator();
+            }
+            for name in recurrence::zone_names().filter(|n| matches(n) && Some(*n) != local.as_deref()) {
+                if ui.selectable_label(ed.draft.time_zone.as_deref() == Some(name), zone_label(name)).clicked() {
+                    chosen = Some(Some(name.to_owned()));
+                }
+            }
+        });
+        if let Some(zone) = chosen {
+            // The date and time fields stay as they are: "09:00" now means
+            // 09:00 in the chosen zone.
+            ed.draft.time_zone = zone;
+            ui.memory_mut(|m| m.close_popup());
+        }
+    });
+}
+
+/// "Never", "Every Day", …, or "Custom" for a rule the presets don't cover.
+fn repeat_label(rule: Option<&Recurrence>) -> &'static str {
+    match rule {
+        None => "Never",
+        Some(r) if r.interval > 1 || !r.weekdays.is_empty() => "Custom",
+        Some(r) => match r.freq {
+            Freq::Daily => "Every Day",
+            Freq::Weekly => "Every Week",
+            Freq::Monthly => "Every Month",
+            Freq::Yearly => "Every Year",
+        },
+    }
+}
+
+/// The repeat rows of the date grid: how often, on which weekdays, and
+/// until when.
+fn repeat_rows(ui: &mut egui::Ui, ed: &mut Editor, p: &Palette) {
+    let wide = Vec2::new(DATE_BUTTON.x, DATE_BUTTON.y);
+    ui.label(RichText::new("repeat").color(p.secondary));
+    let current = ed.draft.recurrence.clone();
+    menu_button(ui, "repeat-menu", repeat_label(current.as_ref()), wide, |ui| {
+        if ui.selectable_label(current.is_none(), "Never").clicked() {
+            ed.draft.recurrence = None;
+        }
+        for freq in Freq::ALL {
+            let preset = Recurrence::new(freq);
+            let on = current.as_ref().is_some_and(|r| r.rule_eq(&Recurrence { end: r.end, ..preset.clone() }));
+            if ui.selectable_label(on, repeat_label(Some(&preset))).clicked() {
+                // Keep when it ends, and occurrences already removed.
+                let mut rule = preset;
+                if let Some(old) = &current {
+                    rule.end = old.end;
+                    rule.exceptions = old.exceptions.clone();
+                }
+                ed.draft.recurrence = Some(rule);
+            }
+        }
+    });
+    ui.end_row();
+
+    let first_day = ed.start_date;
+    let Some(rule) = ed.draft.recurrence.as_mut() else { return };
+    ui.label(RichText::new("every").color(p.secondary));
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut rule.interval).range(1..=99));
+        ui.label(rule.freq.unit(rule.interval));
+    });
+    ui.end_row();
+
+    if rule.freq == Freq::Weekly {
+        ui.label(RichText::new("on").color(p.secondary));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            for i in 0..7 {
+                let wd = column_weekday(i);
+                let on = rule.weekdays.contains(&wd) || (rule.weekdays.is_empty() && wd == first_day.weekday());
+                let chip = egui::Button::new(RichText::new(weekday_initial(i)).color(if on { Color32::WHITE } else { p.text }))
+                    .fill(if on { theme::ACCENT } else { p.button })
+                    .min_size(Vec2::new(22.0, 22.0))
+                    .rounding(11.0);
+                if ui.add(chip).on_hover_text(day_short(wd)).clicked() {
+                    if rule.weekdays.is_empty() {
+                        rule.weekdays.push(first_day.weekday());
+                    }
+                    if on {
+                        rule.weekdays.retain(|&d| d != wd);
+                    } else {
+                        rule.weekdays.push(wd);
+                    }
+                    // Only the first day's weekday is the same as no choice.
+                    if rule.weekdays == [first_day.weekday()] {
+                        rule.weekdays.clear();
+                    }
+                }
+            }
+        });
+        ui.end_row();
+    }
+
+    ui.label(RichText::new("end repeat").color(p.secondary));
+    ui.horizontal(|ui| {
+        let label = match rule.end {
+            RepeatEnd::Never => "Never",
+            RepeatEnd::Until(_) => "On Date",
+            RepeatEnd::Count(_) => "After",
+        };
+        let end = &mut rule.end;
+        menu_button(ui, "end-repeat-menu", label, Vec2::new(TIME_BUTTON.x, DATE_BUTTON.y), |ui| {
+            if ui.selectable_label(*end == RepeatEnd::Never, "Never").clicked() {
+                *end = RepeatEnd::Never;
+            }
+            if ui.selectable_label(matches!(end, RepeatEnd::Until(_)), "On Date").clicked() {
+                *end = RepeatEnd::Until(add_months(first_day, 1));
+            }
+            if ui.selectable_label(matches!(end, RepeatEnd::Count(_)), "After").clicked() {
+                *end = RepeatEnd::Count(10);
+            }
+        });
+        match &mut rule.end {
+            RepeatEnd::Never => {}
+            RepeatEnd::Until(d) => {
+                ui.push_id("until", |ui| ui.add_sized(DATE_BUTTON, egui_extras::DatePickerButton::new(d)));
+            }
+            RepeatEnd::Count(n) => {
+                ui.add(egui::DragValue::new(n).range(1..=999));
+                ui.label(if *n == 1 { "time" } else { "times" });
+            }
+        }
+    });
+    ui.end_row();
 }
 
 /// The calendar picker: a chip with the calendar's color dot; clicking it
@@ -359,7 +594,18 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
                     });
                     ui.end_row();
                 }
+                if !ed.draft.all_day {
+                    ui.label(RichText::new("time zone").color(p.secondary));
+                    zone_button(ui, ed);
+                    ui.end_row();
+                }
+                if !ed.in_fixed_series() {
+                    repeat_rows(ui, ed, p);
+                }
             });
+        }
+        for line in when_details(ed) {
+            ui.label(RichText::new(line).color(p.secondary).small());
         }
         if let Some(err) = &ed.error {
             ui.label(RichText::new(err).color(RED).small());
@@ -380,14 +626,41 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
         });
     });
 
+    // Changing one occurrence of a repeating event: this one, or all?
+    // (A new repeat rule always applies to the whole series.)
+    if ed.is_occurrence() && !read_only {
+        let stored = store.find_event(&ed.draft.id);
+        let same_rule = match (&ed.draft.recurrence, stored.as_ref().and_then(|s| s.recurrence.as_ref())) {
+            (Some(a), Some(b)) => a.rule_eq(b),
+            _ => false,
+        };
+        if same_rule && changed(ed, stored.as_ref()) {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Apply to").color(p.secondary));
+                ui.selectable_value(&mut ed.scope, Scope::ThisEvent, "This Event");
+                ui.selectable_value(&mut ed.scope, Scope::AllEvents, "All Events");
+            });
+        }
+    }
+
     ui.horizontal(|ui| {
+        let link = |ui: &mut egui::Ui, text: &str| {
+            let l = ui.add(egui::Label::new(RichText::new(text).color(RED)).sense(Sense::click()));
+            l.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+        };
         if read_only {
             ui.label(RichText::new("This calendar is read-only.").color(p.secondary).small());
-        } else if !ed.is_new {
-            let del = ui.add(egui::Label::new(RichText::new("Delete Event").color(RED)).sense(Sense::click()));
-            if del.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+        } else if ed.is_new {
+        } else if ed.is_occurrence() || ed.in_fixed_series() {
+            if link(ui, "Delete This Event") {
                 outcome = Outcome::Delete;
             }
+            ui.add_space(12.0);
+            if link(ui, "Delete All Events") {
+                outcome = Outcome::DeleteSeries;
+            }
+        } else if link(ui, "Delete Event") {
+            outcome = Outcome::Delete;
         }
     });
 

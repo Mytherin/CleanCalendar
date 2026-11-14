@@ -7,10 +7,11 @@ use chrono::{Duration, Local, NaiveDate, NaiveDateTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, Stroke, Vec2};
 
 use crate::app_icon::AppIcon;
-use crate::editor::{self, Editor, Outcome, Placement};
+use crate::editor::{self, Editor, Outcome, Placement, Scope};
 use crate::dates::*;
 use crate::google::{self, Cmd, Worker};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
+use crate::recurrence;
 use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, ACCENT, RED};
 use crate::interact::Pointer;
@@ -149,17 +150,37 @@ impl App {
                     }
                     self.status = Some((text, error));
                 }
-                Notice::Renamed { from, to } => {
-                    if self.selected.as_deref() == Some(from.as_str()) {
-                        self.selected = Some(to.clone());
-                    }
-                    if let Some(ed) = self.editor.as_mut().filter(|ed| ed.draft.id == from) {
-                        ed.draft.id = to.clone();
-                    }
-                    self.pointer.rename(&from, &to);
-                }
+                Notice::Renamed { from, to } => self.rename_shown(&from, &to),
             }
         }
+    }
+
+    /// An event's id changed: follow it in the selection, the editor and the
+    /// pointer, including ids of a renamed series' occurrences.
+    fn rename_shown(&mut self, from: &str, to: &str) {
+        let renamed = |id: &str| -> Option<String> {
+            if id == from {
+                return Some(to.to_owned());
+            }
+            match recurrence::split_occurrence(id) {
+                Some((series, stamp)) if series == from => Some(recurrence::occurrence_id(to, stamp)),
+                _ => None,
+            }
+        };
+        if let Some(new) = self.selected.as_deref().and_then(renamed) {
+            self.selected = Some(new);
+        }
+        if let Some(ed) = self.editor.as_mut() {
+            if let Some(new) = renamed(&ed.draft.id) {
+                ed.draft.id = new;
+            }
+        }
+        if let Some(old) = self.dragging_id() {
+            if let Some(new) = renamed(&old) {
+                self.pointer.rename(&old, &new);
+            }
+        }
+        self.pointer.rename(from, to);
     }
 
     /// Hands queued commands to the worker, applies notices, and saves.
@@ -177,8 +198,8 @@ impl App {
         let calendar_id = self
             .selected
             .as_ref()
-            .and_then(|id| self.store.event(id))
-            .map(|e| e.calendar_id.clone())
+            .and_then(|id| self.store.find_event(id))
+            .map(|e| e.calendar_id)
             .filter(|cid| self.store.calendar(cid).is_some_and(|c| !c.read_only))
             .or_else(|| self.store.writable_calendars().find(|c| c.visible).map(|c| c.id.clone()))
             .or_else(|| self.store.writable_calendars().next().map(|c| c.id.clone()));
@@ -198,6 +219,8 @@ impl App {
             rev: 0,
             etag: None,
             base: None,
+            recurrence: None,
+            time_zone: None,
         };
         self.finish_editor(Outcome::Done);
         let placement = if self.view == View::Day {
@@ -215,14 +238,14 @@ impl App {
             return;
         }
         self.finish_editor(Outcome::Done);
-        if let Some(ev) = self.store.event(id) {
+        if let Some(ev) = self.store.find_event(id) {
             let placement = if self.view == View::Day {
                 Placement::Inspector
             } else {
                 Placement::Popover { anchor: self.event_rects.get(id).copied() }
             };
             self.selected = Some(id.to_owned());
-            self.editor = Some(Editor::new(ev.clone(), false, placement));
+            self.editor = Some(Editor::new(ev, false, placement));
         }
     }
 
@@ -234,18 +257,65 @@ impl App {
             Outcome::Open => self.editor = Some(ed),
             Outcome::Cancel => {}
             Outcome::Delete => self.delete_event(&ed.draft.id),
+            Outcome::DeleteSeries => self.delete_series(&ed.draft.id),
             Outcome::Done => {
-                let stored = self.store.event(&ed.draft.id);
-                if !(ed.is_new || editor::changed(&ed, stored)) {
+                let stored = self.store.find_event(&ed.draft.id);
+                if !(ed.is_new || editor::changed(&ed, stored.as_ref())) {
                     return;
                 }
                 match ed.result() {
+                    Ok(ev) if is_occurrence(&self.store, &ev.id) => self.commit_occurrence(ev, ed.scope),
                     Ok(ev) => self.commit_event(ev, ed.is_new),
                     // Keep it open so the problem can be fixed.
                     Err(_) => self.editor = Some(ed),
                 }
             }
         }
+    }
+
+    /// Saves an edited occurrence of a repeating event: on its own (it
+    /// leaves the series), or as a change to the whole series. Changing the
+    /// repeat rule always changes the whole series.
+    fn commit_occurrence(&mut self, ev: Event, scope: Scope) {
+        let Some((series_id, stamp)) = recurrence::split_occurrence(&ev.id) else { return };
+        let series_id = series_id.to_owned();
+        let Some(series) = self.store.event(&series_id).cloned() else { return };
+        let Some(rule) = series.recurrence.clone() else { return };
+        let rule_changed = ev.recurrence.as_ref().map_or(true, |r| !r.rule_eq(&rule));
+        if scope == Scope::ThisEvent && !rule_changed {
+            let id = self.detach(&series_id, stamp, ev);
+            self.selected = Some(id);
+            return;
+        }
+
+        let (s, shown) = recurrence::edit_series(&series, stamp, &ev);
+        self.commit_event(s, false);
+        self.selected = Some(shown);
+    }
+
+    /// Takes one occurrence out of its series as an event of its own (with
+    /// `ev`'s details) and returns the new event's id.
+    fn detach(&mut self, series_id: &str, stamp: NaiveDateTime, mut ev: Event) -> String {
+        if let Some(mut series) = self.store.event(series_id).cloned() {
+            if let Some(rule) = series.recurrence.as_mut() {
+                rule.exceptions.push(stamp);
+            }
+            self.commit_event(series, false);
+        }
+        let id = format!("local:{}", uuid::Uuid::new_v4().simple());
+        ev.id = id.clone();
+        ev.recurrence = None;
+        // Still listed as part of the series (for "Delete All Events").
+        ev.recurring_id = Some(series_id.to_owned());
+        ev.remote_id = None;
+        ev.etag = None;
+        ev.base = None;
+        ev.pending = false;
+        ev.rev = 0;
+        self.store.events.push(ev);
+        self.engine.event_changed(&mut self.store, &id);
+        self.flush();
+        id
     }
 
     fn commit_event(&mut self, mut ev: Event, is_new: bool) {
@@ -289,30 +359,111 @@ impl App {
             self.status = Some(("That event was deleted elsewhere while you edited it; your version was kept".into(), true));
         }
         self.engine.event_changed(&mut self.store, &id);
-        self.selected = Some(id);
+        self.selected = Some(self.store.event(&id).map_or(id, Event::shown_id));
         self.flush();
     }
 
-    /// Called when the user starts dragging an event.
-    fn begin_edit(&mut self, id: &str) {
+    /// Called when the user starts dragging an event. Returns the id to
+    /// drag: dragging one occurrence of a repeating event takes it out of
+    /// the series first (like Google, a drag changes only that one).
+    fn begin_edit(&mut self, id: &str) -> String {
+        if is_occurrence(&self.store, id) {
+            let Some(ev) = self.store.find_event(id) else { return id.to_owned() };
+            let Some((series_id, stamp)) = recurrence::split_occurrence(id) else { return id.to_owned() };
+            let new_id = self.detach(&series_id.to_owned(), stamp, ev);
+            if let Some(ed) = self.editor.take() {
+                // Re-open the editor on the detached event, unsaved edits kept.
+                if ed.draft.id == id {
+                    let mut draft = ed.draft.clone();
+                    draft.id = new_id.clone();
+                    draft.recurrence = None;
+                    draft.recurring_id = Some(series_id.to_owned());
+                    self.editor = Some(Editor::new(draft, false, ed.placement));
+                } else {
+                    self.editor = Some(ed);
+                }
+            }
+            self.selected = Some(new_id.clone());
+            self.pointer.rename(id, &new_id);
+            return new_id;
+        }
         self.engine.before_change(&mut self.store, id);
+        id.to_owned()
     }
 
+    fn is_read_only(&self, ev: &Event) -> bool {
+        self.store.calendar(&ev.calendar_id).is_some_and(|c| c.read_only)
+    }
+
+    /// Deletes an event, or just this occurrence of a repeating one.
     fn delete_event(&mut self, id: &str) {
-        let Some(ev) = self.store.event(id).cloned() else { return };
-        if self.store.calendar(&ev.calendar_id).is_some_and(|c| c.read_only) {
+        let Some(ev) = self.store.find_event(id) else { return };
+        if self.is_read_only(&ev) {
+            return;
+        }
+        if self.selected.as_deref() == Some(id) {
+            self.selected = None;
+        }
+        if is_occurrence(&self.store, id) {
+            let Some((series_id, stamp)) = recurrence::split_occurrence(id) else { return };
+            let Some(mut series) = self.store.event(series_id).cloned() else { return };
+            if let Some(rule) = series.recurrence.as_mut() {
+                rule.exceptions.push(stamp);
+            }
+            self.commit_event(series, false);
+            self.selected = None;
             return;
         }
         self.store.events.retain(|e| e.id != id);
         self.engine.event_deleted(&mut self.store, &ev, true);
-        if self.selected.as_deref() == Some(id) {
-            self.selected = None;
+        self.flush();
+    }
+
+    /// Deletes every occurrence of the repeating event `id` belongs to.
+    fn delete_series(&mut self, id: &str) {
+        let Some(ev) = self.store.find_event(id) else { return };
+        if self.is_read_only(&ev) {
+            return;
         }
+        // A series stored here (shown as occurrences, plus any that were
+        // changed on their own), or one Google sent as separate occurrences.
+        let local_series = match recurrence::split_occurrence(id) {
+            Some((series, _)) => Some(series.to_owned()),
+            None => ev.recurring_id.clone().filter(|r| self.store.event(r).is_some_and(|s| s.recurrence.is_some())),
+        };
+        let series_id = match (&local_series, &ev.recurring_id) {
+            (Some(s), _) | (None, Some(s)) => s.clone(),
+            (None, None) => return self.delete_event(id),
+        };
+        let members: Vec<Event> = self
+            .store
+            .events
+            .iter()
+            .filter(|e| e.id == series_id || (e.recurring_id.as_deref() == Some(&series_id) && e.calendar_id == ev.calendar_id))
+            .cloned()
+            .collect();
+        self.store.events.retain(|e| !members.iter().any(|m| m.id == e.id));
+        if local_series.is_some() {
+            for m in &members {
+                self.engine.event_deleted(&mut self.store, m, true);
+            }
+        } else if let Some(gcal) = self.store.google_calendar_of(&ev) {
+            self.engine.series_deleted(&mut self.store, &gcal, &series_id);
+        }
+        self.selected = None;
         self.flush();
     }
 
     fn apply_actions(&mut self) {
-        for action in std::mem::take(&mut self.actions) {
+        // Occurrences detached by a drag get a new id; later actions in this
+        // batch may still name the old one.
+        let mut renamed: HashMap<String, String> = HashMap::new();
+        for mut action in std::mem::take(&mut self.actions) {
+            if let Action::SetTimes { id, .. } | Action::Committed(id) = &mut action {
+                if let Some(new) = renamed.get(id) {
+                    *id = new.clone();
+                }
+            }
             match action {
                 Action::Select(id) => {
                     // The day view's inspector follows the selection.
@@ -327,7 +478,12 @@ impl App {
                 Action::Open(id) => self.open_event(&id),
                 Action::New { start, end, all_day } => self.new_event(start, end, all_day),
                 Action::GoTo(d, v) => self.go_to(d, v),
-                Action::BeginEdit(id) => self.begin_edit(&id),
+                Action::BeginEdit(id) => {
+                    let new = self.begin_edit(&id);
+                    if new != id {
+                        renamed.insert(id, new);
+                    }
+                }
                 Action::SetTimes { id, start, end } => {
                     if let Some(ev) = self.store.event_mut(&id) {
                         ev.start = start;
@@ -823,6 +979,12 @@ impl eframe::App for App {
 
 // ---------------------------------------------------------------------------
 // Widgets
+
+/// Whether `id` names an occurrence of a repeating event stored here (rather
+/// than an event of its own).
+fn is_occurrence(store: &Store, id: &str) -> bool {
+    store.event(id).is_none() && recurrence::split_occurrence(id).is_some()
+}
 
 fn icon_button(ui: &mut egui::Ui, text: &str, hover: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).size(15.0)).frame(false).min_size(Vec2::new(28.0, 26.0)))

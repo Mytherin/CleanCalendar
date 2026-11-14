@@ -34,6 +34,8 @@ fn event(id: &str, start: &str, end: &str) -> Event {
         rev: 0,
         etag: None,
         base: None,
+        recurrence: None,
+        time_zone: None,
     }
 }
 

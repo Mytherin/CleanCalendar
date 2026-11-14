@@ -11,6 +11,7 @@ use eframe::egui::{Pos2, Rect, Vec2};
 
 use crate::dates::*;
 use crate::model::{Event, Store};
+use crate::recurrence;
 
 /// Matches macOS Calendar's hour spacing (~53px at 100% scaling).
 pub const HOUR_H: f32 = 52.0;
@@ -155,13 +156,17 @@ pub struct Placed {
 pub fn events_in(store: &Store, first: NaiveDate, n: i64) -> Vec<Event> {
     let a = midnight(first);
     let b = midnight(first + Duration::days(n));
-    let mut v: Vec<Event> = store
-        .events
-        .iter()
-        .filter(|e| store.is_visible(&e.calendar_id))
+    let visible = store.events.iter().filter(|e| store.is_visible(&e.calendar_id));
+    let mut v: Vec<Event> = visible
+        .clone()
+        .filter(|e| e.recurrence.is_none())
         .filter(|e| e.start < b && (e.end > a || (e.end <= e.start && e.start >= a)))
         .cloned()
         .collect();
+    // Repeating events show as their occurrences.
+    for series in visible.filter(|e| e.recurrence.is_some() && e.start < b) {
+        v.extend(recurrence::occurrences(series, a, b));
+    }
     v.sort_by(|x, y| x.start.cmp(&y.start).then(y.duration().cmp(&x.duration())));
     v
 }
@@ -538,6 +543,8 @@ mod tests {
             rev: 0,
             etag: None,
             base: None,
+            recurrence: None,
+            time_zone: None,
         }
     }
 

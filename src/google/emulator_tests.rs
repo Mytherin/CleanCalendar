@@ -153,6 +153,8 @@ impl App {
             rev: 0,
             etag: None,
             base: None,
+            recurrence: None,
+            time_zone: None,
         });
         self.engine.event_changed(&mut self.store, &id);
         id
@@ -251,6 +253,8 @@ fn changes_from_another_device_show_up_on_next_sync() {
         rev: 0,
         etag: None,
         base: None,
+        recurrence: None,
+        time_zone: None,
     };
     let remote_id = phone.save_event(WORK, &ev).unwrap().0;
     app.sync();
@@ -333,6 +337,8 @@ fn all_day_events_round_trip() {
         rev: 0,
         etag: None,
         base: None,
+        recurrence: None,
+        time_zone: None,
     });
     app.engine.event_changed(&mut app.store, &id);
     app.pump();
@@ -367,6 +373,8 @@ fn full_sync_reads_every_page() {
             rev: 0,
             etag: None,
             base: None,
+            recurrence: None,
+            time_zone: None,
         };
         phone.save_event(calendar, &ev).unwrap();
     }
@@ -398,6 +406,8 @@ fn emulator_still_lacks_event_updates() {
         rev: 0,
         etag: None,
         base: None,
+        recurrence: None,
+        time_zone: None,
     };
     let remote_id = phone.save_event(USER, &ev).unwrap().0;
     ev.remote_id = Some(remote_id.clone());

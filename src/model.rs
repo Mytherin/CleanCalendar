@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
+use crate::recurrence::{self, Recurrence};
+
 /// Apple's system palette, used for new calendars.
 pub const CALENDAR_COLORS: [[u8; 3]; 7] = [
     [0xFF, 0x3B, 0x30], // red
@@ -42,9 +44,10 @@ impl Calendar {
     }
 }
 
-/// An event. Times are naive local wall-clock times. For all-day events
-/// `start` is midnight of the first day and `end` is midnight of the day
-/// *after* the last day (exclusive), matching Google's convention.
+/// An event. Times are naive local wall-clock times (see [`crate::recurrence`]
+/// for events pinned to a time zone). For all-day events `start` is midnight
+/// of the first day and `end` is midnight of the day *after* the last day
+/// (exclusive), matching Google's convention.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,
@@ -78,6 +81,13 @@ pub struct Event {
     /// With it, a conflict can be merged field by field (three-way merge).
     #[serde(default)]
     pub base: Option<EventFields>,
+    /// How the event repeats; `start`/`end` are then the first occurrence.
+    #[serde(default)]
+    pub recurrence: Option<Recurrence>,
+    /// The IANA zone a timed event is pinned to (e.g. "America/New_York");
+    /// `None`: floating, it happens at the same wall time wherever you are.
+    #[serde(default)]
+    pub time_zone: Option<String>,
 }
 
 /// The user-editable parts of an event.
@@ -89,6 +99,10 @@ pub struct EventFields {
     pub start: NaiveDateTime,
     pub end: NaiveDateTime,
     pub all_day: bool,
+    #[serde(default)]
+    pub recurrence: Option<Recurrence>,
+    #[serde(default)]
+    pub time_zone: Option<String>,
 }
 
 impl Event {
@@ -100,6 +114,8 @@ impl Event {
             start: self.start,
             end: self.end,
             all_day: self.all_day,
+            recurrence: self.recurrence.clone(),
+            time_zone: self.time_zone.clone(),
         }
     }
 
@@ -110,6 +126,22 @@ impl Event {
         self.start = f.start;
         self.end = f.end;
         self.all_day = f.all_day;
+        self.recurrence = f.recurrence;
+        self.time_zone = f.time_zone;
+    }
+
+    /// Whether this is (an occurrence of) a repeating event.
+    pub fn repeats(&self) -> bool {
+        self.recurrence.is_some() || self.recurring_id.is_some()
+    }
+
+    /// The id it's shown under: a series shows as its occurrences, so its
+    /// first one.
+    pub fn shown_id(&self) -> String {
+        match self.recurrence {
+            Some(_) => recurrence::occurrence_id(&self.id, recurrence::series_start(self)),
+            None => self.id.clone(),
+        }
     }
 
     pub fn occurs_on(&self, day: NaiveDate) -> bool {
@@ -236,6 +268,16 @@ impl Store {
 
     pub fn event_mut(&mut self, id: &str) -> Option<&mut Event> {
         self.events.iter_mut().find(|e| e.id == id)
+    }
+
+    /// An event as shown: a stored event, or an occurrence of a repeating one
+    /// (see [`recurrence::occurrence_id`]).
+    pub fn find_event(&self, id: &str) -> Option<Event> {
+        if let Some(ev) = self.event(id) {
+            return Some(ev.clone());
+        }
+        let (series, _) = recurrence::split_occurrence(id)?;
+        recurrence::occurrence(self.event(series)?, id)
     }
 
     /// The Google calendar id an event lives on, if any.
