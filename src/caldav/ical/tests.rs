@@ -131,6 +131,32 @@ fn a_new_location_drops_apples_map_pin() {
 }
 
 #[test]
+fn renaming_leaves_floating_and_unknown_zone_times_alone() {
+    for dtstart in ["DTSTART:20261201T090000", "DTSTART;TZID=Customized Time Zone:20261201T090000"] {
+        let c = ics(&format!("BEGIN:VEVENT\r\nUID:f\r\nSUMMARY:Standup\r\n{dtstart}\r\nDURATION:PT30M\r\nEND:VEVENT\r\n"));
+        let mut ev = events(&cal(), "/cal/home/f.ics", Some("\"e1\""), &c, year().0, year().1).remove(0);
+        ev.base = Some(ev.fields());
+        ev.title = "Standup (moved room)".into();
+        let out = write(&put(Some(c), &ev, "f", None).unwrap());
+        assert!(out.contains(&format!("{dtstart}\r\n")), "{dtstart} kept as it was:\n{out}");
+        assert!(out.contains("DURATION:PT30M") && !out.contains("DTEND"), "{out}");
+        assert!(out.contains("SUMMARY:Standup (moved room)"));
+    }
+}
+
+#[test]
+fn moving_a_floating_event_keeps_it_floating() {
+    let c = ics("BEGIN:VEVENT\r\nUID:f\r\nSUMMARY:Standup\r\nDTSTART:20261201T090000\r\nDTEND:20261201T093000\r\nEND:VEVENT\r\n");
+    let mut ev = events(&cal(), "/cal/home/f.ics", None, &c, year().0, year().1).remove(0);
+    ev.base = Some(ev.fields());
+    ev.start += Duration::hours(1);
+    ev.end += Duration::hours(1);
+    let out = write(&put(Some(c), &ev, "f", None).unwrap());
+    assert!(out.contains("DTSTART:20261201T100000\r\n"), "{out}");
+    assert!(out.contains("DTEND:20261201T103000\r\n"), "{out}");
+}
+
+#[test]
 fn a_character_split_by_another_clients_fold_is_joined_back() {
     // "café" folded between the two bytes of "é" (C3 A9).
     let data = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:a\r\nSUMMARY:x\r\n\
