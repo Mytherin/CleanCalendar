@@ -678,6 +678,38 @@ fn repeating_events_sync_occurrence_by_occurrence() {
 }
 
 #[test]
+fn editing_a_new_series_before_its_occurrences_come_back_keeps_the_edit() {
+    let server = FakeDav::start();
+    let (mut laptop, _) = devices(&server);
+    let home = laptop.cal(&server.cal_url("home"));
+    let id = format!("local:{}", uuid::Uuid::new_v4().simple());
+    let mut ev = crate::model::tests::event(&id, &home, "Piano");
+    ev.start = at(17, 18);
+    ev.end = at(17, 19);
+    let mut rule = Recurrence::new(Freq::Weekly);
+    rule.end = RepeatEnd::Count(4);
+    ev.recurrence = Some(rule);
+    laptop.store.events.push(ev);
+    laptop.engine.event_changed(&mut laptop.store, &id);
+
+    // The create is confirmed, but the sync that would bring back its
+    // occurrences hasn't run yet when the user renames it.
+    let save = laptop.engine.outbox.remove(0);
+    let msg = run(&mut laptop.conns, save);
+    laptop.engine.handle(&mut laptop.store, msg, None, laptop.today);
+    let later: Vec<Cmd> = laptop.engine.outbox.drain(..).collect();
+    let series_id = laptop.one("Piano").id.clone();
+    laptop.edit(&series_id, |e| e.title = "Piano lesson".into());
+    laptop.pump();
+    laptop.engine.outbox.extend(later);
+    laptop.pump();
+
+    assert!(server.files("home")[0].1.contains("SUMMARY:Piano lesson"), "{:?}", server.files("home"));
+    assert_eq!(laptop.titled("Piano lesson").len(), 4, "{:?}", laptop.said);
+    assert!(laptop.said.iter().all(|s| !s.contains("different repeating event")), "{:?}", laptop.said);
+}
+
+#[test]
 fn a_series_made_here_comes_back_as_occurrences() {
     let server = FakeDav::start();
     let (mut laptop, mut phone) = devices(&server);

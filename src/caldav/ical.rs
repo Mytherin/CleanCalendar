@@ -703,6 +703,11 @@ pub fn events(cal: &CalRef, href: &str, etag: Option<&str>, ics: &Component, fro
     out
 }
 
+/// Whether the resource's main VEVENT repeats.
+pub fn is_series(ics: &Component) -> bool {
+    master(ics).is_some_and(repeats)
+}
+
 /// The event with this remote id in a resource (`None`: not there, e.g. a
 /// deleted occurrence).
 pub fn find(cal: &CalRef, rid: &str, etag: Option<&str>, ics: &Component) -> Option<Event> {
