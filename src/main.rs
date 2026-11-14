@@ -9,6 +9,7 @@ mod db;
 mod google;
 mod interact;
 mod layout;
+mod menu;
 mod model;
 mod recurrence;
 mod sync;
