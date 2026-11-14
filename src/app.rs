@@ -418,6 +418,15 @@ impl App {
             ev.recurring_id = old.recurring_id.clone();
             ev.etag = old.etag.clone();
             ev.base = old_base;
+            // An event with guests stays where it is (the editor's calendar
+            // picker can still ask; see `Event::can_change_calendar`).
+            if old.calendar_id != ev.calendar_id && !old.can_change_calendar() {
+                ev.calendar_id = old.calendar_id.clone();
+                self.status = Some((
+                    format!("“{}” has invitees, so it stays on its calendar (moving it would re-invite everyone)", ev.title),
+                    true,
+                ));
+            }
             // Moving to another calendar means delete + recreate remotely.
             if old.calendar_id != ev.calendar_id {
                 self.engine.event_deleted(&mut self.store, &old, false);
@@ -585,7 +594,7 @@ impl App {
         let writable = !self.is_read_only(&ev);
         let mut items = vec![
             Item::new(Icon::Info, "Get Info", true, Command::GetInfo),
-            Item::Calendars { enabled: writable, current: ev.calendar_id.clone() },
+            Item::Calendars { enabled: writable && ev.can_change_calendar(), current: ev.calendar_id.clone() },
             Item::Separator,
             Item::new(Icon::Trash, "Delete", writable, Command::Delete),
             Item::new(Icon::Scissors, "Cut", writable, Command::Cut),
@@ -688,7 +697,11 @@ impl App {
             _ => id.to_owned(),
         };
         let Some(mut ev) = self.store.event(&target).cloned() else { return };
-        if ev.calendar_id == calendar_id || self.is_read_only(&ev) || !self.is_writable(calendar_id) {
+        if ev.calendar_id == calendar_id
+            || self.is_read_only(&ev)
+            || !self.is_writable(calendar_id)
+            || !ev.can_change_calendar()
+        {
             return;
         }
         ev.calendar_id = calendar_id.to_owned();

@@ -681,6 +681,10 @@ fn calendar_chip(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
     if read_only {
         return;
     }
+    if !ed.original.can_change_calendar() {
+        resp.on_hover_text("Events with invitees stay on their calendar: moving one would invite everyone again");
+        return;
+    }
     let popup_id = ui.id().with("calendar-picker");
     if resp.clicked() {
         ui.memory_mut(|m| m.toggle_popup(popup_id));
