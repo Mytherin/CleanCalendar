@@ -26,6 +26,10 @@ pub const FULL_SYNC_DAYS: i64 = 7;
 /// ended.
 pub const MONTHS_AHEAD: i32 = 13;
 
+/// Conflicts in a row after which an event's upload waits for the next sync
+/// instead of being re-sent at once.
+const MAX_CONFLICT_RETRIES: u32 = 3;
+
 /// Where "all past events" starts.
 pub fn earliest() -> NaiveDate {
     NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
@@ -63,6 +67,9 @@ pub struct SyncEngine {
     /// Uploads handed out and not answered yet ("save:<event id>",
     /// "del:<remote id>"), so retries don't queue duplicates.
     in_flight: HashSet<String>,
+    /// Conflicts in a row per event since its last successful upload or the
+    /// last sync (see `resolve_save_conflict`).
+    conflicts: HashMap<String, u32>,
     /// What each upload in flight sent, by local event id: once the service
     /// confirms it, that's the version the service has (the merge base).
     sent: HashMap<String, EventFields>,
@@ -153,6 +160,8 @@ impl SyncEngine {
         let ids: Vec<String> =
             store.events.iter().filter(|e| e.pending && on_account(store.remote_of(e))).map(|e| e.id.clone()).collect();
         for id in ids {
+            // A new sync is a fresh start for uploads that kept conflicting.
+            self.conflicts.remove(&id);
             self.push(store, &id);
         }
         for d in store.pending_deletes.clone() {
@@ -432,6 +441,7 @@ impl SyncEngine {
         today: NaiveDate,
     ) {
         self.in_flight.remove(&format!("save:{local_id}"));
+        self.conflicts.remove(&local_id);
         let sent = self.sent.remove(&local_id);
         let still_there = store.event(&local_id).is_some_and(|ev| store.remote_of(ev).as_ref() == Some(&calendar));
         if !still_there {
@@ -562,7 +572,15 @@ impl SyncEngine {
                 self.status(text, !clashes.is_empty());
             }
         }
-        self.push(store, local_id);
+        // Re-send right away, but not endlessly: a service that keeps
+        // refusing the version it just handed us (e.g. a weak ETag it then
+        // compares strongly) would otherwise loop without pause. Past the
+        // limit the change waits, still pending, for the next sync.
+        let n = self.conflicts.entry(local_id.to_owned()).or_insert(0);
+        *n += 1;
+        if *n <= MAX_CONFLICT_RETRIES {
+            self.push(store, local_id);
+        }
     }
 }
 
@@ -1101,6 +1119,28 @@ mod tests {
         engine.event_changed(&mut store, &id);
         sent(&mut engine);
         (store, engine, id)
+    }
+
+    #[test]
+    fn a_service_that_keeps_refusing_does_not_loop_forever() {
+        // Every upload is refused with the same "newer" copy (e.g. a weak
+        // ETag compared strongly). Re-sending at once must stop.
+        let (mut store, mut engine, id) = edited_locally(|e| e.title = "Standup (ours)".into());
+        let mut uploads = 0;
+        for _ in 0..10 {
+            engine.handle(&mut store, conflict(Some(theirs(|e| e.notes = "agenda".into()))), None, today());
+            let n = sent(&mut engine).iter().filter(|s| matches!(s, Sent::Save { .. })).count();
+            if n == 0 {
+                break;
+            }
+            uploads += n;
+        }
+        assert_eq!(uploads as u32, MAX_CONFLICT_RETRIES);
+        assert!(store.event(&id).unwrap().pending, "kept for the next sync");
+
+        // The next sync tries again.
+        engine.sync(&store, today());
+        assert!(sent(&mut engine).iter().any(|s| matches!(s, Sent::Save { .. })));
     }
 
     #[test]
