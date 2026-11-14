@@ -1,6 +1,6 @@
 # CleanCalendar
 
-A desktop calendar written in Rust that looks and behaves like Apple Calendar, with two-way Google Calendar sync.
+A desktop calendar written in Rust that looks and behaves like Apple Calendar, with two-way sync for iCloud (and any other CalDAV server) and Google Calendar.
 Built on [egui/eframe](https://github.com/emilk/egui).
 
 ## Features
@@ -13,6 +13,8 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar and notes.
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
 - **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
+- **iCloud and CalDAV:** sign in with your Apple ID and an app-specific password (or any CalDAV server: Fastmail, Nextcloud, Radicale, …). All your calendars are imported, Reminders lists are skipped, and creates, edits, moves and deletes go back to the server. Repeating events from other apps show every occurrence, whatever their rule.
+- **Several accounts at once:** iCloud, other CalDAV servers and Google side by side, each in its own group in the sidebar.
 - **Google Calendar:** OAuth sign-in in your browser (loopback + PKCE), imports all your calendars, and sends creates, edits, moves and deletes back to Google. Read-only calendars (holidays, shared calendars) are shown but can't be edited.
 - Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows).
 
@@ -39,6 +41,13 @@ The MSVC toolchain works too if you have the Visual Studio C++ Build Tools.
 | Double-click | Open an event, or create one on empty space |
 | Esc / Enter (in title) | Cancel / save in the editor |
 
+## Connecting iCloud
+
+1. At [account.apple.com](https://account.apple.com/account/manage) go to **Sign-In and Security → App-Specific Passwords** and create one (e.g. "CleanCalendar"). Apple doesn't let other apps use your normal Apple ID password.
+2. In CleanCalendar click **Add Account** (or **Accounts**), choose **iCloud**, enter your Apple ID and the app-specific password, and click **Sign In**.
+
+For another CalDAV server choose **Other CalDAV server** and enter its address (e.g. `https://caldav.fastmail.com/`); the calendars are found from there (`/.well-known/caldav`, the user's principal, then the calendar home). The password is kept in the OS credential store.
+
 ## Connecting Google Calendar
 
 Google requires every app to have its own OAuth client:
@@ -46,32 +55,37 @@ Google requires every app to have its own OAuth client:
 1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and **enable the Google Calendar API**.
 2. Configure the **OAuth consent screen** (External is fine) and add your Google account as a **test user**.
 3. Go to **Credentials → Create credentials → OAuth client ID**, application type **Desktop app**.
-4. In CleanCalendar click **Connect Google**, paste the client ID and secret, and click **Sign in with Google**.
+4. In CleanCalendar open **Accounts → Connect Google Calendar**, paste the client ID and secret, and click **Sign in with Google**.
+
+Google keeps using Google's own REST API rather than its CalDAV endpoint: it's richer (colours, sync tokens, structured JSON) and needs the same OAuth sign-in anyway.
 
 ### How sync works
 
-- **Your changes** (create, edit, move, resize, delete, change calendar) are uploaded right away and marked *pending* until Google confirms them.
-  If Google can't be reached, they stay pending and are retried every minute. The toolbar shows "N changes not yet on Google".
+Every account, whatever the service, goes through the same sync engine (`src/sync.rs`) and worker (`src/remote.rs`); a service only lists calendars and events, and saves, fetches and deletes one event (`Remote` in `src/remote.rs`). So everything below holds for iCloud, other CalDAV servers and Google alike.
+
+- **Your changes** (create, edit, move, resize, delete, change calendar) are uploaded right away and marked *pending* until the server confirms them.
+  If the server can't be reached, they stay pending and are retried every minute. The toolbar shows "N changes not yet synced".
   Pending changes survive restarts, and a sync never overwrites an event that has unsent edits.
 - **Changes from elsewhere** (phone, web, other people) are pulled on launch, every 5 minutes, and when you press ⟳.
-  After the first full download, each calendar syncs incrementally using Google's sync tokens, so only changed events are fetched.
-  A full re-download runs weekly, when Google expires a token, or after Google rejects a change.
+  After the first full download, each calendar syncs incrementally (Google's sync tokens; CalDAV's `sync-collection` report, RFC 6578), so only changed events are fetched.
+  A full re-download runs weekly, when the server expires a token, or after it rejects a change.
   The full download covers 6 months back to 12 months ahead.
-- **Conflicts:** every upload says which version of the event it was based on (Google's `etag`), so an edit can never silently overwrite a newer change made elsewhere. Instead:
+- **Conflicts:** every upload says which version of the event it was based on (its `etag`, sent as `If-Match`), so an edit can never silently overwrite a newer change made elsewhere. Instead:
   - **Both sides edited the event:** the edits are merged field by field (title, location, notes, time). If both changed the same field, your edit wins and the app tells you.
   - **An edit always beats a delete.** If you edit an event that was deleted elsewhere, your version is recreated. If you delete an event that was edited elsewhere, it isn't deleted and comes back with their change.
-  - **A retried create can't duplicate an event:** new events get their Google id up front, so a retry after a lost reply finds the event already there.
-  - If Google rejects an edit (for example, no permission), the app goes back to Google's version.
-  - Repeating events made here are uploaded as a series (`RRULE`) with their time zone; Google then sends them back as separate occurrences, which replace the local copy.
-  - Google’s repeating events are edited one occurrence at a time; “Delete All Events” deletes the whole series.
+  - **A retried create can't duplicate an event:** new events get their id up front (Google's event id; CalDAV's resource name and `If-None-Match: *`), so a retry after a lost reply finds the event already there.
+  - If the server rejects an edit (for example, a read-only calendar), the app goes back to the server's version.
+  - Repeating events made here are uploaded as a series (`RRULE`) with their time zone; they then come back as separate occurrences, which replace the local copy.
+  - Repeating events from a server are edited one occurrence at a time; “Delete All Events” deletes the whole series.
+- **CalDAV specifics:** a CalDAV event is a whole `.ics` file. Saving reads the server's copy first and only replaces what the app owns (title, location, notes, times, repeat rule), so alarms, attendees and other apps' properties are kept. Editing one occurrence of a series writes a `RECURRENCE-ID` override; deleting one adds an `EXDATE`. Series are expanded into occurrences here (with the [`rrule`](https://crates.io/crates/rrule) crate), so any RFC 5545 rule shows correctly. Pinned time zones are written as `TZID`s with a `VTIMEZONE` generated from the zone database.
 
 ## Data
 
 Data is kept in two SQLite databases, split by who owns it:
 
-- **`data.db`: things only this computer has.** Google sign-in settings (client id, account), the calendar list (with your colours and which are shown), events on local calendars, and changes to Google events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\` on Windows (`~/Library/Application Support/CleanCalendar/` on macOS, `~/.local/share/cleancalendar/` on Linux).
-- **`cache.db`: a copy of Google.** Google events as last downloaded, plus the sync tokens. Lives in `%LOCALAPPDATA%\CleanCalendar\` on Windows (`~/Library/Caches/CleanCalendar/` on macOS, `~/.cache/cleancalendar/` on Linux), so it isn't carried around in a roaming profile. It is safe to delete: the next sync downloads everything again. If it can't be read, it is started over automatically.
-- **The Google refresh token** is kept in the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux) under `CleanCalendar` / `google-refresh-token`, not in either file. If no credential store is available it falls back to `data.db` (with a warning), and moves into the credential store once one works.
+- **`data.db`: things only this computer has.** Account settings (Google client id and account, CalDAV servers and user names), the calendar list (with your colours and which are shown), events on local calendars, and changes to synced events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\` on Windows (`~/Library/Application Support/CleanCalendar/` on macOS, `~/.local/share/cleancalendar/` on Linux).
+- **`cache.db`: a copy of the servers.** Synced events as last downloaded, plus the sync tokens. Lives in `%LOCALAPPDATA%\CleanCalendar\` on Windows (`~/Library/Caches/CleanCalendar/` on macOS, `~/.cache/cleancalendar/` on Linux), so it isn't carried around in a roaming profile. It is safe to delete: the next sync downloads everything again. If it can't be read, it is started over automatically.
+- **Secrets** (the Google refresh token, CalDAV passwords) are kept in the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux) under `CleanCalendar` / `google-refresh-token` and `CleanCalendar` / `caldav-<id>-password`, not in either file. If no credential store is available they fall back to `data.db` (with a warning), and move into the credential store once one works. Disconnecting an account deletes its secret.
 
 The cache is attached to the same connection, so each save commits to both files at once. Only rows that changed are written. A `store.json` from an older version is imported on first start and renamed to `store.json.migrated`. Files in the folders older versions used (`%APPDATA%\CleanCalendar\CleanCalendar\data\`, `~/Library/Application Support/com.CleanCalendar.CleanCalendar/`) are moved over on first start.
 
@@ -82,12 +96,16 @@ Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (t
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Window setup |
-| `src/app.rs` | App state, toolbar, sidebar, event editor, Google dialog, sync merge |
+| `src/app.rs` | App state, toolbar, sidebar, event editor, Accounts window, sync glue |
 | `src/views.rs` | Painting: month grid, day/week time grid, year view, mini-month |
 | `src/layout.rs` | Pure geometry: where events and cells go, and what each screen area means to the pointer |
 | `src/interact.rs` | Pointer interaction (clicks, double-clicks, drags) as a testable state machine |
-| `src/sync.rs` | Sync bookkeeping (no UI, no I/O): what to upload, retries, merging Google's changes |
-| `src/google.rs` | OAuth flow, Calendar v3 REST client, background worker thread |
+| `src/sync.rs` | Sync bookkeeping (no UI, no I/O), shared by all services: what to upload, retries, merging changes |
+| `src/remote.rs` | What all services share: the `Remote` trait, commands and replies, the background worker, conflict and token-expiry handling |
+| `src/google.rs` | Google: OAuth flow and the Calendar v3 REST client |
+| `src/caldav.rs` | CalDAV (iCloud and others): discovery and the WebDAV client |
+| `src/caldav/ical.rs` | iCalendar: parsing and writing, series expansion, overrides, `VTIMEZONE` |
+| `src/caldav/xml.rs` | WebDAV XML: multistatus responses and request bodies |
 | `src/model.rs` | `Calendar`, `Event`, and the in-memory `Store` |
 | `src/recurrence.rs` | Repeat rules, expanding a series into occurrences, time zone conversion, `RRULE` |
 | `src/db.rs` | SQLite storage: persistent `data.db` and disposable `cache.db` |
@@ -96,7 +114,7 @@ Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (t
 
 ## Tests
 
-There are three levels of tests.
+There are four levels of tests.
 
 **1. Offline: `cargo test`.** Runs everything that needs no network:
 - **`src/sync.rs`** replays sync scenarios step by step against the `SyncEngine`:
@@ -107,8 +125,11 @@ There are three levels of tests.
   - access-token caching, paging, and full vs. incremental (sync-token) requests, including the fallback to a full sync on `410 Gone`;
   - `If-Match` and `412` conflicts, and duplicate-proof creates;
   - percent-encoded calendar ids, request bodies, and how errors are classified.
+- **`src/caldav/tests.rs`** runs the CalDAV client and the sync engine against an in-memory CalDAV server (`src/caldav/fake.rs`) shaped like iCloud: discovery on one host with the calendar home on another, Basic auth, a Reminders list and a read-only calendar to skip or respect, expiring sync tokens, `If-Match`/`If-None-Match` preconditions, and replies without an `ETag`. Two "devices" (laptop and phone, each with its own store and engine) share the account, covering merges, edit vs. delete, offline changes, moving between calendars, overrides and `EXDATE`s on series, and properties the app doesn't show surviving an edit.
+- **`src/caldav/ical/tests.rs`** covers iCalendar parsing and folding, series expansion (including rules like "the second Tuesday"), daylight saving, overrides, and generated `VTIMEZONE`s.
+- **`src/remote.rs`** tests the shared worker logic against a scripted service; `src/sync.rs` has tests with Google and CalDAV accounts side by side.
 - **`src/interact.rs` and `src/layout.rs`** drive the pointer state machine against real layouts.
-- Unit tests for dates and for parsing Google's JSON.
+- Unit tests for dates, WebDAV XML, and parsing Google's JSON.
 
 **2. Against a Google emulator.** These are `#[ignore]`d by default. They run the real sign-in flow (with a script standing in for the browser), the HTTP client and the sync engine against [`emulate`](https://www.npmjs.com/package/emulate):
 
@@ -131,10 +152,20 @@ export CLEANCALENDAR_LIVE_REFRESH_TOKEN=$(cat /path/outside/repo)
 cargo test live_tests -- --ignored --test-threads 1 --skip live_sign_in
 ```
 
+**4. Against a real CalDAV server.** `src/caldav/server_tests.rs` (also `#[ignore]`d) plays the laptop/phone scenarios against a real server, each in a temporary calendar it creates with `MKCALENDAR` and deletes afterwards. With [Radicale](https://radicale.org/) locally:
+
+```sh
+pip install radicale
+python -m radicale --storage-filesystem-folder=/tmp/radicale --auth-type=none --server-hosts=127.0.0.1:5232
+CLEANCALENDAR_CALDAV_URL=http://127.0.0.1:5232/ CLEANCALENDAR_CALDAV_USER=tester CLEANCALENDAR_CALDAV_PASSWORD=x \
+    cargo test caldav::server_tests -- --ignored --test-threads 1
+```
+
+Or against iCloud: `CLEANCALENDAR_CALDAV_URL=https://caldav.icloud.com/`, your Apple ID, and an app-specific password (never commit it).
+
 ## Ideas for next steps
 
-- Recurring events created locally (Google recurring events already show, expanded into instances)
 - Search, event alerts/notifications, and an inspector-style popover next to the event
-- Editing the rule of a series that came from Google, and “this and all future events”
-- Monthly rules like “the second Tuesday”
-- Keychain storage for tokens; additional providers (iCloud via CalDAV, Outlook)
+- Editing the rule of a series that came from a server, and “this and all future events”
+- Monthly rules like “the second Tuesday” in the editor (they already show when they come from a server)
+- Outlook / Microsoft 365
