@@ -584,9 +584,10 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
         painter.vline(g.col_x(i), grid.y_range(), Stroke::new(1.0_f32, p.grid));
     }
 
-    for t in &lay.timed {
+    for (i, t) in lay.timed.iter().enumerate() {
         let ev = &events[t.ev];
-        draw_timed(ui, &painter, t.rect, ev, event_color(app, ev), is_selected(app, ev), p);
+        let covered_from = layout::covered_from(&lay.timed, i);
+        draw_timed(ui, &painter, t.rect, ev, event_color(app, ev), is_selected(app, ev), p, covered_from);
     }
 
     // Ghost block while drag-creating.
@@ -601,7 +602,7 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
             let y0 = g.y_of((ps - ds).num_minutes());
             let y1 = g.y_of((pe - ds).num_minutes()).max(y0 + g.hour_h / 4.0);
             let r = Rect::from_min_max(Pos2::new(g.col_x(i) + 0.5, y0 + 0.5), Pos2::new(g.col_x(i + 1) - 0.5, y1 - 0.5));
-            draw_timed(ui, &painter, r, &ghost_event(s, e, false), theme::ACCENT, false, p);
+            draw_timed(ui, &painter, r, &ghost_event(s, e, false), theme::ACCENT, false, p, r.bottom());
         }
     }
 
@@ -626,7 +627,7 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
 /// bar on the left, the title in bold in the calendar's color (wrapping when
 /// there's room), then a clock icon with the time range, then the location.
 /// Short events show just their title.
-fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Color32, selected: bool, p: &Palette) {
+fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Color32, selected: bool, p: &Palette, text_bottom: f32) {
     const LINE: f32 = 14.0;
     painter.rect_filled(r, 4.0, p.event_fill(color, selected));
     let bar_color = if selected { Color32::WHITE.gamma_multiply(0.85) } else { color };
@@ -655,7 +656,10 @@ fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Colo
     let top = r.top() + 3.0;
     // The title may wrap (up to 3 lines) as long as the time line still fits;
     // the location only gets whatever room is left after that.
-    let lines_fit = (((r.height() - 6.0) / LINE).floor() as usize).max(1);
+    // Text stops above an event drawn on top of this one (see the caller):
+    // a line it would cut through is left out rather than half shown.
+    let bottom = r.bottom().min(text_bottom);
+    let lines_fit = (((bottom - r.top() - 6.0) / LINE).floor() as usize).max(1);
     let title_rows = lines_fit.saturating_sub(1).clamp(1, 3);
     let title = wrapped_galley(ui, &ev.title, title_font, text_color, title_w, title_rows);
     let title_h = title.size().y;
@@ -665,13 +669,13 @@ fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Colo
     }
 
     let mut y = top + title_h;
-    if y + LINE <= r.bottom() {
+    if y + LINE <= bottom {
         draw_clock(&p_clip, Pos2::new(x + 4.5, y + LINE / 2.0), text_color);
         let range = fmt_time_range(ev.start.time(), ev.end.time());
         draw_text(ui, &p_clip, Pos2::new(x + 12.0, y), &range, theme::font(11.5), text_color, title_w - 12.0);
         y += LINE;
     }
-    if !ev.location.is_empty() && y + LINE <= r.bottom() {
+    if !ev.location.is_empty() && y + LINE <= bottom {
         draw_text(ui, &p_clip, Pos2::new(x, y), &ev.location, theme::font(11.5), text_color, title_w);
     }
 }

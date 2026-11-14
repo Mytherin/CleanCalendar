@@ -320,6 +320,20 @@ pub fn week(
     WeekLayout { first, ndays, geom, rects, banners, timed, hits }
 }
 
+/// Where the event block `placed[i]` starts being hidden under a block drawn
+/// after it (on top), e.g. "Colour consultation" at 17:30 nested inside
+/// "Nvidia sync" 17:00–18:00; its own bottom if nothing covers it. Its text
+/// should stop above that.
+pub fn covered_from(placed: &[Placed], i: usize) -> f32 {
+    let r = placed[i].rect;
+    placed[i + 1..]
+        .iter()
+        .map(|o| o.rect)
+        .filter(|o| o.left() < r.right() && o.right() > r.left() && o.top() >= r.top() && o.top() < r.bottom())
+        .map(|o| o.top())
+        .fold(r.bottom(), f32::min)
+}
+
 #[derive(Debug)]
 pub struct Segment {
     pub ev: usize,
@@ -692,6 +706,19 @@ mod tests {
         assert_eq!(more.width(), lay.rows[0].rect.width());
         assert_eq!(more.top() - lay.rows[1].rect.top(), MONTH_ROW_H, "the row after the last event");
         assert_no_overlaps(&lay);
+    }
+
+    #[test]
+    fn text_stops_where_an_event_on_top_begins() {
+        let rect = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x1, y1));
+        let placed = [
+            Placed { ev: 0, rect: rect(0.0, 100.0, 200.0, 152.0) }, // 17:00–18:00
+            Placed { ev: 1, rect: rect(8.0, 126.0, 200.0, 152.0) }, // nested at 17:30
+            Placed { ev: 2, rect: rect(200.0, 100.0, 400.0, 152.0) }, // next column: no cover
+        ];
+        assert_eq!(covered_from(&placed, 0), 126.0);
+        assert_eq!(covered_from(&placed, 1), 152.0, "nothing on top of the nested one");
+        assert_eq!(covered_from(&placed, 2), 152.0, "touching at the edge isn't covering");
     }
 
     #[test]
