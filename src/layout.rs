@@ -38,7 +38,7 @@ pub const GRID_PAD: f32 = 6.0;
 pub const SCROLLBAR_W: f32 = 12.0;
 /// Height of the resize handle at the bottom of a timed event.
 const RESIZE_GRIP: f32 = 6.0;
-const MONTH_HEADER_H: f32 = 26.0;
+pub const MONTH_HEADER_H: f32 = 26.0;
 const MONTH_ROW_H: f32 = 18.0;
 /// Gap between a month cell's right edge and its day number (the weekday
 /// header above is right-aligned on the same line).
@@ -461,21 +461,77 @@ pub fn month_span(month: NaiveDate) -> (NaiveDate, i64) {
     (grid_start, (last - grid_start).num_days() / 7 + 1)
 }
 
-/// Lays out the month containing `month` in `rect`. `number_w` measures a day
-/// number label (painting decides the font).
+/// Where the month view is scrolled to. Like Apple Calendar, it scrolls
+/// smoothly through weeks rather than paging by months.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MonthScroll {
+    /// The first day of the week in the top row.
+    pub top: NaiveDate,
+    /// How much of the top row (0..1) has scrolled up out of view.
+    pub offset: f32,
+    /// How many rows fit the view (kept while scrolling, so rows don't
+    /// change height under the pointer).
+    pub rows: i64,
+}
+
+impl MonthScroll {
+    /// The month containing `month`, its first week at the top.
+    pub fn at_rest(month: NaiveDate) -> Self {
+        let (top, rows) = month_span(month);
+        MonthScroll { top, offset: 0.0, rows }
+    }
+
+    /// Scrolls by `rows` (positive is later).
+    pub fn scroll(&mut self, rows: f32) {
+        self.offset += rows;
+        let whole = self.offset.floor();
+        self.top += Duration::days(7 * whole as i64);
+        self.offset -= whole;
+    }
+
+    /// The month shown (the one in the middle row), first day.
+    pub fn month(&self) -> NaiveDate {
+        let mid = (self.offset + self.rows as f32 / 2.0).floor() as i64;
+        first_of_month(self.top + Duration::days(7 * mid + 3))
+    }
+
+    /// The first day drawn, and how many weeks are (partly) visible.
+    pub fn span(&self) -> (NaiveDate, i64) {
+        (self.top, self.rows + (self.offset > 0.0) as i64)
+    }
+
+    /// Moves `t` (0..1) of the way to the nearest week boundary; returns
+    /// whether it still has some way to go.
+    pub fn settle(&mut self, t: f32) -> bool {
+        let target = self.offset.round();
+        if (target - self.offset).abs() < 0.002 {
+            self.top += Duration::days(7 * target as i64);
+            self.offset = 0.0;
+            return false;
+        }
+        self.scroll((target - self.offset) * t);
+        true
+    }
+}
+
+/// Lays out the month view scrolled to `pos` in `rect`. `number_w` measures
+/// a day number label (painting decides the font).
 pub fn month(
     events: &[Event],
-    month: NaiveDate,
+    pos: MonthScroll,
     rect: Rect,
     number_w: &dyn Fn(NaiveDate) -> f32,
     editable: &dyn Fn(&Event) -> bool,
 ) -> MonthLayout {
     // Events move by whole days in the month grid, keeping their times.
     let grip = |ev: &Event| if editable(ev) { Grip::MoveDays } else { Grip::None };
-    let (grid_start, weeks) = month_span(month);
+    let (grid_start, weeks) = pos.span();
+    let month = pos.month();
     let header_h = MONTH_HEADER_H;
+    // Rows scroll under the weekday header.
+    let grid = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + header_h), rect.max);
     let cell_w = rect.width() / 7.0;
-    let cell_h = (rect.height() - header_h) / weeks as f32;
+    let cell_h = grid.height() / pos.rows as f32;
     let row_h = MONTH_ROW_H;
     let max_rows = (((cell_h - 30.0) / row_h).floor() as usize).max(1);
     let mut out = MonthLayout {
@@ -490,7 +546,7 @@ pub fn month(
 
     for w in 0..weeks {
         let week_start = grid_start + Duration::days(w * 7);
-        let top = rect.top() + header_h + w as f32 * cell_h;
+        let top = grid.top() + (w as f32 - pos.offset) * cell_h;
 
         for d in 0..7 {
             let day = week_start + Duration::days(d);
@@ -500,8 +556,8 @@ pub fn month(
                 Pos2::new(cell.right() - MONTH_NUMBER_INSET - nw / 2.0, cell.top() + 14.0),
                 Vec2::new(nw + 12.0, 22.0),
             );
-            out.hits.push(cell, rect, Target::MonthCell(day));
-            out.hits.push(number, rect, Target::MonthDayNumber(day));
+            out.hits.push(cell, grid, Target::MonthCell(day));
+            out.hits.push(number, grid, Target::MonthDayNumber(day));
             out.cells.push(MonthCell { day, rect: cell, number, in_month: day.month() == month.month() });
         }
 
@@ -534,7 +590,7 @@ pub fn month(
                 Pos2::new(rect.left() + (c1 + 1) as f32 * cell_w - 3.0, top + 28.0 + lane as f32 * row_h + row_h - 2.0),
             );
             out.banners.push(Placed { ev: i, rect: r });
-            out.hits.push(r, rect, event_target(&events[i], grip(&events[i])));
+            out.hits.push(r, grid, event_target(&events[i], grip(&events[i])));
         }
 
         // Timed events in each day cell.
@@ -552,7 +608,7 @@ pub fn month(
                 }
                 let r = Rect::from_min_size(Pos2::new(left + 3.0, top + 28.0 + row as f32 * row_h), Vec2::new(cell_w - 6.0, row_h - 2.0));
                 out.rows.push(Placed { ev: i, rect: r });
-                out.hits.push(r, rect, event_target(&events[i], grip(&events[i])));
+                out.hits.push(r, grid, event_target(&events[i], grip(&events[i])));
                 row += 1;
             }
             if more > 0 {
@@ -560,7 +616,7 @@ pub fn month(
                 let pos = Pos2::new(left + 3.0, top + 28.0 + row.min(max_rows - 1) as f32 * row_h);
                 let r = Rect::from_min_size(pos, Vec2::new(cell_w - 6.0, row_h - 2.0));
                 out.more.push((day, more, r));
-                out.hits.push(r, rect, Target::More(day));
+                out.hits.push(r, grid, Target::More(day));
             }
         }
     }
@@ -631,7 +687,7 @@ mod tests {
     /// November 2026 (six week rows) in a rect whose cells fit 3 rows.
     fn month_3_rows(events: &[Event]) -> MonthLayout {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, MONTH_HEADER_H + 6.0 * 90.0));
-        let lay = month(events, day(), rect, &|_| 14.0, &|_| true);
+        let lay = month(events, MonthScroll::at_rest(day()), rect, &|_| 14.0, &|_| true);
         let cell_h = 90.0;
         assert_eq!(((cell_h - 30.0) / MONTH_ROW_H).floor() as usize, 3);
         lay
@@ -730,5 +786,65 @@ mod tests {
         let segs = layout_day(&all, &[0, 1, 2], day(), 200.0, HOUR_H);
         let x: Vec<f32> = segs.iter().map(|s| s.x).collect();
         assert_eq!(x, [0.0, NEST_INDENT, 2.0 * NEST_INDENT]);
+    }
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn month_scroll_moves_through_weeks() {
+        let mut pos = MonthScroll::at_rest(date(2026, 11, 10));
+        let top = pos.top;
+        assert_eq!(pos.month(), date(2026, 11, 1));
+        pos.scroll(0.25);
+        assert_eq!((pos.top, pos.offset), (top, 0.25));
+        assert_eq!(pos.span(), (top, pos.rows + 1), "a part-visible row at the bottom");
+        pos.scroll(1.0);
+        assert_eq!((pos.top, pos.offset), (top + Duration::days(7), 0.25));
+        pos.scroll(-2.5);
+        assert_eq!((pos.top, pos.offset), (top - Duration::days(14), 0.75));
+    }
+
+    #[test]
+    fn month_scroll_shows_the_month_in_the_middle_row() {
+        let mut pos = MonthScroll::at_rest(date(2026, 11, 10));
+        for _ in 0..3 {
+            pos.scroll(1.0);
+        }
+        assert_eq!(pos.month(), date(2026, 12, 1), "three weeks on, December fills the middle");
+        for _ in 0..6 {
+            pos.scroll(-1.0);
+        }
+        assert_eq!(pos.month(), date(2026, 10, 1));
+    }
+
+    #[test]
+    fn month_scroll_settles_on_the_nearest_week() {
+        let mut pos = MonthScroll::at_rest(date(2026, 11, 10));
+        let top = pos.top;
+        pos.scroll(0.6);
+        while pos.settle(0.3) {}
+        assert_eq!((pos.top, pos.offset), (top + Duration::days(7), 0.0));
+        pos.scroll(-0.3);
+        while pos.settle(0.3) {}
+        assert_eq!((pos.top, pos.offset), (top + Duration::days(7), 0.0));
+    }
+
+    #[test]
+    fn scrolled_month_rows_shift_and_clip_under_the_header() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, MONTH_HEADER_H + 6.0 * 90.0));
+        let mut pos = MonthScroll::at_rest(day());
+        pos.scroll(0.5);
+        let lay = month(&[], pos, rect, &|_| 14.0, &|_| true);
+        let first = &lay.cells[0];
+        assert_eq!(first.day, pos.top);
+        assert_eq!(first.rect.top(), MONTH_HEADER_H - 45.0, "half the top row is out of view");
+        assert_eq!(lay.cells.len() as i64, 7 * (pos.rows + 1));
+        // The hidden half of the top row isn't clickable through the header.
+        let under_header = Pos2::new(first.rect.center().x, MONTH_HEADER_H - 10.0);
+        assert!(lay.hits.hit(under_header).is_none());
+        let below = Pos2::new(first.rect.center().x, MONTH_HEADER_H + 10.0);
+        assert_eq!(lay.hits.hit(below), Some(&Target::MonthCell(first.day)));
     }
 }

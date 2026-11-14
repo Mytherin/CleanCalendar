@@ -17,7 +17,7 @@ use crate::recurrence;
 use crate::settings::WeekScroll;
 use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, RED};
-use crate::interact::{Pointer, WheelPager};
+use crate::interact::Pointer;
 use crate::views;
 
 mod search_ui;
@@ -62,8 +62,6 @@ pub enum Action {
     Committed(String),
     /// Open the right-click menu for what's at `pos`.
     ContextMenu { at: MenuAt, pos: egui::Pos2 },
-    /// Page the view forward (or back, if negative), like the ‹ › buttons.
-    Step(i32),
 }
 
 pub struct App {
@@ -73,8 +71,6 @@ pub struct App {
     pub today: NaiveDate,
     pub selected: Option<String>,
     pub pointer: Pointer,
-    /// Pages the month view on mouse-wheel and trackpad scrolling.
-    pub wheel: WheelPager,
     /// Scroll the day/week grid to this hour on the next frame.
     pub scroll_to: Option<f32>,
     /// The week view's first day while scrolling by days (see
@@ -83,6 +79,9 @@ pub struct App {
     /// While stepping by months or years: the day of the month to go back
     /// to, so 31 Jan → Feb → Mar lands on 31 Mar, not 28 Mar.
     month_anchor: Option<u32>,
+    /// Where the month view has been scrolled to; `None` shows `date`'s
+    /// month at rest. Navigating (‹ ›, Today, a date) clears it.
+    pub month_scroll: Option<views::MonthState>,
     pub actions: Vec<Action>,
     /// The event being edited (in a popover, or the day view's inspector).
     pub editor: Option<Editor>,
@@ -142,9 +141,9 @@ impl App {
             today,
             selected: None,
             pointer: Pointer::default(),
-            wheel: WheelPager::default(),
             week_first: None,
             month_anchor: None,
+            month_scroll: None,
             actions: Vec::new(),
             editor: None,
             event_rects: HashMap::new(),
@@ -820,7 +819,6 @@ impl App {
                     self.menu_items = self.menu_items_for(&at);
                     self.menu = (!self.menu_items.is_empty()).then(|| ContextMenu::new(at, pos));
                 }
-                Action::Step(n) => self.step(n),
             }
         }
     }
@@ -833,6 +831,7 @@ impl App {
         }
         self.date = date;
         self.month_anchor = None;
+        self.month_scroll = None;
         if view != self.view {
             self.finish_editor(Outcome::Done);
             // Still open (it can't be saved as is): the inspector only
@@ -845,6 +844,14 @@ impl App {
         }
         self.view = view;
         self.mini_month = first_of_month(date);
+    }
+
+    /// Scrolling the month view brought `month` into the middle: show it
+    /// (title, sidebar) as if stepped to, without moving the view.
+    pub fn month_scrolled_to(&mut self, month: NaiveDate) {
+        let anchor = *self.month_anchor.get_or_insert(self.date.day());
+        self.date = step_months(month, 0, anchor);
+        self.mini_month = first_of_month(month);
     }
 
     /// Days the week view shows (the "Days per week" setting).
@@ -891,6 +898,7 @@ impl App {
                 step_months(self.date, months, anchor)
             }
         };
+        self.month_scroll = None;
         if !matches!(self.view, View::Month | View::Year) {
             self.month_anchor = None;
         }

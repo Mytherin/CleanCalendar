@@ -16,7 +16,7 @@ use eframe::egui::{
 
 use crate::app::{Action, App, View};
 use crate::dates::*;
-use crate::interact::{Cursor, Input, Wheel};
+use crate::interact::{Cursor, Input};
 use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GRID_PAD, GUTTER};
 use crate::model::Event;
 use crate::recurrence;
@@ -342,41 +342,6 @@ fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
     app.actions.extend(actions);
 }
 
-/// Scrolling over `rect` (mouse wheel or trackpad) pages the view by whole
-/// steps, as the macOS month view does.
-fn page_on_wheel(app: &mut App, ui: &Ui, rect: Rect) {
-    let ctx = ui.ctx();
-    let layer = ui.layer_id();
-    let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|pos| {
-        rect.contains(pos) && ctx.layer_id_at(pos).map_or(true, |l| l == layer)
-    });
-    // Not mid-drag, and not while a menu is open.
-    if !over || app.pointer.is_active() || app.menu.is_some() {
-        return;
-    }
-    let (events, time) = ctx.input(|i| (i.events.clone(), i.time));
-    let mut pages = 0;
-    for event in events {
-        let egui::Event::MouseWheel { unit, delta, modifiers } = event else { continue };
-        // Ctrl+wheel zooms.
-        if modifiers.ctrl || modifiers.command {
-            continue;
-        }
-        // Shift+wheel arrives as horizontal; either axis pages.
-        let d = if delta.y != 0.0 { delta.y } else { delta.x };
-        let wheel = match unit {
-            egui::MouseWheelUnit::Line => Wheel::Lines(d),
-            egui::MouseWheelUnit::Point => Wheel::Points(d),
-            egui::MouseWheelUnit::Page => Wheel::Pages(d),
-        };
-        pages += app.wheel.scroll(wheel, time);
-    }
-    if pages != 0 {
-        app.actions.push(Action::Step(pages));
-        ctx.request_repaint();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Month
 
@@ -388,25 +353,82 @@ fn month_label(day: NaiveDate) -> String {
     }
 }
 
+/// The month view's scroll position (see [`App::month_scroll`]).
+#[derive(Clone, Copy, Debug)]
+pub struct MonthState {
+    pos: layout::MonthScroll,
+    /// The date it was shown for: when that changes some other way (the
+    /// sidebar's mini-month), the view starts over at rest.
+    for_date: NaiveDate,
+    /// When the last scroll arrived (seconds).
+    last_input: f64,
+}
+
+/// Seconds after the last scroll before the month view settles on a week.
+const SETTLE_AFTER_S: f64 = 0.12;
+/// How quickly it settles (per second).
+const SETTLE_RATE: f32 = 14.0;
+
+/// Scrolling over the month view moves it smoothly through weeks, like
+/// Apple Calendar; once scrolling stops it settles on the nearest week.
+/// Returns where to draw it this frame.
+fn month_scroll(app: &mut App, ui: &Ui, rect: Rect) -> layout::MonthScroll {
+    let ctx = ui.ctx().clone();
+    let layer = ui.layer_id();
+    let mut st = app
+        .month_scroll
+        .filter(|s| s.for_date == app.date && start_of_week(s.pos.top) == s.pos.top)
+        .unwrap_or(MonthState {
+            pos: layout::MonthScroll::at_rest(app.date),
+            for_date: app.date,
+            last_input: f64::NEG_INFINITY,
+        });
+    let cell_h = ((rect.height() - layout::MONTH_HEADER_H) / st.pos.rows as f32).max(1.0);
+    let (hover, delta, time, dt) = ctx.input(|i| (i.pointer.hover_pos(), i.smooth_scroll_delta, i.time, i.stable_dt));
+    let over = hover.is_some_and(|pos| rect.contains(pos) && ctx.layer_id_at(pos).map_or(true, |l| l == layer));
+    // Shift+wheel arrives as horizontal; either axis scrolls.
+    let dy = if delta.y != 0.0 { delta.y } else { delta.x };
+    // Not mid-drag, and not under an open menu.
+    if over && dy != 0.0 && !app.pointer.is_active() && app.menu.is_none() {
+        st.pos.scroll(-dy / cell_h);
+        st.last_input = time;
+    } else if st.pos.offset != 0.0 && time - st.last_input > SETTLE_AFTER_S {
+        st.pos.settle(1.0 - (-dt * SETTLE_RATE).exp());
+    }
+    if st.pos.offset != 0.0 {
+        // Keep frames coming until it has settled.
+        ctx.request_repaint();
+    }
+    let month = st.pos.month();
+    if month != first_of_month(app.date) {
+        app.month_scrolled_to(month);
+        st.for_date = app.date;
+    }
+    app.month_scroll = Some(st);
+    st.pos
+}
+
 pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, Sense::hover());
-    let (grid_start, weeks) = layout::month_span(app.date);
+    let pos = month_scroll(app, ui, rect);
+    let (grid_start, weeks) = pos.span();
     let events = shown_events(app, grid_start, weeks * 7);
     let number_font = theme::font(14.0);
     let number_w = |day: NaiveDate| text_galley(ui, &month_label(day), number_font.clone(), p.text, 200.0).size().x;
-    let lay = layout::month(&events, app.date, rect, &number_w, &|ev| !is_read_only(app, ev));
+    let lay = layout::month(&events, pos, rect, &number_w, &|ev| !is_read_only(app, ev));
     record_rects(app, &events, lay.banners.iter().map(|b| (b.ev, b.rect)).chain(lay.rows.iter().map(|r| (r.ev, r.rect))));
 
     drive_pointer(app, ui, &lay.hits);
-    page_on_wheel(app, ui, rect);
 
-    let painter = ui.painter_at(rect);
+    let header = ui.painter_at(rect);
+    // Rows scroll under the weekday names.
+    let painter = ui.painter_at(Rect::from_min_max(Pos2::new(rect.left(), rect.top() + lay.header_h), rect.max));
     for i in 0..7 {
         // Right-aligned with the day numbers below.
         let x = rect.left() + (i as f32 + 1.0) * lay.cell_w - layout::MONTH_NUMBER_INSET;
         text_cap_centered(
-            &painter,
+            &header,
             Pos2::new(x, rect.top() + lay.header_h / 2.0),
             Align2::RIGHT_CENTER,
             weekday_short(i),
@@ -414,7 +436,7 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
             if is_weekend_column(i) { p.secondary } else { p.text },
         );
     }
-    painter.hline(rect.x_range(), rect.top() + lay.header_h, Stroke::new(1.0_f32, p.grid));
+    header.hline(rect.x_range(), rect.top() + lay.header_h, Stroke::new(1.0_f32, p.grid));
 
     for (k, cell) in lay.cells.iter().enumerate() {
         if is_weekend(cell.day) {
