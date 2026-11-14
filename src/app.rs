@@ -113,6 +113,8 @@ struct SearchUi {
     /// The query the results list was last scrolled for: a new one scrolls
     /// it to what's coming up.
     scrolled_for: Option<String>,
+    /// The last results (the list is drawn every frame).
+    cache: crate::search::Cache,
 }
 
 impl SearchUi {
