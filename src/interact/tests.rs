@@ -305,10 +305,28 @@ fn drag_on_empty_grid_creates_an_event() {
 }
 
 #[test]
-fn drag_create_upwards_and_across_days_stays_on_the_first_day() {
+fn drag_create_upwards_stays_on_the_day() {
     let mut sim = Sim::week(vec![]);
-    let out = sim.drag(sim.at("2026-11-11", "14:00"), sim.at("2026-11-13", "11:00"));
+    let out = sim.drag(sim.at("2026-11-11", "14:00"), sim.at("2026-11-11", "11:00"));
     assert_eq!(out, vec![Action::New { start: t("2026-11-11 11:00"), end: t("2026-11-11 14:00"), all_day: false }]);
+}
+
+#[test]
+fn drag_create_onto_the_next_day_runs_to_that_time() {
+    let mut sim = Sim::week(vec![]);
+    let from = sim.at("2026-11-11", "14:00");
+    sim.press(from);
+    sim.move_to(sim.at("2026-11-12", "11:00"));
+    assert_eq!(sim.pointer.ghost(), Some((t("2026-11-11 14:00"), t("2026-11-12 11:00"))));
+    let out = sim.release();
+    assert_eq!(out, vec![Action::New { start: t("2026-11-11 14:00"), end: t("2026-11-12 11:00"), all_day: false }]);
+}
+
+#[test]
+fn drag_create_back_onto_an_earlier_day_starts_there() {
+    let mut sim = Sim::week(vec![]);
+    let out = sim.drag(sim.at("2026-11-13", "11:00"), sim.at("2026-11-11", "14:00"));
+    assert_eq!(out, vec![Action::New { start: t("2026-11-11 14:00"), end: t("2026-11-13 11:00"), all_day: false }]);
 }
 
 #[test]
