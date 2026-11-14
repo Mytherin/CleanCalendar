@@ -61,6 +61,7 @@ impl Kind {
 }
 
 /// One place, as found in the map data.
+#[cfg_attr(not(feature = "build-places"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Record {
     pub kind: Kind,
@@ -90,6 +91,7 @@ pub struct Meta {
 // ---------------------------------------------------------------------------
 // Writing
 
+#[cfg_attr(not(feature = "build-places"), allow(dead_code))]
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
@@ -112,6 +114,7 @@ fn get_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 /// A column of strings as (sorted distinct strings, one code per entry).
+#[cfg_attr(not(feature = "build-places"), allow(dead_code))]
 fn dictionary<'a>(values: impl Iterator<Item = &'a str> + Clone) -> (Vec<u8>, Vec<u8>) {
     let mut distinct: Vec<&str> = values.clone().collect();
     distinct.sort_unstable();
@@ -131,6 +134,7 @@ fn dictionary<'a>(values: impl Iterator<Item = &'a str> + Clone) -> (Vec<u8>, Ve
 }
 
 /// Writes `records` (in any order, duplicates allowed) as a region file.
+#[cfg_attr(not(feature = "build-places"), allow(dead_code))]
 pub fn write(path: &Path, mut meta: Meta, mut records: Vec<Record>) -> Result<()> {
     // Kind first (it's the ranking), then town and street: the code columns
     // then hold long runs that compress to almost nothing.
