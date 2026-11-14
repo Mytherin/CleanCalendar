@@ -59,6 +59,35 @@ fn draw_text_centered(
     painter.galley(Pos2::new(x, y), g, color);
 }
 
+/// The events to show from `first` for `ndays`: the stored ones, with the
+/// event being edited replaced by its draft (or added, if it's new), so edits
+/// preview live, like in macOS Calendar.
+fn shown_events(app: &App, first: NaiveDate, ndays: i64) -> Vec<Event> {
+    let mut events = layout::events_in(&app.store, first, ndays);
+    if let Some(ed) = &app.editor {
+        events.retain(|e| e.id != ed.draft.id);
+        let d = &ed.draft;
+        let (a, b) = (midnight(first), midnight(first + Duration::days(ndays)));
+        if d.start < b && (d.end > a || d.start >= a) && app.store.is_visible(&d.calendar_id) {
+            let mut d = d.clone();
+            if d.title.trim().is_empty() {
+                d.title = "New Event".into();
+            }
+            events.push(d);
+            events.sort_by(|x, y| x.start.cmp(&y.start).then(y.duration().cmp(&x.duration())));
+        }
+    }
+    events
+}
+
+/// Remembers where each event was drawn this frame (its first piece), to
+/// anchor the editor popover.
+fn record_rects<'a>(app: &mut App, events: &[Event], placed: impl Iterator<Item = (usize, Rect)>) {
+    for (i, rect) in placed {
+        app.event_rects.entry(events[i].id.clone()).or_insert(rect);
+    }
+}
+
 fn event_color(app: &App, ev: &Event) -> Color32 {
     app.store.calendar(&ev.calendar_id).map(|c| theme::rgb(c.color)).unwrap_or(theme::ACCENT)
 }
@@ -82,7 +111,14 @@ fn day_number_badge(painter: &egui::Painter, center: Pos2, text: &str, is_today:
 }
 
 /// Multi-line text in at most `max_rows` lines, wrapping at word boundaries.
+/// A word too wide for a line is never split ("Engineeri/ng"): the text is
+/// shown on one line, cut short with "…", instead.
 fn wrapped_galley(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32, max_rows: usize) -> Arc<Galley> {
+    let too_wide =
+        |word: &str| ui.fonts(|f| f.layout_no_wrap(word.to_owned(), font.clone(), color).size().x) > max_w;
+    if max_rows > 1 && text.split_whitespace().any(too_wide) {
+        return text_galley(ui, text, font, color, max_w);
+    }
     let mut job = LayoutJob::simple(text.to_owned(), font, color, max_w.max(1.0));
     job.wrap.max_rows = max_rows.max(1);
     job.wrap.overflow_character = Some('…');
@@ -226,10 +262,11 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     let rect = ui.available_rect_before_wrap();
     ui.allocate_rect(rect, Sense::hover());
     let (grid_start, weeks) = layout::month_span(app.date);
-    let events = layout::events_in(&app.store, grid_start, weeks * 7);
+    let events = shown_events(app, grid_start, weeks * 7);
     let number_font = theme::font(14.0);
     let number_w = |day: NaiveDate| text_galley(ui, &month_label(day), number_font.clone(), p.text, 200.0).size().x;
     let lay = layout::month(&events, app.date, rect, &number_w);
+    record_rects(app, &events, lay.banners.iter().map(|b| (b.ev, b.rect)).chain(lay.rows.iter().map(|r| (r.ev, r.rect))));
 
     drive_pointer(app, ui, &lay.hits);
 
@@ -307,7 +344,7 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
 
 pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
     let first = if ndays == 7 { start_of_week(app.date) } else { app.date };
-    let events = layout::events_in(&app.store, first, ndays);
+    let events = shown_events(app, first, ndays);
 
     let full = ui.available_rect_before_wrap();
     // The day view has no column header: its title already names the day.
@@ -327,6 +364,7 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
         let (grid, _) = ui.allocate_exact_size(Vec2::new(full.width(), layout::grid_height()), Sense::hover());
         let rects = WeekRects { header, allday, grid, grid_clip: ui.clip_rect().intersect(grid) };
         let lay = layout::week(&events, first, ndays, rects, &|ev| !is_read_only(app, ev));
+        record_rects(app, &events, lay.timed.iter().chain(lay.banners.iter()).map(|t| (t.ev, t.rect)));
 
         drive_pointer(app, ui, &lay.hits);
 

@@ -1,11 +1,13 @@
 //! Application state, toolbar, sidebar, dialogs, and Google sync glue.
 
+use std::collections::HashMap;
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Duration, Local, NaiveDate, NaiveDateTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, Stroke, Vec2};
 
 use crate::app_icon::AppIcon;
+use crate::editor::{self, Editor, Outcome, Placement};
 use crate::dates::*;
 use crate::google::{self, Cmd, Worker};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
@@ -55,31 +57,6 @@ pub enum Action {
     Committed(String),
 }
 
-pub struct Editor {
-    pub draft: Event,
-    pub is_new: bool,
-    start_date: NaiveDate,
-    start_time: NaiveTime,
-    end_date: NaiveDate,
-    end_time: NaiveTime,
-    error: Option<String>,
-}
-
-impl Editor {
-    fn new(draft: Event, is_new: bool) -> Self {
-        let end = if draft.all_day { draft.end - Duration::days(1) } else { draft.end };
-        Editor {
-            start_date: draft.start.date(),
-            start_time: draft.start.time(),
-            end_date: end.date().max(draft.start.date()),
-            end_time: draft.end.time(),
-            draft,
-            is_new,
-            error: None,
-        }
-    }
-}
-
 pub struct App {
     pub store: Store,
     pub view: View,
@@ -89,7 +66,12 @@ pub struct App {
     pub pointer: Pointer,
     pub scroll_to: Option<f32>,
     pub actions: Vec<Action>,
-    editor: Option<Editor>,
+    /// The event being edited (in a popover, or the day view's inspector).
+    pub editor: Option<Editor>,
+    /// Where each event was drawn this frame, to anchor the popover.
+    pub event_rects: HashMap<String, egui::Rect>,
+    /// The last pointer position, to anchor the popover of a new event.
+    last_pointer: Option<egui::Pos2>,
     sidebar_open: bool,
     mini_month: NaiveDate,
     worker: Worker,
@@ -114,6 +96,8 @@ impl App {
             scroll_to: Some(layout::HOUR_H * 7.5),
             actions: Vec::new(),
             editor: None,
+            event_rects: HashMap::new(),
+            last_pointer: None,
             sidebar_open: true,
             mini_month: first_of_month(today),
             worker: Worker::spawn(cc.egui_ctx.clone(), google::Endpoints::from_env()),
@@ -215,13 +199,52 @@ impl App {
             etag: None,
             base: None,
         };
-        self.editor = Some(Editor::new(draft, true));
+        self.finish_editor(Outcome::Done);
+        let placement = if self.view == View::Day {
+            Placement::Inspector
+        } else {
+            let anchor = self.last_pointer.map(|p| egui::Rect::from_center_size(p, Vec2::splat(2.0)));
+            Placement::Popover { anchor }
+        };
+        self.selected = Some(draft.id.clone());
+        self.editor = Some(Editor::new(draft, true, placement));
     }
 
     fn open_event(&mut self, id: &str) {
+        if self.editor.as_ref().is_some_and(|ed| ed.draft.id == id) {
+            return;
+        }
+        self.finish_editor(Outcome::Done);
         if let Some(ev) = self.store.event(id) {
+            let placement = if self.view == View::Day {
+                Placement::Inspector
+            } else {
+                Placement::Popover { anchor: self.event_rects.get(id).copied() }
+            };
             self.selected = Some(id.to_owned());
-            self.editor = Some(Editor::new(ev.clone(), false));
+            self.editor = Some(Editor::new(ev.clone(), false, placement));
+        }
+    }
+
+    /// Closes the editor: keeps the changes (if any), discards them, or
+    /// deletes the event.
+    fn finish_editor(&mut self, outcome: Outcome) {
+        let Some(ed) = self.editor.take() else { return };
+        match outcome {
+            Outcome::Open => self.editor = Some(ed),
+            Outcome::Cancel => {}
+            Outcome::Delete => self.delete_event(&ed.draft.id),
+            Outcome::Done => {
+                let stored = self.store.event(&ed.draft.id);
+                if !(ed.is_new || editor::changed(&ed, stored)) {
+                    return;
+                }
+                match ed.result() {
+                    Ok(ev) => self.commit_event(ev, ed.is_new),
+                    // Keep it open so the problem can be fixed.
+                    Err(_) => self.editor = Some(ed),
+                }
+            }
         }
     }
 
@@ -291,7 +314,16 @@ impl App {
     fn apply_actions(&mut self) {
         for action in std::mem::take(&mut self.actions) {
             match action {
-                Action::Select(id) => self.selected = id,
+                Action::Select(id) => {
+                    // The day view's inspector follows the selection.
+                    if self.view == View::Day {
+                        match &id {
+                            Some(id) => self.open_event(id),
+                            None => self.finish_editor(Outcome::Done),
+                        }
+                    }
+                    self.selected = id;
+                }
                 Action::Open(id) => self.open_event(&id),
                 Action::New { start, end, all_day } => self.new_event(start, end, all_day),
                 Action::GoTo(d, v) => self.go_to(d, v),
@@ -300,6 +332,10 @@ impl App {
                     if let Some(ev) = self.store.event_mut(&id) {
                         ev.start = start;
                         ev.end = end;
+                    }
+                    // Dragging the event being edited (e.g. a new one) moves the draft too.
+                    if let Some(ed) = self.editor.as_mut().filter(|ed| ed.draft.id == id) {
+                        ed.set_times(start, end);
                     }
                 }
                 Action::Committed(id) => {
@@ -317,6 +353,9 @@ impl App {
             self.scroll_to = Some(layout::HOUR_H * 7.5);
         }
         self.date = date;
+        if view != self.view {
+            self.finish_editor(Outcome::Done);
+        }
         self.view = view;
         self.mini_month = first_of_month(date);
     }
@@ -333,7 +372,8 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
-        let modal = self.editor.is_some() || self.show_google;
+        let popover = self.editor.as_ref().is_some_and(|ed| matches!(ed.placement, Placement::Popover { .. }));
+        let modal = popover || self.show_google;
         let mut view = None;
         let mut step = 0;
         let mut today = false;
@@ -616,142 +656,48 @@ impl App {
 
     // ---- UI: dialogs ------------------------------------------------------
 
-    fn editor_window(&mut self, ctx: &egui::Context, p: &Palette) {
+    /// Shows the editor's popover (the inspector draws itself in the day view).
+    fn editor_popover(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(ed) = self.editor.as_mut() else { return };
-        let read_only = self.store.calendar(&ed.draft.calendar_id).is_some_and(|c| c.read_only);
-        let mut open = true;
-        let mut save = false;
-        let mut delete = false;
-        let mut cancel = false;
-        egui::Window::new(if ed.is_new { "New Event" } else { "Event" })
-            .id(egui::Id::new("event-editor"))
-            .collapsible(false)
+        let Placement::Popover { anchor } = ed.placement else { return };
+        // Follow the event if it's drawn (e.g. a new event appears after the
+        // first frame, or the view scrolls).
+        let anchor = self.event_rects.get(&ed.draft.id).copied().or(anchor);
+        ed.placement = Placement::Popover { anchor };
+        let outcome = editor::popover(ctx, ed, &self.store, p, anchor);
+        self.finish_editor(outcome);
+    }
+
+    /// The day view's right-hand panel: a mini-month, then the selected
+    /// event's details (like macOS Calendar's inspector).
+    fn inspector(&mut self, ctx: &egui::Context, p: &Palette) {
+        egui::SidePanel::right("inspector")
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(360.0, 0.0))
-            .open(&mut open)
+            .exact_width(320.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::none().fill(p.bg).inner_margin(egui::Margin { left: 12.0, right: 14.0, top: 8.0, bottom: 12.0 }))
             .show(ctx, |ui| {
-                ui.add_enabled_ui(!read_only, |ui| {
-                    let title = ui.add(
-                        egui::TextEdit::singleline(&mut ed.draft.title)
-                            .hint_text("New Event")
-                            .font(theme::bold_font(18.0))
-                            .frame(false)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if ed.is_new && !title.has_focus() && ed.draft.title.is_empty() && ui.memory(|m| m.focused().is_none()) {
-                        title.request_focus();
-                    }
-                    if title.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        save = true;
-                    }
-                    ui.add(
-                        egui::TextEdit::singleline(&mut ed.draft.location)
-                            .hint_text("Add Location")
-                            .frame(false)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.separator();
-                    egui::Grid::new("editor-grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                        ui.label(RichText::new("all-day").color(p.secondary));
-                        ui.checkbox(&mut ed.draft.all_day, "");
-                        ui.end_row();
-
-                        ui.label(RichText::new("starts").color(p.secondary));
-                        ui.horizontal(|ui| {
-                            ui.push_id("start-date", |ui| ui.add(egui_extras::DatePickerButton::new(&mut ed.start_date)));
-                            if !ed.draft.all_day {
-                                time_combo(ui, "start-time", &mut ed.start_time);
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label(RichText::new("ends").color(p.secondary));
-                        ui.horizontal(|ui| {
-                            ui.push_id("end-date", |ui| ui.add(egui_extras::DatePickerButton::new(&mut ed.end_date)));
-                            if !ed.draft.all_day {
-                                time_combo(ui, "end-time", &mut ed.end_time);
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label(RichText::new("calendar").color(p.secondary));
-                        let current = self.store.calendar(&ed.draft.calendar_id);
-                        let (name, color) =
-                            current.map(|c| (c.name.clone(), theme::rgb(c.color))).unwrap_or(("—".into(), p.secondary));
-                        egui::ComboBox::new("calendar-combo", "")
-                            .selected_text(RichText::new(format!("● {name}")).color(color))
-                            .width(200.0)
-                            .show_ui(ui, |ui| {
-                                for c in self.store.calendars.iter().filter(|c| !c.read_only || read_only) {
-                                    let label = RichText::new(format!("● {}", c.name)).color(theme::rgb(c.color));
-                                    ui.selectable_value(&mut ed.draft.calendar_id, c.id.clone(), label);
-                                }
-                            });
-                        ui.end_row();
-                    });
-                    ui.separator();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut ed.draft.notes)
-                            .hint_text("Add Notes")
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                if let Some(err) = &ed.error {
-                    ui.label(RichText::new(err).color(RED));
+                let r = ui.max_rect();
+                ui.painter().vline(r.left() - 12.0, r.y_range().expand(20.0), Stroke::new(1.0_f32, p.grid));
+                let w = ui.available_width();
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 7.0 * 24.0), Sense::hover());
+                if let Some(day) = views::mini_month(ui, rect, first_of_month(self.date), self.today, Some(self.date), p, true) {
+                    self.go_to(day, View::Day);
                 }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if !ed.is_new && !read_only {
-                        if ui.button(RichText::new("Delete").color(RED)).clicked() {
-                            delete = true;
-                        }
+                ui.add_space(14.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.editor.as_mut() {
+                    Some(ed) if ed.placement == Placement::Inspector => {
+                        let outcome = editor::inspector(ui, ed, &self.store, p);
+                        self.finish_editor(outcome);
                     }
-                    if read_only {
-                        ui.label(RichText::new("Read-only calendar").color(p.secondary).small());
+                    _ => {
+                        ui.add_space(40.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("No Event Selected").font(theme::font(15.0)).color(p.placeholder));
+                        });
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if !read_only {
-                            let btn = egui::Button::new(RichText::new(if ed.is_new { "Add" } else { "Save" }).color(Color32::WHITE))
-                                .fill(ACCENT);
-                            if ui.add(btn).clicked() {
-                                save = true;
-                            }
-                        }
-                        if ui.button(if read_only { "Close" } else { "Cancel" }).clicked() {
-                            cancel = true;
-                        }
-                    });
                 });
             });
-
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            cancel = true;
-        }
-        if save {
-            let mut ev = ed.draft.clone();
-            if ev.all_day {
-                ev.start = midnight(ed.start_date);
-                ev.end = midnight(ed.end_date.max(ed.start_date)) + Duration::days(1);
-            } else {
-                ev.start = ed.start_date.and_time(ed.start_time);
-                ev.end = ed.end_date.and_time(ed.end_time);
-            }
-            if ev.end < ev.start {
-                ed.error = Some("The event ends before it starts.".into());
-                return;
-            }
-            let is_new = ed.is_new;
-            self.editor = None;
-            self.commit_event(ev, is_new);
-        } else if delete {
-            let id = ed.draft.id.clone();
-            self.editor = None;
-            self.delete_event(&id);
-        } else if cancel || !open {
-            self.editor = None;
-        }
     }
 
     fn google_window(&mut self, ctx: &egui::Context, p: &Palette) {
@@ -844,6 +790,11 @@ impl eframe::App for App {
         // Sidebar first, so it runs the window's full height.
         self.sidebar(ctx, &p);
         self.toolbar(ctx, &p);
+        if self.view == View::Day {
+            self.inspector(ctx, &p);
+        }
+        self.last_pointer = ctx.input(|i| i.pointer.interact_pos()).or(self.last_pointer);
+        self.event_rects.clear();
         egui::CentralPanel::default().frame(egui::Frame::none().fill(p.bg)).show(ctx, |ui| {
             ui.add_space(10.0);
             self.header(ui, &p);
@@ -856,7 +807,7 @@ impl eframe::App for App {
             }
         });
         self.apply_actions();
-        self.editor_window(ctx, &p);
+        self.editor_popover(ctx, &p);
         self.google_window(ctx, &p);
 
         // Keep the current-time line moving.
@@ -955,13 +906,4 @@ fn calendar_row(ui: &mut egui::Ui, cal: &Calendar, p: &Palette) -> egui::Respons
         p.text,
     );
     resp.on_hover_text(&cal.name)
-}
-
-fn time_combo(ui: &mut egui::Ui, id: &str, t: &mut NaiveTime) {
-    egui::ComboBox::new(id, "").selected_text(fmt_time(*t)).width(96.0).height(260.0).show_ui(ui, |ui| {
-        for q in 0..96 {
-            let slot = NaiveTime::from_hms_opt(q / 4, (q % 4) * 15, 0).unwrap();
-            ui.selectable_value(t, slot, fmt_time(slot));
-        }
-    });
 }
