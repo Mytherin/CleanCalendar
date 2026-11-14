@@ -390,21 +390,19 @@ impl App {
     // ---- UI: toolbar ------------------------------------------------------
 
     fn toolbar(&mut self, ctx: &egui::Context, p: &Palette) {
+        // Like macOS, the toolbar is part of the window: same background, no
+        // divider line.
         egui::TopBottomPanel::top("toolbar")
-            .exact_height(48.0)
+            .exact_height(52.0)
+            .show_separator_line(false)
             .frame(egui::Frame::none().fill(p.toolbar).inner_margin(egui::Margin::symmetric(12.0, 0.0)))
             .show(ctx, |ui| {
-                ui.painter().hline(
-                    ui.max_rect().x_range().expand(12.0),
-                    ui.max_rect().bottom(),
-                    Stroke::new(1.0_f32, p.grid_strong),
-                );
                 let full = ui.max_rect();
                 ui.horizontal_centered(|ui| {
                     if icon_button(ui, "☰", "Show/hide calendar list").clicked() {
                         self.sidebar_open = !self.sidebar_open;
                     }
-                    if icon_button(ui, "+", "New event (Ctrl+N)").clicked() {
+                    if pill_button(ui, "+", p.seg_track, p).on_hover_text("New event (Ctrl+N)").clicked() {
                         let start = midnight(self.date) + Duration::hours(9);
                         self.new_event(start, start + Duration::hours(1), false);
                     }
@@ -432,9 +430,10 @@ impl App {
                         }
                     });
                 });
-                // Centered segmented control, laid over the row.
-                let seg_w = 280.0;
-                let seg = egui::Rect::from_center_size(full.center(), Vec2::new(seg_w, 26.0));
+                // Centered on the whole window (like macOS), laid over the row.
+                let seg_w = 300.0;
+                let window_mid = ui.ctx().screen_rect().center().x;
+                let seg = egui::Rect::from_center_size(egui::pos2(window_mid, full.center().y), Vec2::new(seg_w, 32.0));
                 let mut child = ui.new_child(egui::UiBuilder::new().max_rect(seg).layout(Layout::left_to_right(Align::Center)));
                 if let Some(v) = segmented(&mut child, self.view, p) {
                     self.go_to(self.date, v);
@@ -445,16 +444,24 @@ impl App {
     // ---- UI: sidebar ------------------------------------------------------
 
     fn sidebar(&mut self, ctx: &egui::Context, p: &Palette) {
+        // An inset, rounded, darker panel running the window's full height
+        // (it's laid out before the toolbar), like the macOS sidebar.
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .exact_width(220.0)
-            .frame(egui::Frame::none().fill(p.sidebar).inner_margin(egui::Margin::same(14.0)))
+            .exact_width(236.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::none().fill(p.bg).inner_margin(egui::Margin::same(8.0)))
             .show_animated(ctx, self.sidebar_open, |ui| {
-                ui.painter().vline(
-                    ui.max_rect().right() + 14.0,
-                    ui.max_rect().y_range().expand(14.0),
-                    Stroke::new(1.0_f32, p.grid_strong),
-                );
+                let card = ui.max_rect();
+                ui.painter().rect_filled(card, 12.0, p.sidebar);
+                if !p.dark {
+                    ui.painter().rect_stroke(card, 12.0, Stroke::new(1.0_f32, p.grid));
+                }
+                let inner = card.shrink2(Vec2::new(14.0, 14.0));
+                let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
+                let ui = &mut ui;
+                // Leave room for the window's title-bar controls area.
+                ui.add_space(30.0);
                 let mini_h = 210.0;
                 let list_h = (ui.available_height() - mini_h).max(80.0);
                 egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(ui, |ui| {
@@ -541,20 +548,23 @@ impl App {
     }
 
     fn mini_month_ui(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(self.mini_month.format("%B %Y").to_string()).font(theme::bold_font(13.0)).color(p.text),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                if small_button(ui, "›").clicked() {
-                    self.mini_month = add_months(self.mini_month, 1);
-                }
-                if small_button(ui, "‹").clicked() {
-                    self.mini_month = add_months(self.mini_month, -1);
-                }
-            });
-        });
+        // "‹  November 2026  ›" with the month name centered, as in macOS.
+        let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
+        ui.painter().text(
+            row.center(),
+            Align2::CENTER_CENTER,
+            self.mini_month.format("%B %Y").to_string(),
+            theme::font(14.0),
+            p.text,
+        );
+        let mut left = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(Layout::left_to_right(Align::Center)));
+        if chevron_button(&mut left, "‹", p).clicked() {
+            self.mini_month = add_months(self.mini_month, -1);
+        }
+        let mut right = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
+        if chevron_button(&mut right, "›", p).clicked() {
+            self.mini_month = add_months(self.mini_month, 1);
+        }
         let w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 7.0 * 24.0), Sense::hover());
         if let Some(day) = views::mini_month(ui, rect, self.mini_month, self.today, Some(self.date), p, true) {
@@ -568,34 +578,40 @@ impl App {
     // ---- UI: header (title + nav) -----------------------------------------
 
     fn header(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        // "November 2026" (bold month), "13 November 2026" in the day view,
+        // and a plain "2026" in the year view, like macOS Calendar.
+        let (bold, rest) = match self.view {
+            View::Day => (self.date.format("%-d %B").to_string(), self.date.format(" %Y").to_string()),
+            View::Week | View::Month => (self.date.format("%B").to_string(), self.date.format(" %Y").to_string()),
+            View::Year => (String::new(), self.date.format("%Y").to_string()),
+        };
         ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            let (bold, rest) = match self.view {
-                View::Day => (self.date.format("%B %-d,").to_string(), self.date.format(" %Y").to_string()),
-                View::Week | View::Month => (self.date.format("%B").to_string(), self.date.format(" %Y").to_string()),
-                View::Year => (self.date.format("%Y").to_string(), String::new()),
-            };
+            ui.add_space(18.0);
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.label(RichText::new(bold).font(theme::bold_font(26.0)).color(p.text));
-            ui.label(RichText::new(rest).font(theme::font(26.0)).color(p.text));
-            if self.view == View::Day {
-                ui.add_space(12.0);
-                ui.label(RichText::new(self.date.format("%A").to_string()).font(theme::font(16.0)).color(p.secondary));
+            if !bold.is_empty() {
+                ui.label(RichText::new(bold).font(theme::bold_font(30.0)).color(p.text));
             }
+            ui.label(RichText::new(rest).font(theme::font(30.0)).color(p.text));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(16.0);
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if small_button(ui, "›").on_hover_text("Next").clicked() {
+                ui.add_space(14.0);
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if pill_button(ui, "›", p.button, p).on_hover_text("Next").clicked() {
                     self.step(1);
                 }
-                if ui.button("Today").clicked() {
+                if pill_button(ui, "Today", p.button, p).clicked() {
                     self.go_to(self.today, self.view);
                 }
-                if small_button(ui, "‹").on_hover_text("Previous").clicked() {
+                if pill_button(ui, "‹", p.button, p).on_hover_text("Previous").clicked() {
                     self.step(-1);
                 }
             });
         });
+        if self.view == View::Day {
+            ui.horizontal(|ui| {
+                ui.add_space(18.0);
+                ui.label(RichText::new(self.date.format("%A").to_string()).font(theme::font(20.0)).color(p.secondary));
+            });
+        }
     }
 
     // ---- UI: dialogs ------------------------------------------------------
@@ -825,8 +841,9 @@ impl eframe::App for App {
         }
         self.shortcuts(ctx);
 
-        self.toolbar(ctx, &p);
+        // Sidebar first, so it runs the window's full height.
         self.sidebar(ctx, &p);
+        self.toolbar(ctx, &p);
         egui::CentralPanel::default().frame(egui::Frame::none().fill(p.bg)).show(ctx, |ui| {
             ui.add_space(10.0);
             self.header(ui, &p);
@@ -855,30 +872,52 @@ fn icon_button(ui: &mut egui::Ui, text: &str, hover: &str) -> egui::Response {
         .on_hover_text(hover)
 }
 
-fn small_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(egui::Button::new(RichText::new(text).size(16.0)).min_size(Vec2::new(26.0, 22.0)))
+/// A fully rounded button like macOS toolbar buttons: a circle for a single
+/// glyph ("+", "‹"), a pill for words ("Today").
+fn pill_button(ui: &mut egui::Ui, text: &str, fill: Color32, p: &Palette) -> egui::Response {
+    let font = theme::font(if text.chars().count() == 1 { 18.0 } else { 14.0 });
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), p.text);
+    let h = 30.0;
+    let w = (galley.size().x + 26.0).max(h);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+    let fill = if resp.is_pointer_button_down_on() {
+        theme::blend(fill, p.text, 0.18)
+    } else if resp.hovered() {
+        theme::blend(fill, p.text, 0.08)
+    } else {
+        fill
+    };
+    ui.painter().rect_filled(rect, h / 2.0, fill);
+    ui.painter().text(rect.center() - Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, text, font, p.text);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A bare chevron (the sidebar mini-month's ‹ ›).
+fn chevron_button(ui: &mut egui::Ui, text: &str, p: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 6.0, p.selection);
+    }
+    ui.painter().text(rect.center() - Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, text, theme::font(18.0), p.secondary);
+    resp
 }
 
 /// macOS-style segmented control.
 fn segmented(ui: &mut egui::Ui, current: View, p: &Palette) -> Option<View> {
     let rect = ui.max_rect();
-    let painter = ui.painter();
-    let track = if p.dark { Color32::from_rgb(0x3A, 0x3A, 0x3C) } else { Color32::from_rgb(0xE3, 0xE3, 0xE8) };
-    painter.rect_filled(rect, 7.0, track);
+    ui.painter().rect_filled(rect, rect.height() / 2.0, p.seg_track);
     let w = rect.width() / View::ALL.len() as f32;
     let mut picked = None;
     for (i, v) in View::ALL.into_iter().enumerate() {
         let r = egui::Rect::from_min_size(rect.min + Vec2::new(i as f32 * w, 0.0), Vec2::new(w, rect.height()));
         let resp = ui.interact(r, ui.id().with(("seg", i)), Sense::click());
         if v == current {
-            let knob = r.shrink(2.0);
-            let fill = if p.dark { Color32::from_rgb(0x63, 0x63, 0x66) } else { Color32::WHITE };
-            ui.painter().rect_filled(knob.translate(Vec2::new(0.0, 0.5)), 5.0, Color32::from_black_alpha(30));
-            ui.painter().rect_filled(knob, 5.0, fill);
+            let knob = r.shrink(3.0);
+            ui.painter().rect_filled(knob, knob.height() / 2.0, p.seg_knob);
         } else if i > 0 && View::ALL[i - 1] != current {
-            ui.painter().vline(r.left(), r.y_range().shrink(6.0), Stroke::new(1.0_f32, p.tertiary));
+            ui.painter().vline(r.left(), r.y_range().shrink(9.0), Stroke::new(1.0_f32, p.grid));
         }
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, v.label(), theme::font(13.0), p.text);
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, v.label(), theme::font(14.0), p.text);
         if resp.clicked() {
             picked = Some(v);
         }

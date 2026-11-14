@@ -42,6 +42,23 @@ fn draw_text(ui: &Ui, painter: &egui::Painter, pos: Pos2, text: &str, font: Font
     w
 }
 
+/// One line of text starting at `x`, vertically centered in `rect` using the
+/// font's real line height (fixed offsets drift when the UI font changes).
+fn draw_text_centered(
+    ui: &Ui,
+    painter: &egui::Painter,
+    x: f32,
+    rect: Rect,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) {
+    let g = text_galley(ui, text, font, color, max_w);
+    let y = (rect.center().y - g.size().y / 2.0).round();
+    painter.galley(Pos2::new(x, y), g, color);
+}
+
 fn event_color(app: &App, ev: &Event) -> Color32 {
     app.store.calendar(&ev.calendar_id).map(|c| theme::rgb(c.color)).unwrap_or(theme::ACCENT)
 }
@@ -64,22 +81,41 @@ fn day_number_badge(painter: &egui::Painter, center: Pos2, text: &str, is_today:
     }
 }
 
+/// Multi-line text in at most `max_rows` lines, wrapping at word boundaries.
+fn wrapped_galley(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32, max_rows: usize) -> Arc<Galley> {
+    let mut job = LayoutJob::simple(text.to_owned(), font, color, max_w.max(1.0));
+    job.wrap.max_rows = max_rows.max(1);
+    job.wrap.overflow_character = Some('…');
+    ui.fonts(|f| f.layout_job(job))
+}
+
+/// Apple's small clock glyph shown before an event's time range.
+fn draw_clock(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.0_f32, color);
+    painter.circle_stroke(center, 4.0, stroke);
+    painter.line_segment([center, center + Vec2::new(0.0, -2.5)], stroke);
+    painter.line_segment([center, center + Vec2::new(1.8, 0.0)], stroke);
+}
+
+/// Marker for occurrences of a repeating event, at the right end of a line.
+fn draw_repeat_marker(painter: &egui::Painter, right_center: Pos2, color: Color32) {
+    painter.text(right_center, Align2::RIGHT_CENTER, "⟳", theme::font(9.5), color.gamma_multiply(0.65));
+}
+
 fn draw_banner(ui: &Ui, painter: &egui::Painter, rect: Rect, ev: &Event, color: Color32, selected: bool, p: &Palette) {
     painter.rect_filled(rect, 4.0, p.event_fill(color, selected));
+    let text_color = p.event_text(color, selected);
     let text = if ev.all_day {
         ev.title.clone()
     } else {
         format!("{} {}", fmt_time(ev.start.time()), ev.title)
     };
-    draw_text(
-        ui,
-        painter,
-        rect.left_top() + Vec2::new(6.0, 2.5),
-        &text,
-        theme::bold_font(11.5),
-        p.event_text(color, selected),
-        rect.width() - 10.0,
-    );
+    let repeat = ev.recurring_id.is_some() && rect.width() > 60.0;
+    if repeat {
+        draw_repeat_marker(painter, Pos2::new(rect.right() - 5.0, rect.center().y), text_color);
+    }
+    let max_w = rect.width() - 12.0 - if repeat { 12.0 } else { 0.0 };
+    draw_text_centered(ui, painter, rect.left() + 6.0, rect, &text, theme::bold_font(11.5), text_color, max_w);
 }
 
 fn hover_text(ev: &Event) -> String {
@@ -204,22 +240,27 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
             Pos2::new(x, rect.top() + lay.header_h / 2.0),
             Align2::RIGHT_CENTER,
             weekday_short(i),
-            theme::font(12.0),
-            p.secondary,
+            theme::font(15.0),
+            if is_weekend_column(i) { p.secondary } else { p.text },
         );
     }
     painter.hline(rect.x_range(), rect.top() + lay.header_h, Stroke::new(1.0_f32, p.grid));
 
     for cell in &lay.cells {
-        let wd = cell.day.weekday().num_days_from_sunday();
-        if wd == 0 || wd == 6 {
+        if is_weekend(cell.day) {
             painter.rect_filled(cell.rect, 0.0, p.weekend);
         }
         painter.hline(cell.rect.x_range(), cell.rect.bottom(), Stroke::new(1.0_f32, p.grid));
-        if wd > 0 {
+        if cell.rect.left() > rect.left() + 1.0 {
             painter.vline(cell.rect.left(), cell.rect.y_range(), Stroke::new(1.0_f32, p.grid));
         }
-        let color = if cell.in_month { p.text } else { p.tertiary };
+        let color = if !cell.in_month {
+            p.tertiary
+        } else if is_weekend(cell.day) {
+            p.secondary
+        } else {
+            p.text
+        };
         day_number_badge(&painter, cell.number.center(), &month_label(cell.day), cell.day == app.today, number_font.clone(), color);
     }
 
@@ -236,25 +277,28 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
             painter.rect_filled(r, 4.0, color);
         }
         let text_color = if selected { Color32::WHITE } else { p.text };
-        painter.circle_filled(Pos2::new(r.left() + 6.0, r.center().y), 3.5, if selected { Color32::WHITE } else { color });
+        // A short colored bar marks the calendar (Apple's month view).
+        let bar = Rect::from_center_size(Pos2::new(r.left() + 5.0, r.center().y), Vec2::new(3.0, 12.0));
+        painter.rect_filled(bar, 1.5, if selected { Color32::WHITE } else { color });
         let time = fmt_time(ev.start.time());
-        let tw = text_galley(ui, &time, theme::font(11.0), p.secondary, 100.0).size().x;
+        let time_font = theme::font(11.0);
+        let tw = text_galley(ui, &time, time_font.clone(), p.secondary, 100.0).size().x;
         let show_time = r.width() > tw + 60.0;
         if show_time {
             painter.text(
                 Pos2::new(r.right() - 4.0, r.center().y),
                 Align2::RIGHT_CENTER,
                 &time,
-                theme::font(11.0),
+                time_font,
                 if selected { Color32::WHITE } else { p.secondary },
             );
         }
         let max_w = r.width() - 16.0 - if show_time { tw + 8.0 } else { 0.0 };
-        draw_text(ui, &painter, Pos2::new(r.left() + 13.0, r.top() + 1.5), &ev.title, theme::font(12.0), text_color, max_w);
+        draw_text_centered(ui, &painter, r.left() + 11.0, r, &ev.title, theme::font(12.5), text_color, max_w);
     }
 
     for &(_, more, r) in &lay.more {
-        painter.text(r.min, Align2::LEFT_TOP, format!("{more} more"), theme::bold_font(11.5), p.secondary);
+        painter.text(r.min, Align2::LEFT_TOP, format!("+{more} more"), theme::font(11.5), p.secondary);
     }
 }
 
@@ -266,7 +310,9 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
     let events = layout::events_in(&app.store, first, ndays);
 
     let full = ui.available_rect_before_wrap();
-    let (header, _) = ui.allocate_exact_size(Vec2::new(full.width(), DAY_HEADER_H), Sense::hover());
+    // The day view has no column header: its title already names the day.
+    let header_h = if ndays == 1 { 0.0 } else { DAY_HEADER_H };
+    let (header, _) = ui.allocate_exact_size(Vec2::new(full.width(), header_h), Sense::hover());
     let lane_h = layout::allday_height(&events, first, ndays);
     let (allday, _) = ui.allocate_exact_size(Vec2::new(full.width(), lane_h), Sense::hover());
     // Header and all-day lane stay put; paint them with the outer painter.
@@ -297,15 +343,19 @@ fn paint_day_headers(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayo
         let day = lay.first + Duration::days(i);
         let x = g.col_x(i);
         let is_today = day == app.today;
-        let wd = weekday_short(day.weekday().num_days_from_sunday() as usize);
+        let wd = day_short(day.weekday());
         let num = day.day().to_string();
-        let color = if is_today { RED } else { p.text };
+        let color = if is_today {
+            RED
+        } else if is_weekend(day) {
+            p.secondary
+        } else {
+            p.text
+        };
         let font = theme::font(15.0);
         if lay.ndays == 1 {
-            let x0 = x + 8.0;
-            let w = draw_text(ui, painter, Pos2::new(x0, cy - 9.0), wd, font.clone(), color, 100.0);
-            let nw = text_galley(ui, &num, font.clone(), color, 50.0).size().x;
-            day_number_badge(painter, Pos2::new(x0 + w + 8.0 + nw / 2.0, cy), &num, is_today, font, color);
+            // The day view's title already names the day (like Apple's).
+            continue;
         } else {
             let label_w = text_galley(ui, wd, font.clone(), color, 100.0).size().x;
             let nw = text_galley(ui, &num, font.clone(), color, 50.0).size().x;
@@ -342,16 +392,7 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
     let g = &lay.geom;
     let painter = ui.painter_at(grid);
 
-    for i in 0..lay.ndays {
-        let wd = (lay.first + Duration::days(i)).weekday().num_days_from_sunday();
-        if lay.ndays > 1 && (wd == 0 || wd == 6) {
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(g.col_x(i), grid.top()), Vec2::new(g.col_w, grid.height())),
-                0.0,
-                p.weekend,
-            );
-        }
-    }
+    // (No weekend shading here: Apple's week view keeps all days alike.)
     let now = Local::now().naive_local();
     let now_y = g.y_of(minute_of_day(now));
     let today_col = (0..lay.ndays).find(|&i| lay.first + Duration::days(i) == app.today);
@@ -384,7 +425,7 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
         if (0..lay.ndays).contains(&i) {
             let y0 = g.y_of(minute_of_day(s));
             let y1 = g.y_of(minute_of_day(s) + (e - s).num_minutes()).max(y0 + HOUR_H / 4.0);
-            let r = Rect::from_min_max(Pos2::new(g.col_x(i) + 1.0, y0), Pos2::new(g.col_x(i) + g.col_w - 5.0, y1));
+            let r = Rect::from_min_max(Pos2::new(g.col_x(i) + 0.5, y0 + 0.5), Pos2::new(g.col_x(i + 1) - 0.5, y1 - 0.5));
             let ghost = Event {
                 id: String::new(),
                 calendar_id: String::new(),
@@ -422,28 +463,54 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
 }
 
 
+/// A timed event block, styled after Apple Calendar: tinted fill, a solid
+/// bar on the left, the title in bold in the calendar's color (wrapping when
+/// there's room), then a clock icon with the time range, then the location.
+/// Short events show just their title.
 fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Color32, selected: bool, p: &Palette) {
+    const LINE: f32 = 14.0;
     painter.rect_filled(r, 4.0, p.event_fill(color, selected));
+    let bar_color = if selected { Color32::WHITE.gamma_multiply(0.85) } else { color };
     let bar = Rect::from_min_size(r.min, Vec2::new(3.0, r.height()));
-    painter.rect_filled(bar, egui::Rounding { nw: 4.0, sw: 4.0, ne: 0.0, se: 0.0 }, color);
+    painter.rect_filled(bar, egui::Rounding { nw: 4.0, sw: 4.0, ne: 0.0, se: 0.0 }, bar_color);
+
     let text_color = p.event_text(color, selected);
-    let max_w = r.width() - 10.0;
-    let x = r.left() + 7.0;
-    let mut y = r.top() + 3.0;
     let p_clip = painter.with_clip_rect(r.intersect(painter.clip_rect()));
-    if r.height() < 30.0 {
-        let line = format!("{}  {}", ev.title, fmt_time(ev.start.time()));
-        draw_text(ui, &p_clip, Pos2::new(x, y - 1.0), &line, theme::bold_font(11.5), text_color, max_w);
+    let x = r.left() + 7.0;
+    let repeat = ev.recurring_id.is_some() && r.width() > 60.0;
+    let title_w = r.width() - 11.0 - if repeat { 12.0 } else { 0.0 };
+    let title_font = theme::bold_font(12.0);
+
+    if r.height() < 2.0 * LINE + 4.0 {
+        // Too short for a second line: title only, centered (e.g. a 15-min stand-up).
+        draw_text_centered(ui, &p_clip, x, r, &ev.title, title_font, text_color, title_w);
+        if repeat {
+            draw_repeat_marker(&p_clip, Pos2::new(r.right() - 5.0, r.center().y), text_color);
+        }
         return;
     }
-    draw_text(ui, &p_clip, Pos2::new(x, y), &ev.title, theme::bold_font(12.0), text_color, max_w);
-    y += 16.0;
-    if !ev.location.is_empty() && r.height() > 48.0 {
-        draw_text(ui, &p_clip, Pos2::new(x, y), &ev.location, theme::font(11.5), text_color, max_w);
-        y += 15.0;
+
+    let top = r.top() + 3.0;
+    // The title may wrap (up to 3 lines) as long as the time line still fits;
+    // the location only gets whatever room is left after that.
+    let lines_fit = (((r.height() - 6.0) / LINE).floor() as usize).max(1);
+    let title_rows = lines_fit.saturating_sub(1).clamp(1, 3);
+    let title = wrapped_galley(ui, &ev.title, title_font, text_color, title_w, title_rows);
+    let title_h = title.size().y;
+    p_clip.galley(Pos2::new(x, top), title, text_color);
+    if repeat {
+        draw_repeat_marker(&p_clip, Pos2::new(r.right() - 5.0, top + LINE / 2.0), text_color);
     }
-    if y + 14.0 < r.bottom() {
-        draw_text(ui, &p_clip, Pos2::new(x, y), &fmt_time(ev.start.time()), theme::font(11.5), text_color, max_w);
+
+    let mut y = top + title_h;
+    if y + LINE <= r.bottom() {
+        draw_clock(&p_clip, Pos2::new(x + 4.5, y + LINE / 2.0), text_color);
+        let range = fmt_time_range(ev.start.time(), ev.end.time());
+        draw_text(ui, &p_clip, Pos2::new(x + 12.0, y), &range, theme::font(11.5), text_color, title_w - 12.0);
+        y += LINE;
+    }
+    if !ev.location.is_empty() && y + LINE <= r.bottom() {
+        draw_text(ui, &p_clip, Pos2::new(x, y), &ev.location, theme::font(11.5), text_color, title_w);
     }
 }
 
@@ -464,14 +531,14 @@ pub fn year(app: &mut App, ui: &mut Ui, p: &Palette) {
         )
         .shrink2(Vec2::new(14.0, 8.0));
         let month = add_months(jan, m as i32);
-        let is_cur = month.year() == app.today.year() && month.month() == app.today.month();
-        let title_rect = Rect::from_min_size(cell.min, Vec2::new(cell.width(), 26.0));
+        // Apple's year view names every month in red.
+        let title_rect = Rect::from_min_size(cell.min, Vec2::new(cell.width(), 30.0));
         ui.painter().text(
-            title_rect.left_center(),
+            title_rect.left_center() + Vec2::new(4.0, 0.0),
             Align2::LEFT_CENTER,
             month.format("%B").to_string(),
-            theme::bold_font(17.0),
-            if is_cur { RED } else { p.text },
+            theme::font(20.0),
+            RED,
         );
         if ui
             .interact(title_rect, ui.id().with(("ym", m)), Sense::click())
@@ -481,7 +548,7 @@ pub fn year(app: &mut App, ui: &mut Ui, p: &Palette) {
             app.actions.push(Action::GoTo(month, View::Month));
         }
         let grid = Rect::from_min_max(Pos2::new(cell.left(), title_rect.bottom() + 4.0), cell.max);
-        if let Some(day) = mini_month(ui, grid, month, app.today, None, p, false) {
+        if let Some(day) = mini_month(ui, grid, month, app.today, None, p, true) {
             app.actions.push(Action::GoTo(day, View::Day));
         }
     }
@@ -508,7 +575,7 @@ pub fn mini_month(
             Pos2::new(rect.left() + (i as f32 + 0.5) * cw, rect.top() + ch / 2.0),
             Align2::CENTER_CENTER,
             weekday_initial(i),
-            theme::bold_font(size * 0.85),
+            theme::font(size * 0.9),
             p.secondary,
         );
     }
@@ -537,10 +604,12 @@ pub fn mini_month(
         }
         let color = if is_today {
             Color32::WHITE
-        } else if in_month {
-            p.text
-        } else {
+        } else if !in_month {
             p.tertiary
+        } else if is_weekend(day) {
+            p.secondary
+        } else {
+            p.text
         };
         let font = if is_today || is_sel { theme::bold_font(size) } else { theme::font(size) };
         painter.text(center, Align2::CENTER_CENTER, day.day().to_string(), font, color);

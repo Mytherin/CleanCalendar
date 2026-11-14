@@ -12,9 +12,22 @@ use eframe::egui::{Pos2, Rect, Vec2};
 use crate::dates::*;
 use crate::model::{Event, Store};
 
-pub const HOUR_H: f32 = 48.0;
+/// Matches macOS Calendar's hour spacing (~53px at 100% scaling).
+pub const HOUR_H: f32 = 52.0;
+/// Shortest drawn height of a timed event, enough for one line of title.
+pub const MIN_EVENT_H: f32 = 18.0;
+
+/// `MIN_EVENT_H` in minutes of the time grid.
+fn min_event_minutes() -> i64 {
+    (MIN_EVENT_H / HOUR_H * 60.0).ceil() as i64
+}
 pub const GUTTER: f32 = 58.0;
 pub const BANNER_H: f32 = 20.0;
+/// Gridlines are 1px strokes centered on their coordinate. Events in the
+/// week/day grid fill the space between them edge to edge, like Apple
+/// Calendar: they start half a line past one gridline and stop half a line
+/// before the next, so the gridline is the only separator.
+const HALF_LINE: f32 = 0.5;
 pub const DAY_HEADER_H: f32 = 34.0;
 /// Space above the midnight line in the hour grid.
 pub const GRID_PAD: f32 = 6.0;
@@ -228,8 +241,13 @@ pub fn week(
     let mut banners = Vec::new();
     for (i, c0, c1, lane) in banner_lanes(events, first, ndays) {
         let ev = &events[i];
-        let y = rects.allday.top() + 3.0 + lane as f32 * BANNER_H;
-        let rect = Rect::from_min_max(Pos2::new(geom.col_x(c0) + 2.0, y), Pos2::new(geom.col_x(c1 + 1) - 2.0, y + BANNER_H - 2.0));
+        // Lanes are BANNER_H apart with 2px between bars, inside a lane area
+        // 6px taller than the bars: 4px above the first, 4px below the last.
+        let y = rects.allday.top() + 4.0 + lane as f32 * BANNER_H;
+        let rect = Rect::from_min_max(
+            Pos2::new(geom.col_x(c0) + HALF_LINE, y),
+            Pos2::new(geom.col_x(c1 + 1) - HALF_LINE, y + BANNER_H - 2.0),
+        );
         banners.push(Placed { ev: i, rect });
         let grip = if editable(ev) { Grip::MoveDays } else { Grip::None };
         hits.push(rect, rects.allday, event_target(ev, grip));
@@ -245,10 +263,14 @@ pub fn week(
     for d in 0..ndays {
         for seg in layout_day(events, &timed_idx, first + Duration::days(d)) {
             let ev = &events[seg.ev];
-            let x0 = geom.col_x(d) + 1.0 + seg.col as f32 * (col_w - 6.0) / seg.cols as f32;
-            let w = (col_w - 6.0) / seg.cols as f32 - 1.0;
-            let y0 = geom.y_of(seg.start_min) + 1.0;
-            let y1 = (geom.y_of(seg.end_min) - 1.0).max(y0 + 16.0);
+            // Edge to edge between the gridlines; overlapping events split
+            // the column evenly and touch each other.
+            let left = geom.col_x(d) + HALF_LINE;
+            let slot = (col_w - 2.0 * HALF_LINE) / seg.cols as f32;
+            let x0 = left + seg.col as f32 * slot;
+            let w = slot;
+            let y0 = geom.y_of(seg.start_min) + HALF_LINE;
+            let y1 = (geom.y_of(seg.end_min) - HALF_LINE).max(y0 + MIN_EVENT_H);
             let rect = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x0 + w, y1));
             timed.push(Placed { ev: seg.ev, rect });
             if editable(ev) {
@@ -290,7 +312,10 @@ pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate) -> Vec<Segmen
             let s = e.start.max(ds);
             let end = e.end.min(de);
             let start_min = (s - ds).num_minutes();
-            let end_min = ((end - ds).num_minutes()).max(start_min + 15);
+            // Short events are drawn taller than their duration so the title
+            // fits; lay them out at that drawn length, so the next event goes
+            // beside them instead of underneath their text.
+            let end_min = ((end - ds).num_minutes()).max(start_min + min_event_minutes());
             Segment { ev: i, start_min, end_min, col: 0, cols: 1, ends_here: e.end <= de }
         })
         .collect();
