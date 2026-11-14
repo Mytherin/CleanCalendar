@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
+use crate::settings::Settings;
+
 /// Apple's system palette, used for new calendars.
 pub const CALENDAR_COLORS: [[u8; 3]; 7] = [
     [0xFF, 0x3B, 0x30], // red
@@ -39,6 +41,16 @@ impl Calendar {
             Source::Google { calendar_id } => Some(calendar_id),
             Source::Local => None,
         }
+    }
+
+    /// Google's birthdays calendar (from your contacts).
+    pub fn is_birthdays(&self) -> bool {
+        self.google_id().is_some_and(|id| id.contains("#contacts@") || id.contains("#birthdays@"))
+    }
+
+    /// One of Google's public holiday calendars.
+    pub fn is_holidays(&self) -> bool {
+        self.google_id().is_some_and(|id| id.contains("#holiday@"))
     }
 }
 
@@ -177,6 +189,8 @@ pub struct Store {
     /// Keyed by Google calendar id.
     #[serde(default)]
     pub sync_state: HashMap<String, SyncState>,
+    #[serde(default)]
+    pub settings: Settings,
     /// Where this store is saved; `None` for one that isn't (tests).
     #[serde(skip)]
     pub(crate) db: Option<crate::db::Db>,
@@ -212,6 +226,7 @@ impl Store {
             google: GoogleSettings::default(),
             pending_deletes: Vec::new(),
             sync_state: HashMap::new(),
+            settings: Settings::default(),
             db: None,
         }
     }
@@ -248,11 +263,24 @@ impl Store {
         self.events.iter().filter(|e| e.pending).count() + self.pending_deletes.len()
     }
 
+    /// Whether a calendar is listed at all (in the sidebar, the editor's
+    /// picker, the views): not if its account is switched off, or it is a
+    /// birthdays/holidays calendar the user chose not to show.
+    pub fn is_listed(&self, c: &Calendar) -> bool {
+        let s = &self.settings;
+        match c.source {
+            Source::Local => true,
+            Source::Google { .. } => {
+                s.google_enabled && (s.show_birthdays || !c.is_birthdays()) && (s.show_holidays || !c.is_holidays())
+            }
+        }
+    }
+
     pub fn is_visible(&self, calendar_id: &str) -> bool {
-        self.calendar(calendar_id).is_some_and(|c| c.visible)
+        self.calendar(calendar_id).is_some_and(|c| c.visible && self.is_listed(c))
     }
 
     pub fn writable_calendars(&self) -> impl Iterator<Item = &Calendar> {
-        self.calendars.iter().filter(|c| !c.read_only)
+        self.calendars.iter().filter(|c| !c.read_only && self.is_listed(c))
     }
 }

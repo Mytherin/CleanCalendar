@@ -78,8 +78,8 @@ impl Sim {
         let lane_h = layout::allday_height(&self.events, self.first, self.ndays);
         let allday = Rect::from_min_size(Pos2::new(0.0, header.bottom()), Vec2::new(WIDTH, lane_h));
         assert!(allday.bottom() <= GRID_TOP, "all-day lane overlaps the grid in this test setup");
-        let grid = Rect::from_min_size(Pos2::new(0.0, GRID_TOP), Vec2::new(WIDTH, layout::grid_height()));
-        let rects = WeekRects { header, allday, grid, grid_clip: self.grid_clip.unwrap_or(grid) };
+        let grid = Rect::from_min_size(Pos2::new(0.0, GRID_TOP), Vec2::new(WIDTH, layout::grid_height(layout::HOUR_H)));
+        let rects = WeekRects { header, allday, grid, grid_clip: self.grid_clip.unwrap_or(grid), hour_h: layout::HOUR_H };
         layout::week(&self.events, self.first, self.ndays, rects, &|e| !self.read_only.contains(&e.id))
     }
 

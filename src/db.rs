@@ -24,6 +24,10 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, Row, Transaction};
 
 use crate::model::{Calendar, Event, GoogleSettings, PendingDelete, Source, Store, SyncState};
+use crate::settings::Settings;
+
+/// The `main.settings` row holding the app's preferences (as JSON).
+const PREFS_KEY: &str = "app.settings";
 
 const DATA_VERSION: i32 = 1;
 const CACHE_VERSION: i32 = 1;
@@ -86,6 +90,7 @@ struct Saved {
     google: GoogleSettings,
     pending_deletes: Vec<PendingDelete>,
     sync_state: HashMap<String, SyncState>,
+    settings: Settings,
     events: HashMap<String, (Place, Event)>,
 }
 
@@ -227,6 +232,7 @@ struct DataPart {
     local: Vec<Event>,
     outbox: Vec<Event>,
     pending_deletes: Vec<PendingDelete>,
+    settings: Settings,
 }
 
 impl DataPart {
@@ -237,6 +243,7 @@ impl DataPart {
             && self.outbox.is_empty()
             && self.pending_deletes.is_empty()
             && self.google == GoogleSettings::default()
+            && self.settings == Settings::default()
     }
 }
 
@@ -311,6 +318,15 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
         refresh_token: settings.remove("google.refresh_token"),
         account_email: settings.remove("google.account_email"),
     };
+    // Unreadable preferences (e.g. hand-edited) fall back to the defaults
+    // rather than failing the whole load.
+    let prefs = match settings.remove(PREFS_KEY) {
+        Some(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("Ignoring unreadable settings ({e}); using defaults");
+            Settings::default()
+        }),
+        None => Settings::default(),
+    };
 
     let calendars = conn
         .prepare("SELECT id, name, color, visible, google_id, read_only FROM main.calendars ORDER BY position")?
@@ -342,6 +358,7 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
         local: load_events(conn, Place::Local)?,
         outbox: load_events(conn, Place::Outbox)?,
         pending_deletes,
+        settings: prefs,
     })
 }
 
@@ -476,6 +493,7 @@ impl Db {
         self.saved.google = data.google.clone();
         self.saved.pending_deletes = data.pending_deletes.clone();
         self.saved.sync_state = cache.sync_state.clone();
+        self.saved.settings = data.settings.clone();
 
         Store {
             calendars: data.calendars,
@@ -483,6 +501,7 @@ impl Db {
             google: data.google,
             pending_deletes: data.pending_deletes,
             sync_state: cache.sync_state,
+            settings: data.settings,
             db: Some(self),
         }
     }
@@ -535,8 +554,15 @@ impl Db {
         let google_changed = s.google != self.saved.google;
         let deletes_changed = s.pending_deletes != self.saved.pending_deletes;
         let sync_changed = s.sync_state != self.saved.sync_state;
+        let settings_changed = s.settings != self.saved.settings;
 
-        if upserts.is_empty() && deletes.is_empty() && !calendars_changed && !google_changed && !deletes_changed && !sync_changed
+        if upserts.is_empty()
+            && deletes.is_empty()
+            && !calendars_changed
+            && !google_changed
+            && !deletes_changed
+            && !sync_changed
+            && !settings_changed
         {
             return Ok(());
         }
@@ -562,6 +588,12 @@ impl Db {
                     tx.execute("INSERT INTO main.settings (key, value) VALUES (?1, ?2)", params![key, value])?;
                 }
             }
+        }
+        if settings_changed {
+            tx.execute(
+                "INSERT OR REPLACE INTO main.settings (key, value) VALUES (?1, ?2)",
+                params![PREFS_KEY, serde_json::to_string(&s.settings)?],
+            )?;
         }
         if calendars_changed {
             tx.execute("DELETE FROM main.calendars", [])?;
@@ -612,6 +644,9 @@ impl Db {
         }
         if sync_changed {
             self.saved.sync_state = s.sync_state.clone();
+        }
+        if settings_changed {
+            self.saved.settings = s.settings.clone();
         }
         Ok(())
     }
@@ -704,6 +739,9 @@ mod tests {
             "me@example.com".into(),
             SyncState { token: Some("tok".into()), full_sync_on: Some(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()) },
         );
+        store.settings.days_per_week = 5;
+        store.settings.week_start = Some(6);
+        store.settings.google_description = "Work".into();
         store.save();
         store
     }
@@ -734,12 +772,13 @@ mod tests {
     fn everything_round_trips() {
         let dir = TempDir::new();
         let store = populated(&dir);
-        let (calendars, events, google, deletes, sync) = (
+        let (calendars, events, google, deletes, sync, settings) = (
             store.calendars.clone(),
             store.events.clone(),
             store.google.clone(),
             store.pending_deletes.clone(),
             store.sync_state.clone(),
+            store.settings.clone(),
         );
         drop(store);
 
@@ -749,6 +788,18 @@ mod tests {
         assert_eq!(again.google, google);
         assert_eq!(again.pending_deletes, deletes);
         assert_eq!(again.sync_state, sync);
+        assert_eq!(again.settings, settings);
+        assert_eq!(again.settings.days_per_week, 5);
+    }
+
+    #[test]
+    fn signing_out_keeps_the_settings() {
+        let dir = TempDir::new();
+        let mut store = populated(&dir);
+        store.google = GoogleSettings::default();
+        store.save();
+        drop(store);
+        assert_eq!(open(&dir.paths()).settings.google_description, "Work");
     }
 
     #[test]

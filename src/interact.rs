@@ -200,7 +200,7 @@ fn double_click(target: &Target, pos: Pos2, grid: Option<TimeGrid>, out: &mut Ve
             if let Some(g) = grid {
                 let t = g.time_at(pos);
                 let start = midnight(t.date()) + Duration::minutes(minute_of_day(t) / 30 * 30);
-                out.push(Action::New { start, end: start + Duration::hours(1), all_day: false });
+                out.push(Action::New { start, end: start + default_event_len(), all_day: false });
             }
         }
         Target::AllDayLane => {
@@ -211,7 +211,7 @@ fn double_click(target: &Target, pos: Pos2, grid: Option<TimeGrid>, out: &mut Ve
         }
         Target::MonthCell(day) | Target::MonthDayNumber(day) => {
             let start = midnight(*day) + Duration::hours(9);
-            out.push(Action::New { start, end: start + Duration::hours(1), all_day: false });
+            out.push(Action::New { start, end: start + default_event_len(), all_day: false });
         }
         Target::DayHeader(day) => out.push(Action::GoTo(*day, View::Day)),
         Target::More(day) => out.push(Action::GoTo(*day, View::Day)),
@@ -295,7 +295,7 @@ fn finish_drag(drag: Drag, out: &mut Vec<Action>) {
             let (mut s, mut e) = if current < anchor { (current, anchor) } else { (anchor, current) };
             if e - s < Duration::minutes(15) {
                 s = anchor;
-                e = anchor + Duration::hours(1);
+                e = anchor + default_event_len();
             }
             out.push(Action::New { start: s, end: e, all_day: false });
         }
