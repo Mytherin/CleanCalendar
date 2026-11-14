@@ -769,14 +769,15 @@ fn event_to_json(ev: &Event) -> Value {
         (None, Some(_)) => recurrence::local_zone_name(),
         (None, None) => None,
     };
+    // Updates are PATCHes, which merge into Google's `start`/`end`: the
+    // fields that don't apply are sent as null so they're cleared (otherwise
+    // turning a timed event into an all-day one leaves its `dateTime`, and
+    // Google rejects the mix).
     let when = |t: NaiveDateTime| {
         if ev.all_day {
-            json!({ "date": t.date().format("%Y-%m-%d").to_string() })
+            json!({ "date": t.date().format("%Y-%m-%d").to_string(), "dateTime": null, "timeZone": null })
         } else {
-            match &zone {
-                Some(z) => json!({ "dateTime": to_rfc3339(t), "timeZone": z }),
-                None => json!({ "dateTime": to_rfc3339(t) }),
-            }
+            json!({ "dateTime": to_rfc3339(t), "timeZone": zone, "date": null })
         }
     };
     let mut body = json!({
@@ -921,7 +922,8 @@ mod tests {
         let plain = json!({"id": "p", "start": {"dateTime": "2026-11-14T18:00:00Z"}, "end": {"dateTime": "2026-11-14T19:00:00Z"}});
         let plain = event_from_json("c", &plain).unwrap();
         assert!(plain.time_zone.is_none() && plain.recurrence.is_none());
-        assert!(event_to_json(&plain)["start"].get("timeZone").is_none());
+        let start = &event_to_json(&plain)["start"];
+        assert!(start["timeZone"].is_null() && start["date"].is_null(), "cleared, for PATCH: {start}");
         assert!(event_to_json(&plain).get("recurrence").is_none());
     }
 
