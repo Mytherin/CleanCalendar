@@ -206,7 +206,7 @@ pub fn zone_names() -> impl Iterator<Item = &'static str> {
 /// Wall time `t` in zone `a`, as wall time in zone `b`. A time that doesn't
 /// exist in `a` (skipped by a daylight-saving change) is moved forward an
 /// hour first.
-fn convert<A: TimeZone, B: TimeZone>(t: NaiveDateTime, a: &A, b: &B) -> NaiveDateTime {
+pub fn convert<A: TimeZone, B: TimeZone>(t: NaiveDateTime, a: &A, b: &B) -> NaiveDateTime {
     let at = |t| a.from_local_datetime(&t).earliest();
     match at(t).or_else(|| at(t + Duration::hours(1))) {
         Some(dt) => dt.with_timezone(b).naive_local(),
