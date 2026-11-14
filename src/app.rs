@@ -17,7 +17,7 @@ use crate::recurrence;
 use crate::settings::WeekScroll;
 use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, RED};
-use crate::interact::Pointer;
+use crate::interact::{Pointer, WheelPager};
 use crate::views;
 
 mod search_ui;
@@ -62,6 +62,8 @@ pub enum Action {
     Committed(String),
     /// Open the right-click menu for what's at `pos`.
     ContextMenu { at: MenuAt, pos: egui::Pos2 },
+    /// Page the view forward (or back, if negative), like the ‹ › buttons.
+    Step(i32),
 }
 
 pub struct App {
@@ -71,6 +73,8 @@ pub struct App {
     pub today: NaiveDate,
     pub selected: Option<String>,
     pub pointer: Pointer,
+    /// Pages the month view on mouse-wheel and trackpad scrolling.
+    pub wheel: WheelPager,
     /// Scroll the day/week grid to this hour on the next frame.
     pub scroll_to: Option<f32>,
     /// The week view's first day while scrolling by days (see
@@ -138,6 +142,7 @@ impl App {
             today,
             selected: None,
             pointer: Pointer::default(),
+            wheel: WheelPager::default(),
             week_first: None,
             month_anchor: None,
             actions: Vec::new(),
@@ -815,6 +820,7 @@ impl App {
                     self.menu_items = self.menu_items_for(&at);
                     self.menu = (!self.menu_items.is_empty()).then(|| ContextMenu::new(at, pos));
                 }
+                Action::Step(n) => self.step(n),
             }
         }
     }

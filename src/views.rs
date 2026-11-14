@@ -16,7 +16,7 @@ use eframe::egui::{
 
 use crate::app::{Action, App, View};
 use crate::dates::*;
-use crate::interact::{Cursor, Input};
+use crate::interact::{Cursor, Input, Wheel};
 use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GRID_PAD, GUTTER};
 use crate::model::Event;
 use crate::recurrence;
@@ -342,6 +342,41 @@ fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
     app.actions.extend(actions);
 }
 
+/// Scrolling over `rect` (mouse wheel or trackpad) pages the view by whole
+/// steps, as the macOS month view does.
+fn page_on_wheel(app: &mut App, ui: &Ui, rect: Rect) {
+    let ctx = ui.ctx();
+    let layer = ui.layer_id();
+    let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|pos| {
+        rect.contains(pos) && ctx.layer_id_at(pos).map_or(true, |l| l == layer)
+    });
+    // Not mid-drag, and not while a menu is open.
+    if !over || app.pointer.is_active() || app.menu.is_some() {
+        return;
+    }
+    let (events, time) = ctx.input(|i| (i.events.clone(), i.time));
+    let mut pages = 0;
+    for event in events {
+        let egui::Event::MouseWheel { unit, delta, modifiers } = event else { continue };
+        // Ctrl+wheel zooms.
+        if modifiers.ctrl || modifiers.command {
+            continue;
+        }
+        // Shift+wheel arrives as horizontal; either axis pages.
+        let d = if delta.y != 0.0 { delta.y } else { delta.x };
+        let wheel = match unit {
+            egui::MouseWheelUnit::Line => Wheel::Lines(d),
+            egui::MouseWheelUnit::Point => Wheel::Points(d),
+            egui::MouseWheelUnit::Page => Wheel::Pages(d),
+        };
+        pages += app.wheel.scroll(wheel, time);
+    }
+    if pages != 0 {
+        app.actions.push(Action::Step(pages));
+        ctx.request_repaint();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Month
 
@@ -364,6 +399,7 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     record_rects(app, &events, lay.banners.iter().map(|b| (b.ev, b.rect)).chain(lay.rows.iter().map(|r| (r.ev, r.rect))));
 
     drive_pointer(app, ui, &lay.hits);
+    page_on_wheel(app, ui, rect);
 
     let painter = ui.painter_at(rect);
     for i in 0..7 {
