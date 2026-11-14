@@ -104,8 +104,9 @@ impl Remote for Client {
         self.get_event(&cal.id, remote_id)
     }
 
-    fn delete(&mut self, cal: &CalRef, remote_id: &str, etag: Option<&str>) -> Result<()> {
-        self.delete_event(&cal.id, remote_id, etag)
+    fn delete(&mut self, cal: &CalRef, remote_id: &str, etag: Option<&str>) -> Result<Option<String>> {
+        // Google events are each their own resource.
+        self.delete_event(&cal.id, remote_id, etag).map(|()| None)
     }
 }
 
