@@ -13,6 +13,7 @@ use eframe::egui::{self, Align, Align2, Color32, Key, Layout, Order, Pos2, Rect,
 use crate::dates::*;
 use crate::model::{Event, Store};
 use crate::recurrence::{self, Freq, Recurrence, RepeatEnd};
+use crate::remote::GOOGLE;
 use crate::theme::{self, Palette, RED};
 
 pub const POPOVER_W: f32 = 320.0;
@@ -485,11 +486,15 @@ fn calendar_menu(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette)
     let width = (PAD + 36.0 + text_w + PAD + 6.0).max(180.0);
     ui.set_width(width);
 
-    let google_header = store.google.account_email.clone().unwrap_or_else(|| "Google".into());
-    let groups = [(false, "On My Computer".to_owned()), (true, google_header)];
+    // Local calendars, then each account's.
+    let mut groups: Vec<(Option<String>, String)> = vec![
+        (None, "On My Computer".to_owned()),
+        (Some(GOOGLE.to_owned()), store.google.account_email.clone().unwrap_or_else(|| "Google".into())),
+    ];
+    groups.extend(store.caldav.iter().map(|a| (Some(a.id.clone()), a.label.clone())));
     let mut first = true;
-    for (google, header) in groups {
-        let cals: Vec<_> = store.calendars.iter().filter(|c| !c.read_only && c.google_id().is_some() == google).collect();
+    for (account, header) in groups {
+        let cals: Vec<_> = store.calendars.iter().filter(|c| !c.read_only && c.account() == account.as_deref()).collect();
         if cals.is_empty() {
             continue;
         }

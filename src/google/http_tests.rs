@@ -256,7 +256,7 @@ fn expired_sync_token_falls_back_to_a_full_sync() {
     });
     let tokens = HashMap::from([("primary".to_owned(), "old".to_owned())]);
     let from = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-    let (cals, changes) = sync_all(&mut server.client(), from, from + chrono::Duration::days(400), &tokens).unwrap();
+    let (cals, changes) = sync_all(&mut server.client(), GOOGLE, from, from + chrono::Duration::days(400), &tokens).unwrap();
 
     assert_eq!(cals.len(), 1);
     assert_eq!(changes.len(), 1);
@@ -276,7 +276,7 @@ fn other_sync_errors_fail_the_whole_sync() {
         _ => google_error(503, "Backend Error"),
     });
     let from = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-    let err = sync_all(&mut server.client(), from, from, &HashMap::new()).err().expect("should fail");
+    let err = sync_all(&mut server.client(), GOOGLE, from, from, &HashMap::new()).err().expect("should fail");
     assert_eq!(classify(&err), Failure::Retry);
     assert!(err.to_string().contains("Backend Error"));
 }
@@ -384,18 +384,18 @@ fn worker_reports_save_results_with_revision_and_failure_kind() {
         (_, "PATCH") => google_error(404, "Not Found"),
         _ => (405, Value::Null),
     });
-    let mut client = Some(server.client());
-    let save = |ev: Event| Cmd::Save { creds: creds(), google_calendar_id: "primary".into(), event: ev };
+    let mut conns = test_conns(&server.endpoints());
+    let save = |ev: Event| Cmd::Save { login: Login::Google(creds()), calendar: CalRef::google("primary"), event: ev };
 
-    match run(&mut client, &server.endpoints(), &no_browser, save(local_event(None))) {
-        Msg::Saved { local_id, rev, remote_id, google_calendar_id, .. } => {
+    match run(&mut conns, save(local_event(None))) {
+        Msg::Saved { local_id, rev, remote_id, calendar, .. } => {
             assert_eq!((local_id.as_str(), rev, remote_id.as_str()), ("local:1", 3, "new1"));
-            assert_eq!(google_calendar_id, "primary");
+            assert_eq!(calendar, CalRef::google("primary"));
         }
         _ => panic!("expected Saved"),
     }
     // Updating an event someone deleted is a conflict, not a failure.
-    match run(&mut client, &server.endpoints(), &no_browser, save(local_event(Some("deleted-elsewhere")))) {
+    match run(&mut conns, save(local_event(Some("deleted-elsewhere")))) {
         Msg::SaveConflict { local_id, server } => {
             assert_eq!(local_id, "local:1");
             assert!(server.is_none());
@@ -441,13 +441,13 @@ fn update_refused_as_stale_returns_googles_current_copy() {
         (p, "GET") if p.ends_with("/e2") => (200, json!({"id": "e2", "status": "cancelled"})),
         _ => (405, Value::Null),
     });
-    let mut client = Some(server.client());
+    let mut conns = test_conns(&server.endpoints());
     let save = |rid: &str| {
         let mut ev = local_event(Some(rid));
         ev.etag = Some("\"v1\"".into());
-        Cmd::Save { creds: creds(), google_calendar_id: "primary".into(), event: ev }
+        Cmd::Save { login: Login::Google(creds()), calendar: CalRef::google("primary"), event: ev }
     };
-    match run(&mut client, &server.endpoints(), &no_browser, save("e1")) {
+    match run(&mut conns, save("e1")) {
         Msg::SaveConflict { server: Some(ev), .. } => {
             assert_eq!(ev.title, "Renamed on phone");
             assert_eq!(ev.etag.as_deref(), Some("\"v9\""));
@@ -455,7 +455,7 @@ fn update_refused_as_stale_returns_googles_current_copy() {
         _ => panic!("expected a conflict with their copy"),
     }
     // Deleted events can still be fetched, marked cancelled: that's "gone".
-    match run(&mut client, &server.endpoints(), &no_browser, save("e2")) {
+    match run(&mut conns, save("e2")) {
         Msg::SaveConflict { server: None, .. } => {}
         _ => panic!("expected a conflict without a copy"),
     }
@@ -469,14 +469,14 @@ fn delete_refused_as_stale_returns_googles_current_copy() {
         (_, "GET") => (200, item("e1", "Changed on phone")),
         _ => (405, Value::Null),
     });
-    let mut client = Some(server.client());
+    let mut conns = test_conns(&server.endpoints());
     let cmd = Cmd::Delete {
-        creds: creds(),
-        google_calendar_id: "primary".into(),
+        login: Login::Google(creds()),
+        calendar: CalRef::google("primary"),
         remote_id: "e1".into(),
         etag: Some("\"v1\"".into()),
     };
-    match run(&mut client, &server.endpoints(), &no_browser, cmd) {
+    match run(&mut conns, cmd) {
         Msg::DeleteConflict { remote_id, server: Some(ev), .. } => {
             assert_eq!(remote_id, "e1");
             assert_eq!(ev.title, "Changed on phone");
@@ -520,9 +520,9 @@ fn worker_turns_rejections_into_rejected_failures() {
         "/token" => token_ok(),
         _ => google_error(403, "You need to have writer access to this calendar."),
     });
-    let mut client = Some(server.client());
-    let cmd = Cmd::Save { creds: creds(), google_calendar_id: "primary".into(), event: local_event(Some("e1")) };
-    match run(&mut client, &server.endpoints(), &no_browser, cmd) {
+    let mut conns = test_conns(&server.endpoints());
+    let cmd = Cmd::Save { login: Login::Google(creds()), calendar: CalRef::google("primary"), event: local_event(Some("e1")) };
+    match run(&mut conns, cmd) {
         Msg::SaveFailed { kind, error, .. } => {
             assert_eq!(kind, Failure::Rejected);
             assert!(error.contains("writer access"), "{error}");

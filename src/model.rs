@@ -6,6 +6,8 @@ use chrono::{Duration, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use crate::recurrence::{self, Recurrence};
+use crate::remote::{CalRef, Login, GOOGLE};
+use crate::{caldav, google};
 
 /// Apple's system palette, used for new calendars.
 pub const CALENDAR_COLORS: [[u8; 3]; 7] = [
@@ -22,6 +24,8 @@ pub const CALENDAR_COLORS: [[u8; 3]; 7] = [
 pub enum Source {
     Local,
     Google { calendar_id: String },
+    /// A calendar collection on a CalDAV server (iCloud and others).
+    CalDav { account: String, url: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -36,11 +40,26 @@ pub struct Calendar {
 }
 
 impl Calendar {
-    pub fn google_id(&self) -> Option<&str> {
+    /// Where the calendar lives, if it's synced with a service.
+    pub fn remote(&self) -> Option<CalRef> {
         match &self.source {
-            Source::Google { calendar_id } => Some(calendar_id),
             Source::Local => None,
+            Source::Google { calendar_id } => Some(CalRef::google(calendar_id)),
+            Source::CalDav { account, url } => Some(CalRef::new(account, url)),
         }
+    }
+
+    /// The account it's synced with.
+    pub fn account(&self) -> Option<&str> {
+        match &self.source {
+            Source::Local => None,
+            Source::Google { .. } => Some(GOOGLE),
+            Source::CalDav { account, .. } => Some(account),
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        !matches!(self.source, Source::Local)
     }
 }
 
@@ -177,20 +196,64 @@ impl GoogleSettings {
     }
 }
 
+/// A CalDAV account (iCloud, Fastmail, Nextcloud, …).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CalDavAccount {
+    /// The account key: "caldav-<hex>".
+    pub id: String,
+    /// What the sidebar calls it ("iCloud").
+    pub label: String,
+    /// Where discovery starts, e.g. "https://caldav.icloud.com/".
+    pub server: String,
+    pub username: String,
+    /// Kept in the OS credential store, not with the rest of the data.
+    #[serde(skip)]
+    pub password: Option<String>,
+}
+
+impl CalDavAccount {
+    pub fn new_id() -> String {
+        format!("caldav-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
+    }
+
+    pub fn login(&self) -> Option<caldav::Login> {
+        Some(caldav::Login {
+            server: self.server.clone(),
+            username: self.username.clone(),
+            password: self.password.clone()?,
+        })
+    }
+}
+
 /// A remote deletion that hasn't been confirmed yet.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "PendingDeleteJson")]
 pub struct PendingDelete {
-    pub google_calendar_id: String,
+    pub calendar: CalRef,
     pub remote_id: String,
     /// Delete only if the server still has this version (`None`: always).
-    #[serde(default)]
     pub etag: Option<String>,
+}
+
+/// How the old JSON store wrote a [`PendingDelete`] (Google only).
+#[derive(Deserialize)]
+struct PendingDeleteJson {
+    google_calendar_id: String,
+    remote_id: String,
+    #[serde(default)]
+    etag: Option<String>,
+}
+
+impl From<PendingDeleteJson> for PendingDelete {
+    fn from(j: PendingDeleteJson) -> Self {
+        PendingDelete { calendar: CalRef::google(&j.google_calendar_id), remote_id: j.remote_id, etag: j.etag }
+    }
 }
 
 /// Per-calendar incremental sync bookmark.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncState {
-    /// Google's `nextSyncToken`; `None` forces a full sync.
+    /// The service's sync token; `None` forces a full sync.
     pub token: Option<String>,
     /// When the last full sync happened.
     pub full_sync_on: Option<NaiveDate>,
@@ -205,8 +268,10 @@ pub struct Store {
     #[serde(default)]
     pub google: GoogleSettings,
     #[serde(default)]
+    pub caldav: Vec<CalDavAccount>,
+    #[serde(default)]
     pub pending_deletes: Vec<PendingDelete>,
-    /// Keyed by Google calendar id.
+    /// Keyed by the app's calendar id.
     #[serde(default)]
     pub sync_state: HashMap<String, SyncState>,
     /// Where this store is saved; `None` for one that isn't (tests).
@@ -242,6 +307,7 @@ impl Store {
             ],
             events: Vec::new(),
             google: GoogleSettings::default(),
+            caldav: Vec::new(),
             pending_deletes: Vec::new(),
             sync_state: HashMap::new(),
             db: None,
@@ -280,12 +346,43 @@ impl Store {
         recurrence::occurrence(self.event(series)?, id)
     }
 
-    /// The Google calendar id an event lives on, if any.
-    pub fn google_calendar_of(&self, ev: &Event) -> Option<String> {
-        self.calendar(&ev.calendar_id).and_then(|c| c.google_id()).map(str::to_owned)
+    /// The remote calendar an event lives on, if any.
+    pub fn remote_of(&self, ev: &Event) -> Option<CalRef> {
+        self.calendar(&ev.calendar_id).and_then(Calendar::remote)
     }
 
-    /// Number of local changes not yet confirmed by Google.
+    /// The signed-in accounts, Google first.
+    pub fn accounts(&self) -> Vec<String> {
+        let google = self.google.is_connected().then(|| GOOGLE.to_owned());
+        google.into_iter().chain(self.caldav.iter().filter(|a| a.password.is_some()).map(|a| a.id.clone())).collect()
+    }
+
+    pub fn caldav_account(&self, id: &str) -> Option<&CalDavAccount> {
+        self.caldav.iter().find(|a| a.id == id)
+    }
+
+    /// How to sign in to an account; `None` when signed out.
+    pub fn login(&self, account: &str) -> Option<Login> {
+        if account == GOOGLE {
+            let g = &self.google;
+            return Some(Login::Google(google::Creds {
+                client_id: g.client_id.clone(),
+                client_secret: g.client_secret.clone(),
+                refresh_token: g.refresh_token.clone()?,
+            }));
+        }
+        self.caldav_account(account)?.login().map(Login::CalDav)
+    }
+
+    /// What to call an account in messages and the sidebar.
+    pub fn account_name(&self, account: &str) -> String {
+        if account == GOOGLE {
+            return "Google".into();
+        }
+        self.caldav_account(account).map_or_else(|| "the server".into(), |a| a.label.clone())
+    }
+
+    /// Number of local changes not yet confirmed by a service.
     pub fn unsynced_count(&self) -> usize {
         self.events.iter().filter(|e| e.pending).count() + self.pending_deletes.len()
     }
@@ -296,5 +393,72 @@ impl Store {
 
     pub fn writable_calendars(&self) -> impl Iterator<Item = &Calendar> {
         self.calendars.iter().filter(|c| !c.read_only)
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    /// A one-hour timed event at 09:00 on 2026-11-14.
+    pub fn event(id: &str, calendar_id: &str, title: &str) -> Event {
+        let start = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap().and_hms_opt(9, 0, 0).unwrap();
+        Event {
+            id: id.into(),
+            calendar_id: calendar_id.into(),
+            title: title.into(),
+            start,
+            end: start + Duration::hours(1),
+            all_day: false,
+            location: String::new(),
+            notes: String::new(),
+            remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
+            etag: None,
+            base: None,
+            recurrence: None,
+            time_zone: None,
+        }
+    }
+
+    #[test]
+    fn calendars_know_their_account() {
+        let cal = |source| Calendar { id: "x".into(), name: "x".into(), color: [0; 3], visible: true, source, read_only: false };
+        assert_eq!(cal(Source::Local).remote(), None);
+        assert_eq!(cal(Source::Google { calendar_id: "me@x".into() }).remote(), Some(CalRef::google("me@x")));
+        let dav = cal(Source::CalDav { account: "caldav-1".into(), url: "https://d/cal/".into() });
+        assert_eq!(dav.remote(), Some(CalRef::new("caldav-1", "https://d/cal/")));
+        assert_eq!(dav.account(), Some("caldav-1"));
+    }
+
+    #[test]
+    fn signed_out_accounts_have_no_login() {
+        let mut store = Store::with_defaults();
+        assert!(store.accounts().is_empty());
+        store.caldav.push(CalDavAccount {
+            id: "caldav-1".into(),
+            label: "iCloud".into(),
+            server: "https://caldav.icloud.com/".into(),
+            username: "me@icloud.com".into(),
+            password: None,
+        });
+        assert!(store.login("caldav-1").is_none(), "no password, no login");
+        store.caldav[0].password = Some("abcd-efgh-ijkl-mnop".into());
+        store.google.refresh_token = Some("r".into());
+        assert_eq!(store.accounts(), ["google", "caldav-1"]);
+        assert!(matches!(store.login("caldav-1"), Some(Login::CalDav(l)) if l.username == "me@icloud.com"));
+        assert!(matches!(store.login("google"), Some(Login::Google(_))));
+        assert_eq!(store.account_name("caldav-1"), "iCloud");
+        assert_eq!(store.account_name("google"), "Google");
+    }
+
+    #[test]
+    fn old_pending_deletes_are_google_ones() {
+        let d: PendingDelete =
+            serde_json::from_str(r#"{"google_calendar_id": "me@x", "remote_id": "e1", "etag": "\"v1\""}"#).unwrap();
+        assert_eq!(d.calendar, CalRef::google("me@x"));
+        assert_eq!((d.remote_id.as_str(), d.etag.as_deref()), ("e1", Some("\"v1\"")));
     }
 }

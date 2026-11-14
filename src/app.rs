@@ -1,4 +1,4 @@
-//! Application state, toolbar, sidebar, dialogs, and Google sync glue.
+//! Application state, toolbar, sidebar, dialogs, and sync glue.
 
 use std::collections::HashMap;
 use std::time::{Duration as StdDuration, Instant};
@@ -9,8 +9,10 @@ use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, S
 use crate::app_icon::AppIcon;
 use crate::editor::{self, Editor, Outcome, Placement, Scope};
 use crate::dates::*;
-use crate::google::{self, Cmd, Worker};
-use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
+use crate::caldav;
+use crate::google;
+use crate::model::{CalDavAccount, Calendar, Event, Source, Store, CALENDAR_COLORS};
+use crate::remote::{Cmd, Worker, GOOGLE};
 use crate::recurrence;
 use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, ACCENT, RED};
@@ -18,7 +20,7 @@ use crate::interact::Pointer;
 use crate::layout;
 use crate::views;
 
-/// How often to pull changes from Google.
+/// How often to pull changes from the servers.
 const AUTO_SYNC: StdDuration = StdDuration::from_secs(5 * 60);
 /// How often to retry while local changes are waiting to upload.
 const RETRY_SYNC: StdDuration = StdDuration::from_secs(60);
@@ -79,8 +81,21 @@ pub struct App {
     engine: SyncEngine,
     last_sync: Option<Instant>,
     status: Option<(String, bool)>,
-    show_google: bool,
+    show_accounts: bool,
+    caldav_form: CalDavForm,
     icon: AppIcon,
+}
+
+/// The "add a CalDAV account" form in the Accounts window.
+#[derive(Default)]
+struct CalDavForm {
+    /// Another CalDAV server rather than iCloud.
+    other: bool,
+    server: String,
+    username: String,
+    password: String,
+    /// The account being signed in, until it's added (or fails).
+    pending: Option<String>,
 }
 
 impl App {
@@ -105,7 +120,8 @@ impl App {
             engine: SyncEngine::default(),
             last_sync: None,
             status: None,
-            show_google: false,
+            show_accounts: false,
+            caldav_form: CalDavForm::default(),
             icon: AppIcon::new(&cc.egui_ctx),
         };
         SyncEngine::prepare(&mut app.store);
@@ -113,7 +129,7 @@ impl App {
         app
     }
 
-    // ---- Google glue (the logic lives in sync.rs) -------------------------
+    // ---- Sync glue (the logic lives in sync.rs) ---------------------------
 
     fn sync(&mut self) {
         if self.engine.sync(&self.store, self.today) {
@@ -146,7 +162,7 @@ impl App {
             match notice {
                 Notice::Status { text, error } => {
                     if error {
-                        eprintln!("Google: {text}");
+                        eprintln!("Sync: {text}");
                     }
                     self.status = Some((text, error));
                 }
@@ -426,7 +442,8 @@ impl App {
             return;
         }
         // A series stored here (shown as occurrences, plus any that were
-        // changed on their own), or one Google sent as separate occurrences.
+        // changed on their own), or one a service sent as separate
+        // occurrences (their `recurring_id` is the series' remote id).
         let local_series = match recurrence::split_occurrence(id) {
             Some((series, _)) => Some(series.to_owned()),
             None => ev.recurring_id.clone().filter(|r| self.store.event(r).is_some_and(|s| s.recurrence.is_some())),
@@ -435,20 +452,32 @@ impl App {
             (Some(s), _) | (None, Some(s)) => s.clone(),
             (None, None) => return self.delete_event(id),
         };
-        let members: Vec<Event> = self
-            .store
-            .events
-            .iter()
-            .filter(|e| e.id == series_id || (e.recurring_id.as_deref() == Some(&series_id) && e.calendar_id == ev.calendar_id))
-            .cloned()
-            .collect();
+        // Its remote id, once uploaded: occurrences the service sent carry it.
+        let series_remote = match &local_series {
+            Some(s) => self.store.event(s).and_then(|e| e.remote_id.clone()),
+            None => Some(series_id.clone()),
+        };
+        let in_series = |e: &Event| {
+            e.id == series_id
+                || (e.calendar_id == ev.calendar_id
+                    && (e.recurring_id.as_deref() == Some(&series_id)
+                        || (series_remote.is_some()
+                            && (e.remote_id == series_remote || e.recurring_id == series_remote))))
+        };
+        let members: Vec<Event> = self.store.events.iter().filter(|e| in_series(e)).cloned().collect();
         self.store.events.retain(|e| !members.iter().any(|m| m.id == e.id));
-        if local_series.is_some() {
-            for m in &members {
-                self.engine.event_deleted(&mut self.store, m, true);
+        match (&local_series, self.store.remote_of(&ev)) {
+            (Some(_), _) => {
+                for m in &members {
+                    // Occurrences sent by the service go with their series.
+                    if m.recurring_id.is_some() && m.recurring_id == series_remote {
+                        continue;
+                    }
+                    self.engine.event_deleted(&mut self.store, m, true);
+                }
             }
-        } else if let Some(gcal) = self.store.google_calendar_of(&ev) {
-            self.engine.series_deleted(&mut self.store, &gcal, &series_id);
+            (None, Some(cal)) => self.engine.series_deleted(&mut self.store, cal, &series_id),
+            (None, None) => {}
         }
         self.selected = None;
         self.flush();
@@ -529,7 +558,7 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
         let popover = self.editor.as_ref().is_some_and(|ed| matches!(ed.placement, Placement::Popover { .. }));
-        let modal = popover || self.show_google;
+        let modal = popover || self.show_accounts;
         let mut view = None;
         let mut step = 0;
         let mut today = false;
@@ -603,21 +632,21 @@ impl App {
                         self.new_event(start, start + Duration::hours(1), false);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let connected = self.store.google.is_connected();
+                        let connected = !self.store.accounts().is_empty();
                         if connected {
                             let label = if self.worker.busy > 0 { "Syncing…" } else { "⟳" };
-                            if icon_button(ui, label, "Sync with Google").clicked() {
+                            if icon_button(ui, label, "Sync now").clicked() {
                                 self.sync();
                             }
                         }
-                        let google_label = if connected { "Google: connected" } else { "Connect Google" };
-                        if ui.button(google_label).clicked() {
-                            self.show_google = true;
+                        let accounts_label = if connected { "Accounts" } else { "Add Account" };
+                        if ui.button(accounts_label).clicked() {
+                            self.show_accounts = true;
                         }
                         let unsynced = self.store.unsynced_count();
                         if connected && unsynced > 0 {
                             let s = if unsynced == 1 { "" } else { "s" };
-                            ui.label(RichText::new(format!("{unsynced} change{s} not yet on Google")).color(p.secondary).small());
+                            ui.label(RichText::new(format!("{unsynced} change{s} not yet synced")).color(p.secondary).small());
                         }
                         if let Some((msg, err)) = &self.status {
                             let color = if *err { RED } else { p.secondary };
@@ -674,18 +703,21 @@ impl App {
 
     fn calendar_list(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let mut remove: Option<String> = None;
-        let groups: [(&str, bool); 2] = [("On My Computer", false), ("Google", true)];
-        for (title, google) in groups {
+        // Local calendars, then one group per account.
+        let mut groups: Vec<Option<String>> = vec![None, Some(GOOGLE.to_owned())];
+        groups.extend(self.store.caldav.iter().map(|a| Some(a.id.clone())));
+        for account in groups {
+            let google = account.is_some();
             let idxs: Vec<usize> = (0..self.store.calendars.len())
-                .filter(|&i| self.store.calendars[i].google_id().is_some() == google)
+                .filter(|&i| self.store.calendars[i].account() == account.as_deref())
                 .collect();
             if idxs.is_empty() && google {
                 continue;
             }
-            let header = if google {
-                self.store.google.account_email.clone().unwrap_or_else(|| title.to_owned())
-            } else {
-                title.to_owned()
+            let header = match account.as_deref() {
+                None => "On My Computer".to_owned(),
+                Some(GOOGLE) => self.store.google.account_email.clone().unwrap_or_else(|| "Google".to_owned()),
+                Some(a) => self.store.account_name(a),
             };
             ui.add_space(6.0);
             ui.label(RichText::new(header).font(theme::bold_font(11.5)).color(p.secondary));
@@ -856,74 +888,170 @@ impl App {
             });
     }
 
-    fn google_window(&mut self, ctx: &egui::Context, p: &Palette) {
-        let mut open = self.show_google;
-        let mut connect = false;
-        let mut disconnect = false;
-        egui::Window::new("Google Calendar")
+    fn accounts_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        // A CalDAV sign-in finished: clear the form once the account is in.
+        if let Some(id) = &self.caldav_form.pending {
+            if self.store.caldav_account(id).is_some() {
+                self.caldav_form = CalDavForm { other: self.caldav_form.other, ..CalDavForm::default() };
+            } else if !self.engine.is_connecting() {
+                self.caldav_form.pending = None;
+            }
+        }
+        let mut open = self.show_accounts;
+        let mut connect_google = false;
+        let mut connect_caldav = false;
+        let mut disconnect: Option<String> = None;
+        egui::Window::new("Accounts")
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(440.0, 0.0))
+            .fixed_size(Vec2::new(460.0, 0.0))
             .open(&mut open)
             .show(ctx, |ui| {
-                let g = &mut self.store.google;
-                if g.is_connected() {
-                    ui.label(format!(
-                        "Connected{}.",
-                        g.account_email.as_ref().map(|e| format!(" as {e}")).unwrap_or_default()
-                    ));
+                ui.label(
+                    RichText::new("Changes from other devices appear within 5 minutes. Your changes are sent right away; if a server can't be reached they're kept and retried every minute.")
+                        .color(p.secondary),
+                );
+
+                // ---- iCloud / CalDAV
+                ui.add_space(10.0);
+                ui.label(RichText::new("iCloud and CalDAV").font(theme::bold_font(14.0)));
+                for a in &self.store.caldav {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} — {}", a.label, a.username));
+                        if a.password.is_none() {
+                            ui.label(RichText::new("(password missing)").color(RED).small());
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(RichText::new("Disconnect").color(RED)).clicked() {
+                                disconnect = Some(a.id.clone());
+                            }
+                        });
+                    });
+                }
+                let f = &mut self.caldav_form;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut f.other, false, "iCloud");
+                    ui.selectable_value(&mut f.other, true, "Other CalDAV server");
+                });
+                if f.other {
+                    ui.label(RichText::new("Fastmail, Nextcloud, Radicale, … Enter the server address; the calendars are found from there.").color(p.secondary));
+                } else {
                     ui.label(
-                        RichText::new("Changes from other devices appear within 5 minutes. Your changes are sent to Google right away; if Google can't be reached they're kept and retried every minute.")
+                        RichText::new("Sign in with your Apple ID and an app-specific password (not your Apple ID password): account.apple.com → Sign-In and Security → App-Specific Passwords.")
                             .color(p.secondary),
                     );
-                    ui.add_space(8.0);
-                    if ui.button(RichText::new("Disconnect").color(RED)).clicked() {
-                        disconnect = true;
-                    }
-                    return;
+                    ui.hyperlink_to("Create an app-specific password", "https://account.apple.com/account/manage");
                 }
-                ui.label("CleanCalendar talks to Google with your own OAuth client:");
                 ui.add_space(4.0);
-                for step in [
-                    "1. In Google Cloud Console, create a project and enable the Google Calendar API.",
-                    "2. Configure the OAuth consent screen and add yourself as a test user.",
-                    "3. Create Credentials → OAuth client ID → Application type “Desktop app”.",
-                    "4. Paste the client ID and secret below, then sign in.",
-                ] {
-                    ui.label(RichText::new(step).color(p.secondary));
-                }
-                ui.hyperlink_to("Open Google Cloud Console", "https://console.cloud.google.com/apis/credentials");
-                ui.add_space(8.0);
-                egui::Grid::new("google-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    ui.label("Client ID");
-                    ui.add(egui::TextEdit::singleline(&mut g.client_id).desired_width(300.0));
+                egui::Grid::new("caldav-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    if f.other {
+                        ui.label("Server");
+                        ui.add(egui::TextEdit::singleline(&mut f.server).hint_text("https://caldav.example.com").desired_width(300.0));
+                        ui.end_row();
+                    }
+                    ui.label(if f.other { "User name" } else { "Apple ID" });
+                    ui.add(egui::TextEdit::singleline(&mut f.username).desired_width(300.0));
                     ui.end_row();
-                    ui.label("Client secret");
-                    ui.add(egui::TextEdit::singleline(&mut g.client_secret).password(true).desired_width(300.0));
+                    ui.label(if f.other { "Password" } else { "App password" });
+                    ui.add(egui::TextEdit::singleline(&mut f.password).password(true).hint_text(if f.other { "" } else { "xxxx-xxxx-xxxx-xxxx" }).desired_width(300.0));
                     ui.end_row();
                 });
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let busy = self.worker.busy > 0;
-                    let btn = egui::Button::new(RichText::new("Sign in with Google").color(Color32::WHITE)).fill(ACCENT);
-                    if ui.add_enabled(!busy && !g.client_id.trim().is_empty(), btn).clicked() {
-                        connect = true;
+                    let busy = f.pending.is_some();
+                    let ready = !f.username.trim().is_empty() && !f.password.is_empty() && (!f.other || !f.server.trim().is_empty());
+                    let btn = egui::Button::new(RichText::new("Sign In").color(Color32::WHITE)).fill(ACCENT);
+                    if ui.add_enabled(!busy && ready, btn).clicked() {
+                        connect_caldav = true;
                     }
                     if busy {
                         ui.spinner();
-                        ui.label(RichText::new("Waiting for the browser…").color(p.secondary));
+                        ui.label(RichText::new("Finding your calendars…").color(p.secondary));
                     }
                 });
+
+                // ---- Google
+                ui.add_space(12.0);
+                ui.separator();
+                ui.label(RichText::new("Google").font(theme::bold_font(14.0)));
+                let g = &mut self.store.google;
+                if g.is_connected() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "Connected{}.",
+                            g.account_email.as_ref().map(|e| format!(" as {e}")).unwrap_or_default()
+                        ));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(RichText::new("Disconnect").color(RED)).clicked() {
+                                disconnect = Some(GOOGLE.to_owned());
+                            }
+                        });
+                    });
+                    return;
+                }
+                egui::CollapsingHeader::new("Connect Google Calendar").default_open(false).show(ui, |ui| {
+                    ui.label("CleanCalendar talks to Google with your own OAuth client:");
+                    ui.add_space(4.0);
+                    for step in [
+                        "1. In Google Cloud Console, create a project and enable the Google Calendar API.",
+                        "2. Configure the OAuth consent screen and add yourself as a test user.",
+                        "3. Create Credentials → OAuth client ID → Application type “Desktop app”.",
+                        "4. Paste the client ID and secret below, then sign in.",
+                    ] {
+                        ui.label(RichText::new(step).color(p.secondary));
+                    }
+                    ui.hyperlink_to("Open Google Cloud Console", "https://console.cloud.google.com/apis/credentials");
+                    ui.add_space(8.0);
+                    egui::Grid::new("google-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("Client ID");
+                        ui.add(egui::TextEdit::singleline(&mut g.client_id).desired_width(300.0));
+                        ui.end_row();
+                        ui.label("Client secret");
+                        ui.add(egui::TextEdit::singleline(&mut g.client_secret).password(true).desired_width(300.0));
+                        ui.end_row();
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let busy = self.worker.busy > 0;
+                        let btn = egui::Button::new(RichText::new("Sign in with Google").color(Color32::WHITE)).fill(ACCENT);
+                        if ui.add_enabled(!busy && !g.client_id.trim().is_empty(), btn).clicked() {
+                            connect_google = true;
+                        }
+                        if busy {
+                            ui.spinner();
+                            ui.label(RichText::new("Waiting for the browser…").color(p.secondary));
+                        }
+                    });
+                });
             });
-        self.show_google = open;
-        if connect {
+        self.show_accounts = open;
+        if connect_google {
             self.store.save();
             let g = &self.store.google;
-            self.worker.send(Cmd::Connect { client_id: g.client_id.clone(), client_secret: g.client_secret.clone() });
+            self.worker.send(Cmd::ConnectGoogle { client_id: g.client_id.clone(), client_secret: g.client_secret.clone() });
         }
-        if disconnect {
-            self.engine.disconnect(&mut self.store);
+        if connect_caldav {
+            let f = &mut self.caldav_form;
+            let server = if f.other { f.server.trim().to_owned() } else { caldav::ICLOUD.to_owned() };
+            let label = if f.other {
+                caldav::normalize_server(&server).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_else(|| server.clone())
+            } else {
+                "iCloud".to_owned()
+            };
+            let account = CalDavAccount {
+                id: CalDavAccount::new_id(),
+                label,
+                server,
+                username: f.username.trim().to_owned(),
+                password: Some(f.password.clone()),
+            };
+            f.pending = Some(account.id.clone());
+            self.engine.connect_caldav(account);
+            self.flush();
+        }
+        if let Some(account) = disconnect {
+            self.engine.disconnect(&mut self.store, &account);
             self.flush();
         }
     }
@@ -970,7 +1098,7 @@ impl eframe::App for App {
         }
         self.apply_actions();
         self.editor_popover(ctx, &p);
-        self.google_window(ctx, &p);
+        self.accounts_window(ctx, &p);
 
         // Keep the current-time line moving.
         ctx.request_repaint_after(StdDuration::from_secs(30));
