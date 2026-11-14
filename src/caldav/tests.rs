@@ -239,6 +239,57 @@ fn read_only_calendars_refuse_changes() {
 }
 
 #[test]
+fn editing_an_occurrence_that_no_longer_exists_does_not_duplicate_it() {
+    let server = FakeDav::start();
+    server.put("home", "yoga.ics", SERIES);
+    let (mut laptop, _) = devices(&server);
+    // Offline, the laptop edits the first occurrence; meanwhile the phone
+    // moves the whole series an hour later, so that occurrence is gone.
+    let first = laptop.titled("Yoga")[0].id.clone();
+    server.with(|s| s.down = true);
+    laptop.edit(&first, |e| e.title = "Yoga with Ana".into());
+    laptop.pump();
+    server.with(|s| s.down = false);
+    server.put("home", "yoga.ics", &SERIES.replace("T070000", "T080000"));
+    laptop.sync();
+    assert!(laptop.titled("Yoga with Ana").is_empty(), "not recreated as a separate event");
+    assert_eq!(laptop.titled("Yoga").len(), 6);
+    assert_eq!(server.files("home").len(), 1);
+    assert!(laptop.said.iter().any(|s| s.contains("rejected")), "{:?}", laptop.said);
+    assert_eq!(laptop.store.unsynced_count(), 0, "not retried forever");
+}
+
+#[test]
+fn deleting_an_occurrence_someone_just_changed_keeps_it() {
+    let server = FakeDav::start();
+    server.put("home", "yoga.ics", SERIES);
+    let (mut laptop, mut phone) = devices(&server);
+    let second = laptop.titled("Yoga")[1].id.clone();
+    phone.edit(&second, |e| e.title = "Yoga (outside)".into());
+    phone.pump();
+    laptop.delete(&second);
+    laptop.pump();
+    assert!(!server.file("home", "yoga.ics").unwrap().contains("EXDATE"), "not deleted");
+    assert_eq!(laptop.titled("Yoga (outside)").len(), 1, "their change came back");
+
+    // An occurrence nobody changed is deleted even though the file changed.
+    let third = laptop.titled("Yoga")[1].id.clone();
+    laptop.delete(&third);
+    laptop.pump();
+    assert!(server.file("home", "yoga.ics").unwrap().contains("EXDATE"));
+}
+
+#[test]
+fn a_calendar_the_server_refuses_does_not_stop_the_others() {
+    let server = FakeDav::start();
+    server.put("home", "x.ics", &plain_ics("x", "Coffee", "20261118T100000"));
+    server.with(|s| s.fail_next.push(("REPORT".into(), "/work/".into(), 403)));
+    let laptop = Device::sign_in("laptop", server.login(), today());
+    assert_eq!(laptop.titled("Coffee").len(), 1);
+    assert!(!laptop.said.iter().any(|s| s.starts_with("Couldn't sync")), "{:?}", laptop.said);
+}
+
+#[test]
 fn server_errors_are_retryable() {
     let server = FakeDav::start();
     server.with(|s| s.fail_next.push(("PUT".into(), ".ics".into(), 503)));

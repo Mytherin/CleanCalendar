@@ -64,8 +64,13 @@ fn parameters_with_quotes_and_lists_are_read() {
         .unwrap();
     assert_eq!(p.name, "ATTENDEE");
     assert_eq!(p.param("CN"), Some("Doe, Jane"));
-    assert_eq!(p.param("DELEGATED-FROM"), Some("mailto:a@x,mailto:b@x"));
+    // Several quoted values stay quoted one by one, to be written back as they were.
+    assert_eq!(p.param("DELEGATED-FROM"), Some(r#""mailto:a@x","mailto:b@x""#));
     assert_eq!(p.value, "mailto:jane@x");
+    let mut c = Component::new("VEVENT");
+    c.props.push(p);
+    let unfolded = write(&c).replace("\r\n ", "");
+    assert!(unfolded.contains(r#"CN="Doe, Jane";ROLE=REQ-PARTICIPANT;DELEGATED-FROM="mailto:a@x","mailto:b@x":mailto"#), "{unfolded}");
     let p = parse_line("dtstart;tzid=Europe/Paris:20261114T090000").unwrap();
     assert_eq!((p.name.as_str(), p.param("TZID")), ("DTSTART", Some("Europe/Paris")));
     assert!(parse_line("no colon here").is_none());
@@ -86,6 +91,43 @@ fn time_zone_ids_with_vendor_prefixes_are_understood() {
     assert_eq!(parse_tzid("/mozilla.org/20050126_1/America/New_York"), Some(ny()));
     assert_eq!(parse_tzid("\"Europe/Paris\""), Some("Europe/Paris".parse().unwrap()));
     assert_eq!(parse_tzid("Custom Zone 1"), None);
+}
+
+#[test]
+fn windows_zone_names_from_outlook_invitations_are_understood() {
+    assert_eq!(parse_tzid("W. Europe Standard Time"), Some("Europe/Berlin".parse().unwrap()));
+    assert_eq!(parse_tzid("eastern standard time"), Some(ny()));
+    let c = ics("BEGIN:VEVENT\r\nUID:o\r\nSUMMARY:From Outlook\r\nDTSTART;TZID=Eastern Standard Time:20261116T090000\r\n\
+        DTEND;TZID=Eastern Standard Time:20261116T100000\r\nRRULE:FREQ=DAILY;COUNT=3\r\nEND:VEVENT\r\n");
+    let evs = events(&cal(), "/o.ics", None, &c, year().0, year().1);
+    assert_eq!(wall(&evs[0], ny()), t(2026, 11, 16, 9, 0), "not floating");
+    // Occurrences are named in the file's own TZID, which it defines.
+    let mut c2 = c.clone();
+    remove_occurrence(&mut c2, "20261117T090000").unwrap();
+    let ex = master(&c2).unwrap().prop("EXDATE").unwrap().clone();
+    assert_eq!(ex.param("TZID"), Some("Eastern Standard Time"));
+    assert!(c2.subs.iter().any(|s| s.name == "VTIMEZONE" && s.text("TZID").as_deref() == Some("Eastern Standard Time")));
+    assert_eq!(events(&cal(), "/o.ics", None, &c2, year().0, year().1).len(), 2);
+}
+
+#[test]
+fn unreadable_lines_are_kept_as_they_were() {
+    let c = ics("BEGIN:VEVENT\r\nUID:r\r\nSUMMARY:x\r\nX-ODD;FOO=\"unclosed:value\r\nDTSTART:20261114T090000Z\r\nEND:VEVENT\r\n");
+    let ev = events(&cal(), "/r.ics", None, &c, year().0, year().1).remove(0);
+    let out = write(&put(Some(c), &ev, "r", None).unwrap());
+    assert!(out.contains("X-ODD;FOO=\"unclosed:value\r\n"), "{out}");
+}
+
+#[test]
+fn a_new_location_drops_apples_map_pin() {
+    let c = ics("BEGIN:VEVENT\r\nUID:l\r\nLOCATION:Old cafe\r\nX-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-TITLE=Old cafe:geo:1,2\r\n\
+        DTSTART:20261114T090000Z\r\nEND:VEVENT\r\n");
+    let mut ev = events(&cal(), "/l.ics", None, &c, year().0, year().1).remove(0);
+    let same = put(Some(c.clone()), &ev, "l", None).unwrap();
+    assert!(master(&same).unwrap().prop("X-APPLE-STRUCTURED-LOCATION").is_some(), "kept while the location is unchanged");
+    ev.location = "New bar".into();
+    let moved = put(Some(c), &ev, "l", None).unwrap();
+    assert!(master(&moved).unwrap().prop("X-APPLE-STRUCTURED-LOCATION").is_none());
 }
 
 #[test]
