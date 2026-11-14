@@ -280,6 +280,36 @@ fn deleting_an_occurrence_someone_just_changed_keeps_it() {
 }
 
 #[test]
+fn deleting_two_changed_occurrences_one_after_the_other_deletes_both() {
+    let server = FakeDav::start();
+    server.put("home", "yoga.ics", SERIES);
+    let (mut laptop, mut phone) = devices(&server);
+    // The phone changes two occurrences; the laptop sees both changes.
+    let (a, b) = (phone.titled("Yoga")[1].id.clone(), phone.titled("Yoga")[2].id.clone());
+    phone.edit(&a, |e| e.title = "Yoga A".into());
+    phone.pump();
+    phone.edit(&b, |e| e.title = "Yoga B".into());
+    phone.pump();
+    laptop.sync();
+
+    // Deleting the first rewrites the file; the second must not then look
+    // like it was changed by someone else.
+    let a = laptop.one("Yoga A").id.clone();
+    laptop.delete(&a);
+    laptop.pump();
+    let b = laptop.one("Yoga B").id.clone();
+    laptop.delete(&b);
+    laptop.pump();
+
+    assert!(laptop.titled("Yoga A").is_empty() && laptop.titled("Yoga B").is_empty(), "{:?}", laptop.said);
+    assert!(laptop.said.iter().all(|s| !s.contains("changed on another device")), "{:?}", laptop.said);
+    let file = server.file("home", "yoga.ics").unwrap();
+    assert!(!file.contains("Yoga A") && !file.contains("Yoga B"), "{file}");
+    phone.sync();
+    assert!(phone.titled("Yoga A").is_empty() && phone.titled("Yoga B").is_empty());
+}
+
+#[test]
 fn a_calendar_the_server_refuses_does_not_stop_the_others() {
     let server = FakeDav::start();
     server.put("home", "x.ics", &plain_ics("x", "Coffee", "20261118T100000"));

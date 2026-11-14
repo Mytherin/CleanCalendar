@@ -291,9 +291,15 @@ impl SyncEngine {
                     }
                 }
             }
-            Msg::Deleted { remote_id } => {
+            Msg::Deleted { remote_id, etag } => {
                 self.in_flight.remove(&format!("del:{remote_id}"));
+                let done = store.pending_deletes.iter().find(|d| d.remote_id == remote_id).cloned();
                 store.pending_deletes.retain(|d| d.remote_id != remote_id);
+                if let (Some(d), Some(new)) = (done, etag) {
+                    if let Some(old) = &d.etag {
+                        bump_siblings(store, &d.calendar.local_id(), &remote_id, old, &new);
+                    }
+                }
             }
             Msg::DeleteFailed { remote_id, calendar, error, kind } => {
                 self.in_flight.remove(&format!("del:{remote_id}"));
@@ -337,6 +343,10 @@ impl SyncEngine {
             return;
         }
         let new_id = calendar.event_id(&remote_id);
+        let old_etag = store.event(&local_id).and_then(|e| e.etag.clone());
+        if let (Some(old), Some(new)) = (&old_etag, &etag) {
+            bump_siblings(store, &calendar.local_id(), &remote_id, old, new);
+        }
         let ev = store.event_mut(&local_id).unwrap();
         ev.remote_id = Some(remote_id);
         ev.id = new_id.clone();
@@ -542,6 +552,21 @@ fn merge_calendars(store: &mut Store, account: &str, remote: &[RemoteCalendar]) 
 /// Applies what a sync returned to the store. Events with unconfirmed local
 /// edits (and the one being dragged) are left alone, and events waiting to be
 /// deleted remotely are not brought back.
+/// Several events can come from one resource on the service (the
+/// occurrences of a CalDAV series, with remote ids "<href>#<key>"); they all
+/// carry the resource's version tag. After we changed the resource from
+/// `old` to `new` ourselves, the others are at `new` too, or the next change
+/// to one of them would look like a conflict with someone else.
+fn bump_siblings(store: &mut Store, calendar_id: &str, remote_id: &str, old: &str, new: &str) {
+    let resource = |rid: &str| rid.split_once('#').map_or(rid, |(href, _)| href).to_owned();
+    let ours = resource(remote_id);
+    for e in store.events.iter_mut().filter(|e| e.calendar_id == calendar_id && e.etag.as_deref() == Some(old)) {
+        if e.remote_id.as_deref().is_some_and(|r| resource(r) == ours) {
+            e.etag = Some(new.to_owned());
+        }
+    }
+}
+
 fn apply_changes(store: &mut Store, account: &str, changes: Vec<CalendarChanges>, dragging: Option<&str>, today: NaiveDate) {
     let deleting: HashSet<String> = store.pending_deletes.iter().map(|d| d.remote_id.clone()).collect();
     let protected = |e: &Event| e.pending || Some(e.id.as_str()) == dragging;
@@ -850,7 +875,7 @@ mod tests {
         engine.handle(&mut store, synced(changes(true, vec![gev("a", "x")], &[], None)), None, today());
         assert!(store.events.is_empty());
 
-        engine.handle(&mut store, Msg::Deleted { remote_id: "a".into() }, None, today());
+        engine.handle(&mut store, Msg::Deleted { remote_id: "a".into(), etag: None }, None, today());
         assert!(store.pending_deletes.is_empty());
     }
 
@@ -1278,7 +1303,7 @@ mod tests {
         apply_changes(&mut store, GOOGLE, changes(false, vec![occ], &[], None), None, today());
         assert!(store.events.is_empty());
 
-        engine.handle(&mut store, Msg::Deleted { remote_id: "s".into() }, None, today());
+        engine.handle(&mut store, Msg::Deleted { remote_id: "s".into(), etag: None }, None, today());
         assert_eq!(store.unsynced_count(), 0);
     }
 

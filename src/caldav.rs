@@ -472,13 +472,13 @@ impl Remote for Client {
         })
     }
 
-    fn delete(&mut self, cal: &CalRef, remote_id: &str, etag: Option<&str>) -> Result<()> {
+    fn delete(&mut self, cal: &CalRef, remote_id: &str, etag: Option<&str>) -> Result<Option<String>> {
         let cal_url = Self::calendar_url(cal)?;
         let (href, key) = ical::split_remote_id(remote_id);
         let url = Self::resource_url(&cal_url, href)?;
         if let Some(key) = key {
             // One occurrence: take it out of the series.
-            let Some((mut ics, server_etag)) = self.get(&url)? else { return Ok(()) };
+            let Some((mut ics, server_etag)) = self.get(&url)? else { return Ok(None) };
             // Someone changed this very occurrence since we saw it: their
             // change wins. (Changes to other occurrences don't matter.)
             if etag.is_some() && etag != server_etag.as_deref() && ical::has_override(&ics, key) {
@@ -488,16 +488,20 @@ impl Remote for Client {
                 return self.delete(cal, href, server_etag.as_deref());
             }
             let pre = server_etag.as_deref().unwrap_or("*");
-            self.put(&url, &ics, ("If-Match", pre))?;
-            return Ok(());
+            let new_etag = self.put(&url, &ics, ("If-Match", pre))?;
+            // Some servers leave the ETag out of a PUT's reply: ask.
+            return match new_etag {
+                Some(e) => Ok(Some(e)),
+                None => Ok(self.get(&url)?.and_then(|(_, e)| e)),
+            };
         }
         let headers: Vec<(&str, &str)> = etag.map(|e| vec![("If-Match", e)]).unwrap_or_default();
         let (_, resp) = self.send("DELETE", &url, &headers, None)?;
         if matches!(resp.status().as_u16(), 404 | 410) {
-            return Ok(());
+            return Ok(None);
         }
         Self::check(resp)?;
-        Ok(())
+        Ok(None)
     }
 }
 
