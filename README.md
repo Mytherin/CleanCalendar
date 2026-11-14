@@ -9,11 +9,17 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Sidebar** with calendar visibility checkboxes, a right-click menu for color and delete, and a mini-month navigator.
 - **Week/Day time grid:** overlapping events sit side by side; all-day and multi-day events span the all-day lane.
 - **Direct manipulation:** drag on empty space to create an event, drag an event to move it, drag its bottom edge to resize. Everything snaps to 15 minutes.
+- **Right-click menu** like Apple Calendar's: Get Info, move to another calendar, Delete, Cut, Copy, Paste, Duplicate, go to the next/previous occurrence of a repeating event, and e-mail the event (or its series). Right-click on empty space to create an event or paste there.
 - **Month view:** multi-day banners span across days, timed events show a colored dot and their time, and overflow collapses to "N more".
-- **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar and notes.
+- **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar, invitees and notes.
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
 - **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
-- **iCloud and CalDAV:** sign in with your Apple ID and an app-specific password (or any CalDAV server: Fastmail, Nextcloud, Radicale, …). All your calendars are imported, Reminders lists are skipped, and creates, edits, moves and deletes go back to the server. Repeating events from other apps show every occurrence, whatever their rule.
+- **Settings** (⚙ in the toolbar, or Ctrl+,), laid out like macOS Calendar's:
+  - *General:* 5 or 7 days per week, the first day of the week (or the Windows region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar, and whether to show Google's birthdays and holidays calendars.
+  - *Accounts:* add (+) or remove (−) the Google account, switch it off, give it a name, and choose how often it refreshes (every minute to hourly, or manually).
+  - *Advanced:* shade busy days in the year view, and show week numbers in the week and month views.
+- **Invitees:** on Google calendars, type addresses into "Add Invitees" (Enter, comma or semicolon adds one). Google emails the invitations, updates and cancellations, and each guest's reply (accepted, maybe, declined, no response) is shown next to their name.
+- **iCloud and CalDAV** (the **Accounts** button in the toolbar): sign in with your Apple ID and an app-specific password (or any CalDAV server: Fastmail, Nextcloud, Radicale, …). All your calendars are imported, Reminders lists are skipped, and creates, edits, moves and deletes go back to the server. Repeating events from other apps show every occurrence, whatever their rule.
 - **Several accounts at once:** iCloud, other CalDAV servers and Google side by side, each in its own group in the sidebar.
 - **Google Calendar:** OAuth sign-in in your browser (loopback + PKCE), imports all your calendars, and sends creates, edits, moves and deletes back to Google. Read-only calendars (holidays, shared calendars) are shown but can't be edited.
 - Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows).
@@ -35,10 +41,15 @@ The MSVC toolchain works too if you have the Visual Studio C++ Build Tools.
 |---|---|
 | Ctrl+1 / 2 / 3 / 4 | Day / Week / Month / Year |
 | Ctrl+T | Go to today |
+| Ctrl+, | Settings |
 | Ctrl+N | New event |
 | ← / → | Previous / next period |
 | Delete / Backspace | Delete the selected event |
+| Ctrl+X / C / V | Cut / copy the selected event, paste it (onto the selected event's day, at its own time) |
+| Ctrl+D | Duplicate the selected event |
+| Ctrl+] / Ctrl+[ | Next / previous occurrence of a repeating event |
 | Double-click | Open an event, or create one on empty space |
+| Right-click | The event's menu, or New Event / Paste on empty space |
 | Esc / Enter (in title) | Cancel / save in the editor |
 
 ## Connecting iCloud
@@ -55,7 +66,7 @@ Google requires every app to have its own OAuth client:
 1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and **enable the Google Calendar API**.
 2. Configure the **OAuth consent screen** (External is fine) and add your Google account as a **test user**.
 3. Go to **Credentials → Create credentials → OAuth client ID**, application type **Desktop app**.
-4. In CleanCalendar open **Accounts → Connect Google Calendar**, paste the client ID and secret, and click **Sign in with Google**.
+4. In CleanCalendar open **Settings → Accounts**, click **+**, choose Google, paste the client ID and secret, and click **Sign in with Google**. (**Accounts → Connect Google Calendar** in the toolbar does the same.)
 
 Google keeps using Google's own REST API rather than its CalDAV endpoint: it's richer (colours, sync tokens, structured JSON) and needs the same OAuth sign-in anyway.
 
@@ -66,7 +77,7 @@ Every account, whatever the service, goes through the same sync engine (`src/syn
 - **Your changes** (create, edit, move, resize, delete, change calendar) are uploaded right away and marked *pending* until the server confirms them.
   If the server can't be reached, they stay pending and are retried every minute. The toolbar shows "N changes not yet synced".
   Pending changes survive restarts, and a sync never overwrites an event that has unsent edits.
-- **Changes from elsewhere** (phone, web, other people) are pulled on launch, every 5 minutes, and when you press ⟳.
+- **Changes from elsewhere** (phone, web, other people) are pulled on launch, every 5 minutes (change it under Settings → Accounts → Refresh Calendars), and when you press ⟳.
   After the first full download, each calendar syncs incrementally (Google's sync tokens; CalDAV's `sync-collection` report, RFC 6578), so only changed events are fetched.
   A full re-download runs weekly, when the server expires a token, or after it rejects a change.
   The full download covers 6 months back to 12 months ahead.
@@ -83,13 +94,14 @@ Every account, whatever the service, goes through the same sync engine (`src/syn
 
 Data is kept in two SQLite databases, split by who owns it:
 
-- **`data.db`: things only this computer has.** Account settings (Google client id and account, CalDAV servers and user names), the calendar list (with your colours and which are shown), events on local calendars, and changes to synced events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\` on Windows (`~/Library/Application Support/CleanCalendar/` on macOS, `~/.local/share/cleancalendar/` on Linux).
+- **`data.db`: things only this computer has.** Your settings, account settings (Google client id and account, CalDAV servers and user names), the calendar list (with your colours and which are shown), events on local calendars, and changes to synced events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\` on Windows (`~/Library/Application Support/CleanCalendar/` on macOS, `~/.local/share/cleancalendar/` on Linux).
 - **`cache.db`: a copy of the servers.** Synced events as last downloaded, plus the sync tokens. Lives in `%LOCALAPPDATA%\CleanCalendar\` on Windows (`~/Library/Caches/CleanCalendar/` on macOS, `~/.cache/cleancalendar/` on Linux), so it isn't carried around in a roaming profile. It is safe to delete: the next sync downloads everything again. If it can't be read, it is started over automatically.
 - **Secrets** (the Google refresh token, CalDAV passwords) are kept in the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux) under `CleanCalendar` / `google-refresh-token` and `CleanCalendar` / `caldav-<id>-password`, not in either file. If no credential store is available they fall back to `data.db` (with a warning), and move into the credential store once one works. Disconnecting an account deletes its secret.
 
 The cache is attached to the same connection, so each save commits to both files at once. Only rows that changed are written. A `store.json` from an older version is imported on first start and renamed to `store.json.migrated`. Files in the folders older versions used (`%APPDATA%\CleanCalendar\CleanCalendar\data\`, `~/Library/Application Support/com.CleanCalendar.CleanCalendar/`) are moved over on first start.
 
 Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (the token still goes to the credential store, under an entry named after that folder).
+Set `CLEANCALENDAR_START=month:2026-11-14` (or just `day`, `week`, `month`, `year`) to open on a given view and date, which is handy together with `CLEANCALENDAR_DATA` for screenshots and testing by hand.
 
 ## Code layout
 
@@ -97,6 +109,8 @@ Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (t
 |---|---|
 | `src/main.rs` | Window setup |
 | `src/app.rs` | App state, toolbar, sidebar, event editor, Accounts window, sync glue |
+| `src/app/settings_window.rs` | The Settings window (General, Accounts with the add-account sheet, Advanced) |
+| `src/settings.rs` | The user's preferences and their defaults |
 | `src/views.rs` | Painting: month grid, day/week time grid, year view, mini-month |
 | `src/layout.rs` | Pure geometry: where events and cells go, and what each screen area means to the pointer |
 | `src/interact.rs` | Pointer interaction (clicks, double-clicks, drags) as a testable state machine |

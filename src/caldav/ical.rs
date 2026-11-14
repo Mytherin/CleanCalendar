@@ -616,6 +616,9 @@ fn to_event(
         all_day,
         location: vevent.text("LOCATION").unwrap_or_default(),
         notes: vevent.text("DESCRIPTION").unwrap_or_default(),
+        // Invitations go through Google only; a CalDAV event's ATTENDEEs
+        // stay in its .ics (saving keeps them) but aren't edited here.
+        attendees: Vec::new(),
         remote_id: Some(remote_id),
         recurring_id,
         pending: false,

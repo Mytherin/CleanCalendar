@@ -11,9 +11,8 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, Order, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
 use crate::dates::*;
-use crate::model::{Event, Store};
+use crate::model::{looks_like_email, Attendee, Event, Response, Store};
 use crate::recurrence::{self, Freq, Recurrence, RepeatEnd};
-use crate::remote::GOOGLE;
 use crate::theme::{self, Palette, RED};
 
 pub const POPOVER_W: f32 = 320.0;
@@ -50,7 +49,20 @@ pub enum Scope {
     AllEvents,
 }
 
+/// The date/time fields at one moment, to tell which of them the user changed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WhenFields {
+    all_day: bool,
+    start_date: NaiveDate,
+    start_time: NaiveTime,
+    end_date: NaiveDate,
+    end_time: NaiveTime,
+}
+
 pub struct Editor {
+    /// The event as it was when the editor opened, to tell whether anything
+    /// was edited.
+    original: Event,
     /// The event being edited. Its start/end follow the date/time fields as
     /// they change, so the calendar can preview it live.
     pub draft: Event,
@@ -66,6 +78,9 @@ pub struct Editor {
     /// The date section is expanded into editable fields.
     editing_when: bool,
     error: Option<String>,
+    /// What's typed in the "Add Invitees" field, not yet added.
+    invitee_input: String,
+    invitee_error: Option<String>,
     /// The popover's size last frame, to place it before it's measured.
     size: Vec2,
     focus_title: bool,
@@ -80,12 +95,15 @@ impl Editor {
             start_time: draft.start.time(),
             end_date: draft.start.date(),
             end_time: draft.end.time(),
+            original: draft.clone(),
             draft,
             is_new,
             placement,
             scope: Scope::AllEvents,
             editing_when: false,
             error: None,
+            invitee_input: String::new(),
+            invitee_error: None,
             size: Vec2::new(POPOVER_W, 260.0),
             focus_title: is_new,
             zone_filter: String::new(),
@@ -124,6 +142,44 @@ impl Editor {
         self.fields_from_draft();
     }
 
+    fn when_fields(&self) -> WhenFields {
+        WhenFields {
+            all_day: self.draft.all_day,
+            start_date: self.start_date,
+            start_time: self.start_time,
+            end_date: self.end_date,
+            end_time: self.end_time,
+        }
+    }
+
+    /// Follows up on the date/time fields changing from `before`, the way
+    /// macOS Calendar does: moving the start keeps the duration, and turning
+    /// "all-day" on or off picks times that still make sense.
+    fn adjust_when(&mut self, before: WhenFields) {
+        if before.all_day != self.draft.all_day {
+            if self.draft.all_day {
+                // An event ending at midnight doesn't touch that last day.
+                if self.end_time == NaiveTime::MIN && self.end_date > self.start_date {
+                    self.end_date = self.end_date.pred_opt().unwrap_or(self.end_date);
+                }
+            } else if self.start_time == NaiveTime::MIN && self.end_time == NaiveTime::MIN {
+                // From all-day: the fields hold midnight; give it real hours.
+                self.start_time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+                self.end_time = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
+            }
+            return;
+        }
+        let start_moved = before.start_date != self.start_date || before.start_time != self.start_time;
+        let end_moved = before.end_date != self.end_date || before.end_time != self.end_time;
+        if start_moved && !end_moved {
+            let old_start = before.start_date.and_time(before.start_time);
+            let new_start = self.start_date.and_time(self.start_time);
+            let end = before.end_date.and_time(before.end_time) + (new_start - old_start);
+            self.end_date = end.date();
+            self.end_time = end.time();
+        }
+    }
+
     /// The edited event, or why it can't be saved.
     pub fn result(&self) -> Result<Event, String> {
         let mut ev = self.draft.clone();
@@ -139,10 +195,27 @@ impl Editor {
         if ev.end < ev.start {
             return Err("The event ends before it starts.".into());
         }
+        if let Some(RepeatEnd::Until(last)) = ev.recurrence.as_ref().map(|r| r.end) {
+            if last < self.start_date {
+                return Err("The repeat ends before the event starts.".into());
+            }
+        }
         if ev.title.trim().is_empty() {
             ev.title = "New Event".into();
         }
+        // An address typed but not yet confirmed with Enter still counts.
+        let (typed, _) = split_addresses(&self.invitee_input);
+        add_invitees(&mut ev.attendees, typed);
         Ok(ev)
+    }
+
+    /// Moves complete addresses from the input field into the guest list;
+    /// anything that isn't an address stays in the field.
+    fn take_invitees(&mut self) {
+        let (good, bad) = split_addresses(&self.invitee_input);
+        add_invitees(&mut self.draft.attendees, good);
+        self.invitee_error = (!bad.is_empty()).then(|| format!("\u{201C}{bad}\u{201D} isn't an email address."));
+        self.invitee_input = bad;
     }
 
     /// Keeps the draft's times in step with the fields, for the live preview.
@@ -158,13 +231,35 @@ impl Editor {
     }
 }
 
+/// Splits typed text at commas, semicolons, and spaces into email
+/// addresses and whatever else is left (rejoined with ", ").
+fn split_addresses(text: &str) -> (Vec<String>, String) {
+    let (good, bad): (Vec<&str>, Vec<&str>) = text
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .partition(|s| looks_like_email(s));
+    (good.into_iter().map(str::to_owned).collect(), bad.join(", "))
+}
+
+/// Adds addresses to a guest list, skipping ones already on it.
+fn add_invitees(list: &mut Vec<Attendee>, emails: Vec<String>) {
+    for email in emails {
+        if !list.iter().any(|a| a.email.eq_ignore_ascii_case(&email)) {
+            list.push(Attendee::new(&email));
+        }
+    }
+}
+
 /// Whether the edited event differs from what's stored (so saving it would
 /// change anything).
 pub fn changed(ed: &Editor, stored: Option<&Event>) -> bool {
     let Ok(ev) = ed.result() else { return true };
+    let differs = |s: &Event| ev.fields() != s.fields() || ev.calendar_id != s.calendar_id;
     match stored {
-        None => true,
-        Some(s) => ev.fields() != s.fields() || ev.calendar_id != s.calendar_id,
+        // Gone (deleted elsewhere, or with its calendar): only an actual
+        // edit is worth keeping; closing it untouched must not bring it back.
+        None => ed.is_new || differs(&ed.original),
+        Some(s) => differs(s),
     }
 }
 
@@ -422,7 +517,7 @@ fn repeat_rows(ui: &mut egui::Ui, ed: &mut Editor, p: &Palette) {
         match &mut rule.end {
             RepeatEnd::Never => {}
             RepeatEnd::Until(d) => {
-                ui.push_id("until", |ui| ui.add_sized(DATE_BUTTON, egui_extras::DatePickerButton::new(d)));
+                date_button(ui, "until-date", d, p);
             }
             RepeatEnd::Count(n) => {
                 ui.add(egui::DragValue::new(n).range(1..=999));
@@ -431,6 +526,142 @@ fn repeat_rows(ui: &mut egui::Ui, ed: &mut Editor, p: &Palette) {
         }
     });
     ui.end_row();
+}
+
+/// A button showing the date ("04/11/2026") that drops down a compact month
+/// calendar, like macOS Calendar's: "Nov 2026" with ◀ ● ▶ to page months,
+/// today in red, the chosen day on a soft rounded square. Clicking a day
+/// picks it and closes; clicking elsewhere or Esc just closes.
+fn date_button(ui: &mut egui::Ui, id: &str, date: &mut NaiveDate, p: &Palette) {
+    let popup_id = ui.make_persistent_id(id);
+    let month_id = popup_id.with("month");
+    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let resp = ui.add_sized(DATE_BUTTON, egui::Button::new(date.format("%d/%m/%Y").to_string()).selected(open));
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+        ui.data_mut(|d| d.insert_temp(month_id, first_of_month(*date)));
+    }
+    if !ui.memory(|m| m.is_popup_open(popup_id)) {
+        return;
+    }
+
+    const CELL: Vec2 = Vec2::new(27.0, 22.0);
+    let today = chrono::Local::now().date_naive();
+    let mut month = ui.data(|d| d.get_temp::<NaiveDate>(month_id)).unwrap_or_else(|| first_of_month(*date));
+    let mut close = false;
+    let border = if p.dark { Color32::from_rgb(0x4A, 0x4D, 0x50) } else { p.grid_strong };
+
+    let area = egui::Area::new(popup_id)
+        .order(Order::Foreground)
+        .fixed_pos(resp.rect.left_bottom() + Vec2::new(0.0, 4.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::none()
+                .fill(p.popover)
+                .rounding(8.0)
+                .stroke(Stroke::new(1.0_f32, border))
+                .shadow(egui::epaint::Shadow { offset: Vec2::new(0.0, 4.0), blur: 14.0, spread: 0.0, color: Color32::from_black_alpha(70) })
+                .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+                .show(ui, |ui| {
+                    let w = 7.0 * CELL.x;
+                    // Header: "Nov 2026" on the left, ◀ ● ▶ on the right.
+                    let (head, _) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::hover());
+                    ui.painter().text(
+                        head.left_center() + Vec2::new(3.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        month.format("%b %Y").to_string(),
+                        theme::bold_font(15.0),
+                        p.text,
+                    );
+                    let nav = |ui: &mut egui::Ui, k: i32| {
+                        let c = Pos2::new(head.right() - 9.0 - (2 - k) as f32 * 16.0, head.center().y);
+                        let r = Rect::from_center_size(c, Vec2::splat(16.0));
+                        let resp = ui.interact(r, popup_id.with(("nav", k)), Sense::click());
+                        let color = if resp.hovered() { p.text } else { p.secondary };
+                        match k {
+                            0 => ui.painter().add(egui::Shape::convex_polygon(
+                                vec![c + Vec2::new(-4.0, 0.0), c + Vec2::new(3.0, -4.5), c + Vec2::new(3.0, 4.5)],
+                                color,
+                                Stroke::NONE,
+                            )),
+                            1 => ui.painter().add(egui::Shape::circle_filled(c, 3.5, color)),
+                            _ => ui.painter().add(egui::Shape::convex_polygon(
+                                vec![c + Vec2::new(4.0, 0.0), c + Vec2::new(-3.0, 4.5), c + Vec2::new(-3.0, -4.5)],
+                                color,
+                                Stroke::NONE,
+                            )),
+                        };
+                        resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                    };
+                    if nav(ui, 0) {
+                        month = add_months(month, -1);
+                    }
+                    if nav(ui, 1) {
+                        month = first_of_month(today);
+                    }
+                    if nav(ui, 2) {
+                        month = add_months(month, 1);
+                    }
+
+                    // Weekday initials ("Mo", "Tu", …) over a hairline.
+                    let (days, _) = ui.allocate_exact_size(Vec2::new(w, CELL.y), Sense::hover());
+                    for i in 0..7 {
+                        ui.painter().text(
+                            Pos2::new(days.left() + (i as f32 + 0.5) * CELL.x, days.center().y),
+                            Align2::CENTER_CENTER,
+                            &weekday_short(i)[..2],
+                            theme::bold_font(12.0),
+                            p.secondary,
+                        );
+                    }
+                    ui.painter().hline(days.x_range().shrink(3.0), days.bottom() + 1.0, Stroke::new(1.0_f32, p.grid));
+                    ui.add_space(4.0);
+
+                    // Six weeks of days.
+                    let (grid, _) = ui.allocate_exact_size(Vec2::new(w, 6.0 * CELL.y), Sense::hover());
+                    let start = start_of_week(month);
+                    for k in 0..42 {
+                        let day = start + Duration::days(k);
+                        let r = Rect::from_min_size(
+                            grid.min + Vec2::new((k % 7) as f32 * CELL.x, (k / 7) as f32 * CELL.y),
+                            CELL,
+                        );
+                        let resp = ui.interact(r, popup_id.with(("day", k)), Sense::click());
+                        let bg = r.shrink2(Vec2::new(1.5, 1.0));
+                        if day == *date {
+                            ui.painter().rect_filled(bg, 5.0, if p.dark { p.grid_strong } else { p.button });
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(bg, 5.0, p.selection);
+                        }
+                        let in_month = day.month() == month.month();
+                        let color = if day == today {
+                            RED
+                        } else if in_month {
+                            p.text
+                        } else {
+                            p.tertiary
+                        };
+                        let font = if day == *date || day == today { theme::bold_font(13.0) } else { theme::font(13.0) };
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, day.day().to_string(), font, color);
+                        if resp.clicked() {
+                            *date = day;
+                            close = true;
+                        }
+                    }
+                });
+        });
+    ui.data_mut(|d| d.insert_temp(month_id, month));
+
+    // Close on a press outside the calendar (other than on the button, which
+    // toggles it itself), or on Esc — swallowing the Esc so it doesn't also
+    // discard the whole edit.
+    let outside = ui.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer.press_origin().is_some_and(|pos| !area.response.rect.contains(pos) && !resp.rect.contains(pos))
+    });
+    let esc = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+    if close || outside || esc {
+        ui.memory_mut(|m| m.close_popup());
+    }
 }
 
 /// The calendar picker: a chip with the calendar's color dot; clicking it
@@ -464,71 +695,124 @@ fn calendar_chip(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
         v.window_stroke = Stroke::new(1.0_f32, p.grid_strong);
         ui.style_mut().spacing.menu_margin = egui::Margin::symmetric(5.0, 6.0);
         egui::popup::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-            calendar_menu(ui, ed, store, p);
+            if let Some(id) = crate::menu::calendar_menu(ui, store, &ed.draft.calendar_id, p) {
+                ed.draft.calendar_id = id;
+            }
         });
     });
 }
 
-/// The hovered row of the calendar menu: the red macOS Calendar uses for its
-/// menu highlight, whatever the calendar's own color.
-const MENU_HIGHLIGHT: Color32 = Color32::from_rgb(0xB8, 0x43, 0x40);
-
-fn calendar_menu(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) {
-    const ROW_H: f32 = 22.0;
-    const PAD: f32 = 8.0;
-    ui.spacing_mut().item_spacing = Vec2::ZERO;
-    // Wide enough for the longest name: check and dot columns, then the text.
-    let text_w = store
-        .calendars
-        .iter()
-        .map(|c| ui.fonts(|f| f.layout_no_wrap(c.name.clone(), theme::font(14.0), p.text).size().x))
-        .fold(0.0, f32::max);
-    let width = (PAD + 36.0 + text_w + PAD + 6.0).max(180.0);
-    ui.set_width(width);
-
-    // Local calendars, then each account's.
-    let mut groups: Vec<(Option<String>, String)> = vec![
-        (None, "On My Computer".to_owned()),
-        (Some(GOOGLE.to_owned()), store.google.account_email.clone().unwrap_or_else(|| "Google".into())),
-    ];
-    groups.extend(store.caldav.iter().map(|a| (Some(a.id.clone()), a.label.clone())));
-    let mut first = true;
-    for (account, header) in groups {
-        let cals: Vec<_> = store.calendars.iter().filter(|c| !c.read_only && c.account() == account.as_deref()).collect();
-        if cals.is_empty() {
-            continue;
+/// A small round badge for an invitee's reply, drawn like macOS: a hollow
+/// ring while waiting, a green tick, an orange "?" or a red cross.
+fn response_badge(ui: &mut egui::Ui, response: Response, p: &Palette) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+    let c = rect.center();
+    let painter = ui.painter();
+    let white = Stroke::new(1.6_f32, Color32::WHITE);
+    let tip = match response {
+        Response::NeedsAction => {
+            painter.circle_stroke(c, 6.0, Stroke::new(1.2_f32, p.tertiary));
+            "No response yet"
         }
-        if !first {
-            let (r, _) = ui.allocate_exact_size(Vec2::new(width, 11.0), Sense::hover());
-            ui.painter().hline(r.left() + PAD..=r.right() - PAD, r.center().y, Stroke::new(1.0_f32, p.grid_strong));
+        Response::Accepted => {
+            painter.circle_filled(c, 7.0, Color32::from_rgb(0x34, 0xC7, 0x59));
+            painter.line_segment([c + Vec2::new(-3.0, 0.2), c + Vec2::new(-0.8, 2.5)], white);
+            painter.line_segment([c + Vec2::new(-0.8, 2.5), c + Vec2::new(3.2, -2.5)], white);
+            "Accepted"
         }
-        first = false;
-        let (r, _) = ui.allocate_exact_size(Vec2::new(width, ROW_H - 2.0), Sense::hover());
-        let at = r.left_center() + Vec2::new(PAD, 0.0);
-        ui.painter().text(at, Align2::LEFT_CENTER, header, theme::bold_font(12.0), p.secondary);
+        Response::Tentative => {
+            painter.circle_filled(c, 7.0, Color32::from_rgb(0xFF, 0x95, 0x00));
+            painter.text(c, Align2::CENTER_CENTER, "?", theme::bold_font(10.0), Color32::WHITE);
+            "Maybe"
+        }
+        Response::Declined => {
+            painter.circle_filled(c, 7.0, RED);
+            painter.line_segment([c + Vec2::new(-2.5, -2.5), c + Vec2::new(2.5, 2.5)], white);
+            painter.line_segment([c + Vec2::new(-2.5, 2.5), c + Vec2::new(2.5, -2.5)], white);
+            "Declined"
+        }
+    };
+    resp.on_hover_text(tip);
+}
 
-        for c in cals {
-            let (r, row) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
-            let mut text = p.text;
-            if row.hovered() {
-                ui.painter().rect_filled(r, 5.0, MENU_HIGHLIGHT);
-                text = Color32::WHITE;
-            }
-            if c.id == ed.draft.calendar_id {
-                // A "✓", drawn (the UI font may not have the glyph).
-                let c = Pos2::new(r.left() + PAD + 5.0, r.center().y);
-                let s = Stroke::new(1.6_f32, text);
-                ui.painter().line_segment([c + Vec2::new(-4.0, 0.0), c + Vec2::new(-1.0, 3.5)], s);
-                ui.painter().line_segment([c + Vec2::new(-1.0, 3.5), c + Vec2::new(4.5, -4.5)], s);
-            }
-            ui.painter().circle_filled(Pos2::new(r.left() + PAD + 22.0, r.center().y), 6.0, theme::rgb(c.color));
-            let at = r.left_center() + Vec2::new(PAD + 36.0, 0.0);
-            ui.painter().text(at, Align2::LEFT_CENTER, &c.name, theme::font(14.0), text);
-            if row.clicked() {
-                ed.draft.calendar_id = c.id.clone();
-            }
-        }
+/// The guest list and the "Add Invitees" field. Invitations go out through
+/// Google, so on a local calendar the card only appears if the event already
+/// has guests (e.g. it was moved off a Google calendar), with a note.
+fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette, read_only: bool) {
+    let on_google = store.calendar(&ed.draft.calendar_id).is_some_and(|c| c.google_id().is_some());
+    let has_guests = ed.draft.attendees.iter().any(|a| !a.resource);
+    if !has_guests && (read_only || !on_google) {
+        return;
     }
+    card(ui, p, |ui| {
+        let mut remove = None;
+        for (i, a) in ed.draft.attendees.iter().enumerate().filter(|(_, a)| !a.resource) {
+            ui.horizontal(|ui| {
+                response_badge(ui, a.response, p);
+                let mut text = RichText::new(a.label()).color(p.text);
+                if a.response == Response::Declined {
+                    text = text.strikethrough();
+                }
+                let label = ui.label(text);
+                if !a.name.is_empty() {
+                    label.on_hover_text(&a.email);
+                }
+                let role = if a.organizer {
+                    "organizer"
+                } else if a.is_self {
+                    "you"
+                } else if a.optional {
+                    "optional"
+                } else {
+                    ""
+                };
+                if !role.is_empty() {
+                    ui.label(RichText::new(role).color(p.secondary).small());
+                }
+                if !read_only && !a.organizer {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let x = ui.add(egui::Label::new(RichText::new("\u{2715}").color(p.tertiary)).sense(Sense::click()));
+                        if x.on_hover_text("Remove").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+            });
+        }
+        if let Some(i) = remove {
+            ed.draft.attendees.remove(i);
+        }
+        if !read_only {
+            if has_guests {
+                divider(ui, p);
+            }
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut ed.invitee_input)
+                    .id_source("invitee-input")
+                    .hint_text(RichText::new("Add Invitees").color(p.placeholder))
+                    .text_color(p.text)
+                    .frame(false)
+                    .desired_width(f32::INFINITY),
+            );
+            let entered = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let separated = field.changed() && ed.invitee_input.ends_with([',', ';']);
+            if entered || separated {
+                ed.take_invitees();
+                if entered {
+                    // Stay in the field for the next address.
+                    field.request_focus();
+                }
+            } else if field.changed() {
+                ed.invitee_error = None;
+            }
+        }
+        if let Some(err) = &ed.invitee_error {
+            ui.label(RichText::new(err).color(RED).small());
+        }
+        if !on_google && has_guests {
+            ui.label(RichText::new("Invitations are only sent for events on a Google calendar.").color(p.secondary).small());
+        }
+    });
 }
 
 /// Draws the editor's contents into `ui`.
@@ -582,6 +866,7 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
         }
         if ed.editing_when && !read_only {
             divider(ui, p);
+            let before = ed.when_fields();
             egui::Grid::new("when-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                 ui.label(RichText::new("all-day").color(p.secondary));
                 ui.checkbox(&mut ed.draft.all_day, "");
@@ -592,7 +877,7 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
                 ] {
                     ui.label(RichText::new(label).color(p.secondary));
                     ui.horizontal(|ui| {
-                        ui.push_id(id, |ui| ui.add_sized(DATE_BUTTON, egui_extras::DatePickerButton::new(date)));
+                        date_button(ui, &format!("{id}-date"), date, p);
                         if !ed.draft.all_day {
                             time_button(ui, &format!("{id}-time"), time);
                         }
@@ -608,6 +893,7 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
                     repeat_rows(ui, ed, p);
                 }
             });
+            ed.adjust_when(before);
         }
         for line in when_details(ed) {
             ui.label(RichText::new(line).color(p.secondary).small());
@@ -616,6 +902,8 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
             ui.label(RichText::new(err).color(RED).small());
         }
     });
+
+    invitees_card(ui, ed, store, p, read_only);
 
     // Notes.
     card(ui, p, |ui| {
@@ -751,4 +1039,135 @@ pub fn inspector(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette)
         return Outcome::Cancel;
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap()
+    }
+
+    fn event(start: NaiveDateTime, end: NaiveDateTime, all_day: bool) -> Event {
+        Event {
+            id: "local:e".into(),
+            calendar_id: "local:home".into(),
+            title: "Dentist".into(),
+            start,
+            end,
+            all_day,
+            location: String::new(),
+            notes: String::new(),
+            attendees: Vec::new(),
+            remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
+            etag: None,
+            base: None,
+            recurrence: None,
+            time_zone: None,
+        }
+    }
+
+    fn editor(ev: Event) -> Editor {
+        Editor::new(ev, false, Placement::Inspector)
+    }
+
+    #[test]
+    fn moving_the_start_keeps_the_duration() {
+        let mut ed = editor(event(at(2026, 11, 14, 10, 0), at(2026, 11, 14, 11, 30), false));
+        let before = ed.when_fields();
+        ed.start_date = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        ed.start_time = NaiveTime::from_hms_opt(23, 0, 0).unwrap();
+        ed.adjust_when(before);
+        let ev = ed.result().unwrap();
+        assert_eq!((ev.start, ev.end), (at(2026, 11, 15, 23, 0), at(2026, 11, 16, 0, 30)));
+    }
+
+    #[test]
+    fn moving_the_end_leaves_the_start() {
+        let mut ed = editor(event(at(2026, 11, 14, 10, 0), at(2026, 11, 14, 11, 0), false));
+        let before = ed.when_fields();
+        ed.end_time = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        ed.adjust_when(before);
+        let ev = ed.result().unwrap();
+        assert_eq!((ev.start, ev.end), (at(2026, 11, 14, 10, 0), at(2026, 11, 14, 12, 0)));
+    }
+
+    #[test]
+    fn unchecking_all_day_gives_real_hours() {
+        let mut ed = editor(event(at(2026, 11, 14, 0, 0), at(2026, 11, 17, 0, 0), true));
+        let before = ed.when_fields();
+        ed.draft.all_day = false;
+        ed.adjust_when(before);
+        let ev = ed.result().unwrap();
+        assert_eq!((ev.start, ev.end), (at(2026, 11, 14, 9, 0), at(2026, 11, 16, 10, 0)), "keeps its last day");
+    }
+
+    #[test]
+    fn checking_all_day_on_an_event_ending_at_midnight_keeps_one_day() {
+        let mut ed = editor(event(at(2026, 11, 14, 22, 0), at(2026, 11, 15, 0, 0), false));
+        let before = ed.when_fields();
+        ed.draft.all_day = true;
+        ed.adjust_when(before);
+        let ev = ed.result().unwrap();
+        assert_eq!((ev.start, ev.end), (at(2026, 11, 14, 0, 0), at(2026, 11, 15, 0, 0)));
+    }
+
+    #[test]
+    fn a_repeat_ending_before_the_start_is_refused() {
+        let mut ev = event(at(2026, 11, 14, 9, 0), at(2026, 11, 14, 10, 0), false);
+        let mut rule = Recurrence::new(Freq::Weekly);
+        rule.end = RepeatEnd::Until(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap());
+        ev.recurrence = Some(rule.clone());
+        assert!(editor(ev.clone()).result().is_err());
+        rule.end = RepeatEnd::Until(NaiveDate::from_ymd_opt(2026, 11, 14).unwrap());
+        ev.recurrence = Some(rule);
+        assert!(editor(ev).result().is_ok(), "ending on its first day is fine");
+    }
+
+    #[test]
+    fn closing_an_untouched_editor_on_a_deleted_event_keeps_it_deleted() {
+        let ev = event(at(2026, 11, 14, 9, 0), at(2026, 11, 14, 10, 0), false);
+        let mut ed = editor(ev.clone());
+        assert!(!changed(&ed, None), "nothing edited: don't bring it back");
+        assert!(!changed(&ed, Some(&ev)));
+        ed.draft.title = "Dentist (moved)".into();
+        assert!(changed(&ed, None), "an edit beats a delete");
+        assert!(changed(&Editor::new(ev, true, Placement::Inspector), None), "a new event is always saved");
+    }
+
+    /// A new event on a Google calendar, already inviting ann@example.com.
+    fn invitee_editor() -> Editor {
+        let mut ev = event(at(2026, 11, 14, 9, 0), at(2026, 11, 14, 10, 0), false);
+        ev.calendar_id = "google:primary".into();
+        ev.attendees = vec![Attendee::new("ann@example.com")];
+        Editor::new(ev, true, Placement::Inspector)
+    }
+
+    fn emails(list: &[Attendee]) -> Vec<&str> {
+        list.iter().map(|a| a.email.as_str()).collect()
+    }
+
+    #[test]
+    fn typed_addresses_are_added_once_and_junk_stays_in_the_field() {
+        let mut ed = invitee_editor();
+        ed.invitee_input = "bob@example.com, oops; ANN@example.com carol@example.org".into();
+        ed.take_invitees();
+        assert_eq!(emails(&ed.draft.attendees), ["ann@example.com", "bob@example.com", "carol@example.org"]);
+        assert_eq!(ed.invitee_input, "oops");
+        assert!(ed.invitee_error.is_some());
+    }
+
+    #[test]
+    fn an_address_left_in_the_field_is_saved() {
+        let mut ed = invitee_editor();
+        ed.invitee_input = "dave@example.com".into();
+        let ev = ed.result().unwrap();
+        assert_eq!(emails(&ev.attendees), ["ann@example.com", "dave@example.com"]);
+        ed.invitee_input = "not an address".into();
+        assert_eq!(emails(&ed.result().unwrap().attendees), ["ann@example.com"]);
+    }
 }

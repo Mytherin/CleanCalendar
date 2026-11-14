@@ -164,10 +164,22 @@ fn access_token_is_refreshed_once_and_sent_as_bearer() {
 
 #[test]
 fn failed_token_refresh_is_retryable() {
-    let server = FakeServer::start(|_| (400, json!({"error": "invalid_grant"})));
+    // A hiccup at the token endpoint: try again later.
+    let server = FakeServer::start(|_| (503, json!({"error": "temporarily_unavailable"})));
     let err = server.client().list_calendars().unwrap_err();
     assert_eq!(classify(&err), Failure::Retry);
-    assert!(err.to_string().contains("invalid_grant"));
+    assert!(err.to_string().contains("temporarily_unavailable"));
+}
+
+#[test]
+fn a_revoked_sign_in_asks_to_connect_again() {
+    // The refresh token was revoked or expired: retrying can never work.
+    for code in ["invalid_grant", "invalid_client", "unauthorized_client"] {
+        let server = FakeServer::start(move |_| (400, json!({"error": code})));
+        let err = server.client().list_calendars().unwrap_err();
+        assert_eq!(classify(&err), Failure::SignedOut, "{code}");
+        assert!(err.to_string().contains("connect again"), "{err}");
+    }
 }
 
 // ---- calendar list --------------------------------------------------------
@@ -307,6 +319,7 @@ fn local_event(remote_id: Option<&str>) -> Event {
         all_day: false,
         location: "Cafe".into(),
         notes: "bring cash".into(),
+        attendees: Vec::new(),
         remote_id: remote_id.map(str::to_owned),
         recurring_id: None,
         pending: true,
@@ -341,6 +354,47 @@ fn new_events_are_posted_and_existing_ones_patched() {
 }
 
 #[test]
+fn invitees_are_sent_only_when_the_guest_list_changes() {
+    use crate::model::{Attendee, Response};
+    let server = FakeServer::start(|r| match r.path.as_str() {
+        "/token" => token_ok(),
+        _ => (200, json!({"id": "e1"})),
+    });
+    let mut c = server.client();
+
+    // A new event with a guest: invited, and Google emails them.
+    let mut ev = local_event(None);
+    ev.attendees = vec![Attendee::new("ann@example.com")];
+    c.save_event("primary", &ev).unwrap();
+
+    // Retitled, same guests (Ann has accepted meanwhile): the list is left
+    // alone so the PATCH can't overwrite anything, but guests are notified.
+    let mut edited = local_event(Some("e1"));
+    edited.attendees = vec![Attendee { response: Response::Accepted, ..Attendee::new("ann@example.com") }];
+    edited.base = Some(edited.fields());
+    edited.title = "Lunch!".into();
+    c.save_event("primary", &edited).unwrap();
+
+    // Bob added: the new list is sent.
+    let mut invited = edited.clone();
+    invited.attendees.push(Attendee::new("bob@example.com"));
+    c.save_event("primary", &invited).unwrap();
+
+    // No guests before or after: no emails.
+    c.save_event("primary", &local_event(None)).unwrap();
+
+    let reqs = server.api_requests();
+    assert_eq!(reqs[0].json()["attendees"], json!([{"email": "ann@example.com", "responseStatus": "needsAction"}]));
+    assert_eq!(reqs[0].q("sendUpdates"), Some("all"));
+    assert!(reqs[1].json().get("attendees").is_none());
+    assert_eq!(reqs[1].q("sendUpdates"), Some("all"));
+    let sent: Vec<_> = reqs[2].json()["attendees"].as_array().unwrap().iter().map(|a| a["email"].clone()).collect();
+    assert_eq!(sent, [json!("ann@example.com"), json!("bob@example.com")]);
+    assert!(reqs[3].json().get("attendees").is_none());
+    assert_eq!(reqs[3].q("sendUpdates"), None);
+}
+
+#[test]
 fn all_day_events_are_sent_as_dates() {
     let server = FakeServer::start(|r| match r.path.as_str() {
         "/token" => token_ok(),
@@ -352,8 +406,10 @@ fn all_day_events_are_sent_as_dates() {
     ev.end = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap().and_hms_opt(0, 0, 0).unwrap();
     server.client().save_event("primary", &ev).unwrap();
     let body = server.api_requests()[0].json();
-    assert_eq!(body["start"], json!({"date": "2026-11-11"}));
-    assert_eq!(body["end"], json!({"date": "2026-11-14"}));
+    // dateTime/timeZone are cleared, so a PATCH of a formerly timed event
+    // doesn't leave them next to the date.
+    assert_eq!(body["start"], json!({"date": "2026-11-11", "dateTime": null, "timeZone": null}));
+    assert_eq!(body["end"], json!({"date": "2026-11-14", "dateTime": null, "timeZone": null}));
 }
 
 #[test]
@@ -503,6 +559,30 @@ fn new_events_request_a_stable_id_so_retries_cannot_duplicate() {
     let (id, etag) = server.client().save_event("primary", &ev).unwrap();
     assert_eq!((id.as_str(), etag.as_deref()), ("0123456789abcdef", Some("\"v1\"")));
     assert_eq!(server.api_requests()[0].json()["id"], "0123456789abcdef", "id chosen by us");
+}
+
+#[test]
+fn a_requested_id_taken_by_a_deleted_event_falls_back_to_a_new_one() {
+    // Google keeps deleted events' ids: the create's id is "taken", but GET
+    // says the event is gone. Retrying the same id would fail forever.
+    let server = FakeServer::start(|r| match (r.path.as_str(), r.method.as_str()) {
+        ("/token", _) => token_ok(),
+        (_, "POST") if r.json()["id"].is_string() => google_error(409, "The requested identifier already exists."),
+        (_, "POST") => {
+            let mut v = item("fresh1", "Lunch");
+            v["etag"] = json!("\"n1\"");
+            (200, v)
+        }
+        (p, "GET") if p.ends_with("/0123456789abcdef") => google_error(410, "Resource has been deleted"),
+        _ => (405, Value::Null),
+    });
+    let mut ev = local_event(None);
+    ev.id = "local:0123456789abcdef".into();
+    let (id, etag) = server.client().save_event("primary", &ev).unwrap();
+    assert_eq!((id.as_str(), etag.as_deref()), ("fresh1", Some("\"n1\"")));
+    let posts: Vec<_> = server.api_requests().into_iter().filter(|r| r.method == "POST").collect();
+    assert_eq!(posts.len(), 2);
+    assert!(posts[1].json().get("id").is_none(), "Google picks the id the second time");
 }
 
 #[test]

@@ -1,19 +1,47 @@
 //! Small date/time helpers.
 
+use std::cell::Cell;
+
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 
-/// Weeks start on Monday (as in most of Europe); `false` starts on Sunday.
-pub const WEEK_STARTS_MONDAY: bool = true;
 /// 24-hour clock ("14:30"); `false` uses "2:30 PM".
 pub const CLOCK_24H: bool = true;
 
+// Settings the date helpers follow (see `Settings::apply`). Per thread, so
+// tests that change them can't disturb each other; the UI is one thread.
+thread_local! {
+    static WEEK_START: Cell<Weekday> = const { Cell::new(Weekday::Mon) };
+    static EVENT_MINUTES: Cell<i64> = const { Cell::new(60) };
+}
+
+/// The first day of the week (Monday unless set otherwise).
+pub fn week_start() -> Weekday {
+    WEEK_START.with(Cell::get)
+}
+
+pub fn set_week_start(wd: Weekday) {
+    WEEK_START.with(|c| c.set(wd));
+}
+
+/// How long a new event is when it isn't dragged out (1 hour unless set).
+pub fn default_event_len() -> Duration {
+    Duration::minutes(EVENT_MINUTES.with(Cell::get))
+}
+
+pub fn set_default_event_minutes(m: i64) {
+    EVENT_MINUTES.with(|c| c.set(m.max(5)));
+}
+
 /// Position of a weekday within the week (0 = first column).
 pub fn week_index(wd: Weekday) -> u32 {
-    if WEEK_STARTS_MONDAY {
-        wd.num_days_from_monday()
-    } else {
-        wd.num_days_from_sunday()
-    }
+    (wd.num_days_from_monday() + 7 - week_start().num_days_from_monday()) % 7
+}
+
+/// The ISO week number of the week shown in a row starting on `first`
+/// (the week its Monday belongs to).
+pub fn week_number(first: NaiveDate) -> u32 {
+    let to_monday = (7 - first.weekday().num_days_from_monday()) % 7;
+    (first + Duration::days(to_monday as i64)).iso_week().week()
 }
 
 pub fn start_of_week(d: NaiveDate) -> NaiveDate {
@@ -26,8 +54,7 @@ pub fn is_weekend(d: NaiveDate) -> bool {
 
 /// The weekday shown in week column `i`.
 pub fn column_weekday(i: usize) -> Weekday {
-    let first = if WEEK_STARTS_MONDAY { Weekday::Mon } else { Weekday::Sun };
-    (0..i % 7).fold(first, |wd, _| wd.succ())
+    (0..i % 7).fold(week_start(), |wd, _| wd.succ())
 }
 
 /// Whether week column `i` is Saturday or Sunday.
@@ -46,6 +73,14 @@ pub fn add_months(d: NaiveDate, n: i32) -> NaiveDate {
         d.checked_sub_months(Months::new(n.unsigned_abs()))
     };
     r.unwrap_or(d)
+}
+
+/// `n` months from `d`'s month, on day `day` (or that month's last day if
+/// it's shorter). Stepping with the same `day` doesn't drift:
+/// 31 Jan → 28 Feb → 31 Mar, not → 28 Mar.
+pub fn step_months(d: NaiveDate, n: i32, day: u32) -> NaiveDate {
+    let month = add_months(first_of_month(d), n);
+    month.with_day(day.clamp(1, days_in_month(month))).unwrap_or(month)
 }
 
 pub fn days_in_month(d: NaiveDate) -> u32 {
@@ -145,10 +180,42 @@ mod tests {
     }
 
     #[test]
+    fn week_can_start_on_any_day() {
+        set_week_start(Weekday::Sun);
+        assert_eq!(start_of_week(d(2026, 11, 14)), d(2026, 11, 8));
+        assert_eq!(start_of_week(d(2026, 11, 15)), d(2026, 11, 15), "Sunday starts the week");
+        assert_eq!((weekday_short(0), weekday_initial(6)), ("Sun", "S"));
+        assert!(is_weekend_column(0) && is_weekend_column(6) && !is_weekend_column(5));
+        set_week_start(Weekday::Sat);
+        assert_eq!(start_of_week(d(2026, 11, 13)), d(2026, 11, 7));
+        set_week_start(Weekday::Mon);
+    }
+
+    #[test]
+    fn week_numbers_follow_the_rows_monday() {
+        assert_eq!(week_number(d(2026, 11, 9)), 46, "a Monday row");
+        assert_eq!(week_number(d(2026, 11, 8)), 46, "a Sunday row: its Monday is the 9th");
+        assert_eq!(week_number(d(2026, 12, 28)), 53);
+        assert_eq!(week_number(d(2027, 1, 4)), 1);
+    }
+
+    #[test]
     fn month_math() {
         assert_eq!(add_months(d(2026, 1, 31), 1), d(2026, 2, 28));
         assert_eq!(add_months(d(2026, 1, 15), -1), d(2025, 12, 15));
         assert_eq!(days_in_month(d(2028, 2, 10)), 29);
+    }
+
+    #[test]
+    fn stepping_months_does_not_drift() {
+        let feb = step_months(d(2026, 1, 31), 1, 31);
+        assert_eq!(feb, d(2026, 2, 28));
+        assert_eq!(step_months(feb, 1, 31), d(2026, 3, 31), "back to the 31st");
+        assert_eq!(step_months(d(2026, 3, 31), -1, 31), d(2026, 2, 28));
+        // Years: 29 Feb → 28 Feb → 29 Feb in the next leap year.
+        let y = step_months(d(2028, 2, 29), 12, 29);
+        assert_eq!(y, d(2029, 2, 28));
+        assert_eq!(step_months(y, 36, 29), d(2032, 2, 29));
     }
 
     #[test]

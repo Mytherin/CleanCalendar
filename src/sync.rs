@@ -42,12 +42,26 @@ pub struct SyncEngine {
     /// Uploads handed out and not answered yet ("save:<event id>",
     /// "del:<remote id>"), so retries don't queue duplicates.
     in_flight: HashSet<String>,
+    /// What each upload in flight sent, by local event id: once the service
+    /// confirms it, that's the version the service has (the merge base).
+    sent: HashMap<String, EventFields>,
     /// Accounts with a sync out with the worker.
     running: HashSet<String>,
     /// Accounts asked to sync again while one was running.
     again: HashSet<String>,
     /// CalDAV accounts being added, until the server accepts the login.
     connecting: HashMap<String, CalDavAccount>,
+}
+
+/// The id a new event asks the service for, derived from its local id, so a
+/// create whose reply was lost can still be recognised (and deleted). Only
+/// Google lets the client choose it up front.
+fn requested_remote_id(calendar: &CalRef, local_id: &str) -> Option<String> {
+    if calendar.account == GOOGLE {
+        crate::google::client_event_id(local_id)
+    } else {
+        None
+    }
 }
 
 impl SyncEngine {
@@ -148,12 +162,27 @@ impl SyncEngine {
     /// applies if nobody changed it meanwhile (their change wins). Otherwise
     /// (moved to another calendar) the old copy is removed unconditionally.
     pub fn event_deleted(&mut self, store: &mut Store, ev: &Event, user_deleted: bool) {
-        if let (Some(calendar), Some(remote_id)) = (store.remote_of(ev), ev.remote_id.clone()) {
-            let etag = if user_deleted { ev.etag.clone() } else { None };
-            self.queue_delete(store, PendingDelete { calendar, remote_id, etag });
+        let Some(calendar) = store.remote_of(ev) else { return };
+        // Our own upload of an edit is still out: once it lands, the
+        // service's etag is newer than ours, and an If-Match delete would fail
+        // as if someone else had changed the event. The newer version is ours.
+        let saving = self.in_flight.contains(&format!("save:{}", ev.id));
+        match ev.remote_id.clone() {
+            Some(remote_id) => {
+                let etag = if user_deleted && !saving { ev.etag.clone() } else { None };
+                self.queue_delete(store, PendingDelete { calendar, remote_id, etag });
+            }
+            // Never confirmed. If an upload is in flight, `on_saved` notices
+            // the event is gone and deletes the copy it created. Otherwise an
+            // earlier create may still have landed (only its reply was lost):
+            // delete it by the id it asked for (a 404 is fine).
+            None if !saving => {
+                if let Some(remote_id) = requested_remote_id(&calendar, &ev.id) {
+                    self.queue_delete(store, PendingDelete { calendar, remote_id, etag: None });
+                }
+            }
+            None => {}
         }
-        // Never uploaded: if an upload is in flight, `on_saved` notices the
-        // event is gone and deletes the copy it created.
     }
 
     /// Call when the user deleted a whole repeating series that the service
@@ -169,6 +198,7 @@ impl SyncEngine {
         let Some(calendar) = store.remote_of(&ev) else { return };
         let Some(login) = store.login(&calendar.account) else { return };
         if self.in_flight.insert(format!("save:{id}")) {
+            self.sent.insert(id.to_owned(), ev.fields());
             self.outbox.push(Cmd::Save { login, calendar, event: ev });
         }
     }
@@ -233,6 +263,31 @@ impl SyncEngine {
     /// Processes one reply from the worker. `dragging` is the id of an event
     /// the user is dragging right now; a sync won't overwrite it.
     pub fn handle(&mut self, store: &mut Store, msg: Msg, dragging: Option<&str>, today: NaiveDate) {
+        // A reply to a request made before signing out of its account:
+        // applying it would bring back the calendars that were just removed.
+        let account = match &msg {
+            Msg::Synced { account, .. } | Msg::SyncFailed { account, .. } => Some(account.clone()),
+            Msg::Saved { calendar, .. }
+            | Msg::SaveFailed { calendar, .. }
+            | Msg::DeleteFailed { calendar, .. }
+            | Msg::DeleteConflict { calendar, .. } => Some(calendar.account.clone()),
+            _ => None,
+        };
+        if let Some(account) = account.filter(|a| store.login(a).is_none()) {
+            match &msg {
+                Msg::Saved { local_id, .. } | Msg::SaveFailed { local_id, .. } => {
+                    self.in_flight.remove(&format!("save:{local_id}"));
+                    self.sent.remove(local_id);
+                }
+                Msg::DeleteFailed { remote_id, .. } | Msg::DeleteConflict { remote_id, .. } => {
+                    self.in_flight.remove(&format!("del:{remote_id}"));
+                }
+                _ => {}
+            }
+            self.running.remove(&account);
+            self.again.remove(&account);
+            return;
+        }
         match msg {
             Msg::Connected { account, refresh_token } => {
                 if account == GOOGLE {
@@ -282,6 +337,7 @@ impl SyncEngine {
             }
             Msg::SaveConflict { local_id, server } => {
                 self.in_flight.remove(&format!("save:{local_id}"));
+                self.sent.remove(&local_id);
                 self.resolve_save_conflict(store, &local_id, server);
             }
             Msg::DeleteConflict { remote_id, calendar, server } => {
@@ -310,6 +366,9 @@ impl SyncEngine {
                 let name = store.account_name(&calendar.account);
                 if kind == Failure::Retry {
                     self.status(offline(&name), true);
+                } else if kind == Failure::SignedOut {
+                    // Kept for when the user connects again.
+                    self.status(error, true);
                 } else {
                     // The service won't delete it: drop the request and show
                     // what it has.
@@ -339,6 +398,7 @@ impl SyncEngine {
         today: NaiveDate,
     ) {
         self.in_flight.remove(&format!("save:{local_id}"));
+        let sent = self.sent.remove(&local_id);
         let still_there = store.event(&local_id).is_some_and(|ev| store.remote_of(ev).as_ref() == Some(&calendar));
         if !still_there {
             // Deleted (or moved to another calendar) while the upload was in
@@ -351,6 +411,18 @@ impl SyncEngine {
         if let (Some(old), Some(new)) = (&old_etag, &etag) {
             bump_siblings(store, &calendar.local_id(), &remote_id, old, new);
         }
+        if new_id != local_id {
+            // A sync may already have brought the service's copy of this
+            // event (the create landed but an earlier reply was lost). Two
+            // events with one id can't be saved, so keep one: ours, unless
+            // theirs was edited here since.
+            store.events.retain(|e| !(e.id == new_id && !e.pending));
+            if store.event(&new_id).is_some() {
+                store.events.retain(|e| e.id != local_id);
+                self.notices.push(Notice::Renamed { from: local_id, to: new_id });
+                return;
+            }
+        }
         let ev = store.event_mut(&local_id).unwrap();
         ev.remote_id = Some(remote_id);
         ev.id = new_id.clone();
@@ -358,10 +430,13 @@ impl SyncEngine {
         if ev.rev == rev {
             ev.pending = false;
             ev.base = None;
-        } else {
+        } else if sent.is_some() {
             // Edited again meanwhile: what the service has now is what we
-            // sent. (`base` stays the older snapshot; merging against it only
-            // makes our side win more often, never loses their changes.)
+            // sent, so that's what the next edit is based on. (With the older
+            // snapshot, a field we already uploaded would count as still
+            // changed on our side and overwrite a newer change from
+            // another device.)
+            ev.base = sent;
         }
         // A new series: the service sends it back as occurrences, which
         // replace our copy (see `apply_changes`). Fetch them now.
@@ -388,11 +463,14 @@ impl SyncEngine {
         today: NaiveDate,
     ) {
         self.in_flight.remove(&format!("save:{local_id}"));
+        self.sent.remove(&local_id);
         let title = store.event(&local_id).map(|e| e.title.clone()).unwrap_or_default();
         let name = store.account_name(&calendar.account);
         match kind {
             // Stays pending; the next sync retries it.
             Failure::Retry => self.status(offline(&name), true),
+            // Stays pending until the user connects again.
+            Failure::SignedOut => self.status(error, true),
             // Creating failed because the calendar itself is gone (updates of
             // deleted events arrive as conflicts instead), or it was refused.
             Failure::Gone | Failure::Rejected => {
@@ -473,8 +551,18 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
     let take_loc = take_ours("location", base.location.clone(), ours.location.clone(), theirs.location.clone());
     let take_notes = take_ours("notes", base.notes.clone(), ours.notes.clone(), theirs.notes.clone());
     let take_when = take_ours("time", when(base), when(ours), when(theirs));
+    // Who is invited is compared by address; replies are only ever made on
+    // the server, so they don't count as our change.
+    let emails = |f: &EventFields| f.attendees.iter().map(|a| a.email.to_lowercase()).collect::<Vec<_>>();
+    let take_invitees = take_ours("invitees", emails(base).join(","), emails(ours).join(","), emails(theirs).join(","));
 
     let from = |take_ours: bool| if take_ours { ours } else { theirs };
+    let mut attendees = from(take_invitees).attendees.clone();
+    for a in &mut attendees {
+        if let Some(t) = theirs.attendees.iter().find(|t| t.email.eq_ignore_ascii_case(&a.email)) {
+            a.response = t.response;
+        }
+    }
     let merged = EventFields {
         title: from(take_title).title.clone(),
         location: from(take_loc).location.clone(),
@@ -484,6 +572,7 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
         all_day: from(take_when).all_day,
         recurrence: from(take_when).recurrence.clone(),
         time_zone: from(take_when).time_zone.clone(),
+        attendees,
     };
     (merged, clashes)
 }
@@ -576,7 +665,8 @@ fn apply_changes(store: &mut Store, account: &str, changes: Vec<CalendarChanges>
     let protected = |e: &Event| e.pending || Some(e.id.as_str()) == dragging;
 
     for ch in changes {
-        let cal_id = CalRef::new(account, &ch.calendar_id).local_id();
+        let calendar = CalRef::new(account, &ch.calendar_id);
+        let cal_id = calendar.local_id();
         if ch.full {
             store.events.retain(|e| e.calendar_id != cal_id || protected(e));
         } else if !ch.cancelled.is_empty() {
@@ -591,9 +681,22 @@ fn apply_changes(store: &mut Store, account: &str, changes: Vec<CalendarChanges>
         }
         let mut index: HashMap<String, usize> =
             store.events.iter().enumerate().map(|(i, e)| (e.id.clone(), i)).collect();
+        // New events whose upload hasn't been confirmed: the create may have
+        // reached the service even though its reply didn't reach us. Their
+        // copy from the service is the same event; the confirmation renames
+        // ours.
+        let uploading: HashSet<String> = store
+            .events
+            .iter()
+            .filter(|e| e.calendar_id == cal_id && e.remote_id.is_none())
+            .filter_map(|e| requested_remote_id(&calendar, &e.id))
+            .collect();
         for ev in ch.events {
             let being_deleted = |id: &Option<String>| id.as_ref().is_some_and(|r| deleting.contains(r));
             if being_deleted(&ev.remote_id) || being_deleted(&ev.recurring_id) {
+                continue;
+            }
+            if ev.remote_id.as_ref().is_some_and(|r| uploading.contains(r)) {
                 continue;
             }
             match index.get(&ev.id) {
@@ -651,6 +754,7 @@ mod tests {
             all_day: false,
             location: String::new(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: Some(rid.into()),
             recurring_id: None,
             pending: false,
@@ -1034,6 +1138,123 @@ mod tests {
     }
 
     #[test]
+    fn a_revoked_sign_in_keeps_the_edit_and_says_so() {
+        let id = google::local_event_id(CAL, "a");
+        let mut store = store_with(vec![gev("a", "old")]);
+        let mut engine = SyncEngine::default();
+        edit(&mut store, &mut engine, &id, "new");
+        sent(&mut engine);
+        let msg = Msg::SaveFailed {
+            local_id: id.clone(),
+            calendar: CalRef::google(CAL),
+            error: "Google sign-in expired or was revoked (invalid_grant); connect again".into(),
+            kind: Failure::SignedOut,
+        };
+        engine.handle(&mut store, msg, None, today());
+        assert!(store.event(&id).unwrap().pending, "kept for when the user connects again");
+        assert_eq!(titles(&store), ["new"]);
+        let st = statuses(&engine);
+        assert!(st.iter().any(|s| s.contains("connect again")), "{st:?}");
+        assert!(!st.iter().any(|s| *s == offline("Google")), "not reported as being offline");
+    }
+
+    #[test]
+    fn a_confirmed_upload_becomes_the_base_for_the_next_merge() {
+        // We upload a new title; while it's out, we edit the notes. Then
+        // another device changes the title again.
+        let id = google::local_event_id(CAL, "a");
+        let mut store = store_with(vec![gev("a", "Standup")]);
+        let mut engine = SyncEngine::default();
+        edit(&mut store, &mut engine, &id, "Standup (ours)");
+        engine.before_change(&mut store, &id);
+        store.event_mut(&id).unwrap().notes = "bring slides".into();
+        engine.event_changed(&mut store, &id);
+        engine.handle(&mut store, saved(&id, 1, "a"), None, today());
+        sent(&mut engine);
+
+        let server = theirs(|e| e.title = "Standup (theirs, newer)".into());
+        engine.handle(&mut store, conflict(Some(server)), None, today());
+        let ev = store.event(&id).unwrap();
+        assert_eq!(ev.title, "Standup (theirs, newer)", "our title was already on Google; theirs is newer");
+        assert_eq!(ev.notes, "bring slides", "our unsent edit is kept");
+    }
+
+    #[test]
+    fn replies_arriving_after_signing_out_are_ignored() {
+        let mut store = store_with(vec![]);
+        let mut engine = SyncEngine::default();
+        assert!(engine.sync(&store, today()));
+        sent(&mut engine);
+        engine.disconnect(&mut store, GOOGLE);
+
+        engine.handle(&mut store, synced(changes(true, vec![gev("a", "Standup")], &[], Some("t"))), None, today());
+        assert!(store.calendars.iter().all(|c| c.google_id().is_none()), "Google calendars stay gone");
+        assert!(store.events.is_empty());
+        assert!(store.google.account_email.is_none());
+
+        // Signing in again syncs normally.
+        engine.handle(&mut store, Msg::Connected { account: GOOGLE.into(), refresh_token: Some("r2".into()) }, None, today());
+        assert!(sent(&mut engine).iter().any(|s| matches!(s, Sent::Sync(_))));
+    }
+
+    #[test]
+    fn a_create_whose_reply_was_lost_never_ends_up_twice() {
+        // The create reaches Google but its reply is lost (Retry); a sync then
+        // brings Google's copy before the retried create is confirmed.
+        let mut store = store_with(vec![new_gev("local:abc12", "lunch")]);
+        let mut engine = SyncEngine::default();
+        engine.event_changed(&mut store, "local:abc12");
+        sent(&mut engine);
+        engine.handle(&mut store, save_failed("local:abc12", Failure::Retry), None, today());
+
+        engine.handle(&mut store, synced(changes(false, vec![gev("abc12", "lunch")], &[], Some("t1"))), None, today());
+        assert_eq!(titles(&store), ["lunch"], "Google's copy of our pending create isn't shown twice");
+
+        // Even if a copy did slip in, the confirmation leaves one event.
+        store.events.push(gev("abc12", "lunch"));
+        engine.handle(&mut store, saved("local:abc12", 1, "abc12"), None, today());
+        let id = google::local_event_id(CAL, "abc12");
+        assert_eq!(store.events.iter().filter(|e| e.id == id).count(), 1);
+        assert_eq!(store.events.len(), 1);
+    }
+
+    #[test]
+    fn deleting_right_after_an_edit_deletes_it() {
+        let id = google::local_event_id(CAL, "a");
+        let mut ev = gev("a", "Standup");
+        ev.etag = Some("e0".into());
+        let mut store = store_with(vec![ev]);
+        let mut engine = SyncEngine::default();
+        edit(&mut store, &mut engine, &id, "Standup (moved)");
+        sent(&mut engine);
+
+        // Deleted while the edit's upload is still out: that upload changes
+        // Google's etag, so the delete must not depend on the old one.
+        let ev = store.event(&id).unwrap().clone();
+        store.events.clear();
+        engine.event_deleted(&mut store, &ev, true);
+        match &engine.outbox[0] {
+            Cmd::Delete { etag, .. } => assert_eq!(etag, &None),
+            _ => panic!("expected a delete"),
+        }
+    }
+
+    #[test]
+    fn deleting_a_new_event_whose_create_reply_was_lost_deletes_it_on_google() {
+        let mut store = store_with(vec![new_gev("local:abc12", "lunch")]);
+        let mut engine = SyncEngine::default();
+        engine.event_changed(&mut store, "local:abc12");
+        sent(&mut engine);
+        engine.handle(&mut store, save_failed("local:abc12", Failure::Retry), None, today());
+
+        let ev = store.event("local:abc12").unwrap().clone();
+        store.events.clear();
+        engine.event_deleted(&mut store, &ev, true);
+        assert_eq!(sent(&mut engine), [Sent::Delete("abc12".into())], "the id the create asked for");
+        assert_eq!(store.pending_deletes.len(), 1);
+    }
+
+    #[test]
     fn edit_beats_delete_on_another_device() {
         let (mut store, mut engine, id) = edited_locally(|e| e.title = "Still needed".into());
         engine.handle(&mut store, conflict(None), None, today());
@@ -1115,6 +1336,26 @@ mod tests {
         let (m, clashes) = merge_fields(&base, &ours, &theirs);
         assert_eq!((m.start, m.all_day), (ours.start, false));
         assert_eq!(clashes, ["time"]);
+    }
+
+    #[test]
+    fn merging_invitees_keeps_their_replies() {
+        use crate::model::{Attendee, Response};
+        let mut base = gev("a", "T").fields();
+        base.attendees = vec![Attendee::new("ann@example.com")];
+        // We invite Bob; meanwhile Ann accepts on Google.
+        let mut ours = base.clone();
+        ours.attendees.push(Attendee::new("bob@example.com"));
+        let mut theirs = base.clone();
+        theirs.attendees[0].response = Response::Accepted;
+        let (m, clashes) = merge_fields(&base, &ours, &theirs);
+        let got: Vec<_> = m.attendees.iter().map(|a| (a.email.as_str(), a.response)).collect();
+        assert_eq!(got, [("ann@example.com", Response::Accepted), ("bob@example.com", Response::NeedsAction)]);
+        assert!(clashes.is_empty());
+
+        // A reply alone isn't a change of ours: theirs is kept as is.
+        let (m, _) = merge_fields(&base, &base, &theirs);
+        assert_eq!(m.attendees, theirs.attendees);
     }
 
     #[test]
