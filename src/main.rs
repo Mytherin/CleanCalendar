@@ -1,5 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// The label for a shortcut on egui's "command" modifier (`Modifiers::command`):
+/// `cmd_key!("F")` is "⌘F" on macOS and "Ctrl+F" elsewhere.
+macro_rules! cmd_key {
+    ($key:literal) => {
+        if cfg!(target_os = "macos") {
+            concat!("\u{2318}", $key)
+        } else {
+            concat!("Ctrl+", $key)
+        }
+    };
+}
+
 mod app;
 mod app_icon;
 mod caldav;
@@ -7,6 +19,7 @@ mod date_icon;
 mod editor;
 mod dates;
 mod db;
+mod fonts;
 mod google;
 mod interact;
 mod layout;

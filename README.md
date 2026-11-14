@@ -16,8 +16,8 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Location suggestions, offline:** add the countries you want under Settings → Locations, and typing a location suggests towns, streets and named places (shops, museums, stations, …). A typed house number goes with the street ("Damrak 70"); arrow keys and Enter pick a suggestion. The map pin next to the location opens it in Google Maps. Searches never leave your computer: each country is a small prebuilt index of OpenStreetMap data (7 MB for the Netherlands), downloaded once from this project's GitHub release. With no countries installed, the location field offers to download some.
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
 - **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
-- **Settings** (⚙ in the toolbar, or Ctrl+,), laid out like macOS Calendar's:
-  - *General:* 5 or 7 days per week, the first day of the week (or the Windows region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar, and whether to show Google's birthdays and holidays calendars.
+- **Settings** (⚙ in the toolbar, or Ctrl+, — ⌘, on macOS), laid out like macOS Calendar's:
+  - *General:* 5 or 7 days per week, the first day of the week (or the system's region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar, and whether to show Google's birthdays and holidays calendars.
   - *Accounts:* add (+) or remove (−) the Google account, switch it off, give it a name, and choose how often it refreshes (every minute to hourly, or manually).
   - *Locations:* the countries whose location data is installed (update or remove each), downloads in progress, and a search for countries to add.
   - *Advanced:* shade busy days in the year view, show week numbers in the week and month views, and how much of the past to keep from synced calendars (all of it by default, or the last 5 years, 2 years, 1 year or 6 months).
@@ -25,7 +25,7 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **iCloud and CalDAV** (Settings → Accounts → +): sign in with your Apple ID and an app-specific password (or any CalDAV server: Fastmail, Nextcloud, Radicale, …). All your calendars are imported, Reminders lists are skipped, and creates, edits, moves and deletes go back to the server. Repeating events from other apps show every occurrence, whatever their rule.
 - **Several accounts at once:** iCloud, other CalDAV servers and Google side by side, each in its own group in the sidebar.
 - **Google Calendar:** OAuth sign-in in your browser (loopback + PKCE), imports all your calendars, and sends creates, edits, moves and deletes back to Google. Read-only calendars (holidays, shared calendars) are shown but can't be edited.
-- Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows).
+- Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows, San Francisco on macOS, DejaVu Sans on Linux). The window, taskbar and tray icons (Windows) or Dock icon (macOS) show today's date.
 
 ## Running
 

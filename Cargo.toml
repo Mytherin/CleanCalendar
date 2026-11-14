@@ -22,6 +22,8 @@ sha2 = "0.10"
 base64 = "0.22"
 anyhow = "1"
 ab_glyph = "0.2"
+# Already in the tree through ab_glyph; used to pick faces out of font collections.
+ttf-parser = "0.25"
 raw-window-handle = "0.6"
 rusqlite = { version = "0.42.0", features = ["bundled", "chrono"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
@@ -42,6 +44,12 @@ build-places = ["dep:osmpbf", "dep:rayon"]
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.19"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globalization", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_Console"] }
+
+# The same versions eframe 0.29 uses, so nothing new is built.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSCalendar", "NSData", "NSThread"] }
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSImage", "NSResponder"] }
 
 [dev-dependencies]
 png = "0.17"
