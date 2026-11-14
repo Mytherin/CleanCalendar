@@ -637,6 +637,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Checks a folder of built indexes against the built-in list before
+    /// they're released: every file there, with the right size and
+    /// checksum, loading, and holding the country it should.
+    /// `CLEANCALENDAR_VERIFY_DIR=places-out cargo test --release
+    /// verify_built_indexes -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn verify_built_indexes() {
+        let dir = PathBuf::from(std::env::var("CLEANCALENDAR_VERIFY_DIR").expect("set CLEANCALENDAR_VERIFY_DIR"));
+        let list = builtin_countries();
+        let mut total = 0;
+        for r in &list {
+            let path = dir.join(&r.file);
+            let bytes = std::fs::metadata(&path).unwrap_or_else(|e| panic!("{}: {e}", r.file)).len();
+            assert_eq!(bytes, r.bytes, "{} size", r.file);
+            assert_eq!(sha256_hex(&path).unwrap(), r.sha256, "{} checksum", r.file);
+            let idx = Index::load(&path).unwrap_or_else(|e| panic!("{}: {e:#}", r.file));
+            assert_eq!((idx.meta.id.as_str(), idx.meta.entries, idx.len() as u64), (r.id.as_str(), r.entries, r.entries), "{}", r.file);
+            total += bytes;
+        }
+        println!("{} countries verified, {total} bytes", list.len());
+    }
+
     fn wait_for_long(mut done: impl FnMut() -> bool) {
         let start = Instant::now();
         while !done() {
