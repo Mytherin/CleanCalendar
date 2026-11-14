@@ -6,7 +6,7 @@ use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, Stroke, Vec2};
 
 use crate::dates::*;
-use crate::google::{Cmd, Worker};
+use crate::google::{self, Cmd, Worker};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
 use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, ACCENT, RED};
@@ -113,7 +113,7 @@ impl App {
             editor: None,
             sidebar_open: true,
             mini_month: first_of_month(today),
-            worker: Worker::spawn(cc.egui_ctx.clone()),
+            worker: Worker::spawn(cc.egui_ctx.clone(), google::Endpoints::from_env()),
             engine: SyncEngine::default(),
             last_sync: None,
             status: None,
@@ -177,11 +177,6 @@ impl App {
                         }
                     }
                 }
-                Notice::Removed(id) => {
-                    if self.selected.as_deref() == Some(id.as_str()) {
-                        self.selected = None;
-                    }
-                }
             }
         }
     }
@@ -220,6 +215,8 @@ impl App {
             recurring_id: None,
             pending: false,
             rev: 0,
+            etag: None,
+            base: None,
         };
         self.editor = Some(Editor::new(draft, true));
     }
@@ -235,32 +232,50 @@ impl App {
         if ev.title.trim().is_empty() {
             ev.title = "New Event".into();
         }
-        let id = ev.id.clone();
+        let mut id = ev.id.clone();
         if is_new {
             self.store.events.push(ev);
         } else if let Some(old) = self.store.event(&id).cloned() {
+            self.engine.before_change(&mut self.store, &id);
+            let old_base = self.store.event(&id).and_then(|e| e.base.clone());
             // Sync bookkeeping lives on the stored copy, not the editor's draft.
             ev.rev = old.rev;
             ev.pending = old.pending;
             ev.remote_id = old.remote_id.clone();
             ev.recurring_id = old.recurring_id.clone();
+            ev.etag = old.etag.clone();
+            ev.base = old_base;
             // Moving to another calendar means delete + recreate remotely.
             if old.calendar_id != ev.calendar_id {
-                self.engine.event_deleted(&mut self.store, &old);
+                self.engine.event_deleted(&mut self.store, &old, false);
                 ev.remote_id = None;
                 ev.recurring_id = None;
+                ev.etag = None;
+                ev.base = None;
             }
             if let Some(slot) = self.store.event_mut(&id) {
                 *slot = ev;
             }
         } else {
-            // Deleted (e.g. by a sync) while the editor was open.
-            self.status = Some(("That event was deleted while you were editing it".into(), true));
-            return;
+            // Deleted elsewhere while the editor was open: keep the user's
+            // version as a new event rather than dropping their edit.
+            id = format!("local:{}", uuid::Uuid::new_v4().simple());
+            ev.id = id.clone();
+            ev.remote_id = None;
+            ev.recurring_id = None;
+            ev.etag = None;
+            ev.base = None;
+            self.store.events.push(ev);
+            self.status = Some(("That event was deleted elsewhere while you edited it; your version was kept".into(), true));
         }
         self.engine.event_changed(&mut self.store, &id);
         self.selected = Some(id);
         self.flush();
+    }
+
+    /// Views call this when the user starts dragging an event.
+    pub fn begin_edit(&mut self, id: &str) {
+        self.engine.before_change(&mut self.store, id);
     }
 
     fn delete_event(&mut self, id: &str) {
@@ -269,7 +284,7 @@ impl App {
             return;
         }
         self.store.events.retain(|e| e.id != id);
-        self.engine.event_deleted(&mut self.store, &ev);
+        self.engine.event_deleted(&mut self.store, &ev, true);
         if self.selected.as_deref() == Some(id) {
             self.selected = None;
         }
@@ -397,7 +412,7 @@ impl App {
                                 self.sync();
                             }
                         }
-                        let google_label = if connected { "Google ✓" } else { "Connect Google" };
+                        let google_label = if connected { "Google: connected" } else { "Connect Google" };
                         if ui.button(google_label).clicked() {
                             self.show_google = true;
                         }

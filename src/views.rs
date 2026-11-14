@@ -486,6 +486,7 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
                 if editable && resp.drag_started() {
                     let origin = ui.input(|i| i.pointer.press_origin()).unwrap_or(r.center());
                     app.selected = Some(ev.id.clone());
+                    app.begin_edit(&ev.id);
                     app.drag = Some(if near_bottom(origin) {
                         Drag::Resize { id: ev.id.clone() }
                     } else {
@@ -551,6 +552,8 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
                     recurring_id: None,
                     pending: false,
                     rev: 0,
+                    etag: None,
+                    base: None,
                 };
                 draw_timed(ui, &painter, r, &ghost, theme::ACCENT, false, p);
             }
@@ -780,6 +783,8 @@ mod tests {
             recurring_id: None,
             pending: false,
             rev: 0,
+            etag: None,
+            base: None,
         }
     }
 

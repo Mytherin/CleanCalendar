@@ -1,0 +1,19 @@
+# Seed for the Google emulator used by the end-to-end tests:
+#   npx emulate@0.13.1 --service google --seed testdata/emulate-seed.yaml
+# then, in another terminal:
+#   CLEANCALENDAR_GOOGLE_URL=http://127.0.0.1:4000 cargo test -- --ignored
+google:
+  # Only accept access tokens the emulator issued (exercises real sign-in).
+  strict_scopes: true
+  users:
+    - email: tester@example.com
+      name: Test User
+  calendars:
+    # Like Google, the primary calendar's id is the account's email address.
+    - id: tester@example.com
+      user_email: tester@example.com
+      summary: tester@example.com
+      primary: true
+    - id: work@example.com
+      user_email: tester@example.com
+      summary: Work

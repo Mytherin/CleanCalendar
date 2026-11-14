@@ -19,9 +19,45 @@ use url::Url;
 
 use crate::model::Event;
 
-const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const API: &str = "https://www.googleapis.com/calendar/v3";
+/// Where sign-in, token, and Calendar API requests go.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Endpoints {
+    pub auth: String,
+    pub token: String,
+    pub api: String,
+}
+
+/// Environment variable that points the app at a Google emulator.
+pub const EMULATOR_ENV: &str = "CLEANCALENDAR_GOOGLE_URL";
+
+impl Endpoints {
+    pub fn google() -> Self {
+        Endpoints {
+            auth: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token: "https://oauth2.googleapis.com/token".into(),
+            api: "https://www.googleapis.com/calendar/v3".into(),
+        }
+    }
+
+    /// Everything under one base URL with Google's paths, the layout used
+    /// by emulators such as `npx emulate` (e.g. `http://127.0.0.1:4002`).
+    pub fn at(base: &str) -> Self {
+        let base = base.trim_end_matches('/');
+        Endpoints {
+            auth: format!("{base}/o/oauth2/v2/auth"),
+            token: format!("{base}/oauth2/token"),
+            api: format!("{base}/calendar/v3"),
+        }
+    }
+
+    /// Real Google, unless `CLEANCALENDAR_GOOGLE_URL` names an emulator.
+    pub fn from_env() -> Self {
+        match std::env::var(EMULATOR_ENV) {
+            Ok(base) if !base.trim().is_empty() => Self::at(base.trim()),
+            _ => Self::google(),
+        }
+    }
+}
 const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 const LOGIN_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 
@@ -65,6 +101,8 @@ pub enum Cmd {
         creds: Creds,
         google_calendar_id: String,
         remote_id: String,
+        /// Only delete this version; `None` deletes unconditionally.
+        etag: Option<String>,
     },
 }
 
@@ -97,10 +135,16 @@ pub enum Msg {
     ConnectFailed(String),
     Synced { calendars: Vec<RemoteCalendar>, changes: Vec<CalendarChanges> },
     SyncFailed(String),
-    Saved { local_id: String, google_calendar_id: String, rev: u64, remote_id: String },
+    Saved { local_id: String, google_calendar_id: String, rev: u64, remote_id: String, etag: Option<String> },
     SaveFailed { local_id: String, google_calendar_id: String, error: String, kind: Failure },
+    /// The event changed on Google since we last saw it (or was deleted
+    /// there: `server` is `None`). Carries Google's current copy.
+    SaveConflict { local_id: String, server: Option<Event> },
     Deleted { remote_id: String },
     DeleteFailed { remote_id: String, google_calendar_id: String, error: String, kind: Failure },
+    /// Someone changed the event after we decided to delete it; nothing
+    /// was deleted. Carries Google's current copy (`None` if it's gone).
+    DeleteConflict { remote_id: String, google_calendar_id: String, server: Option<Event> },
 }
 
 /// A non-success HTTP response from Google.
@@ -142,15 +186,16 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(ctx: eframe::egui::Context) -> Self {
+    pub fn spawn(ctx: eframe::egui::Context, endpoints: Endpoints) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         std::thread::Builder::new()
             .name("google-sync".into())
             .spawn(move || {
                 let mut client: Option<Client> = None;
+                let open_browser = |url: &str| open::that(url).context("opening the browser");
                 for cmd in cmd_rx {
-                    let msg = run(&mut client, cmd);
+                    let msg = run(&mut client, &endpoints, &open_browser, cmd);
                     if msg_tx.send(msg).is_err() {
                         break;
                     }
@@ -168,34 +213,71 @@ impl Worker {
     }
 }
 
-fn client_for(client: &mut Option<Client>, creds: Creds) -> &mut Client {
+fn client_for<'a>(client: &'a mut Option<Client>, endpoints: &Endpoints, creds: Creds) -> &'a mut Client {
     let stale = client.as_ref().map_or(true, |c| c.creds.refresh_token != creds.refresh_token);
     if stale {
-        *client = Some(Client::new(creds));
+        *client = Some(Client::new(creds, endpoints));
     }
     client.as_mut().unwrap()
 }
 
-fn run(client: &mut Option<Client>, cmd: Cmd) -> Msg {
+/// Executes one command; what the worker thread does for each message.
+fn run(
+    client: &mut Option<Client>,
+    endpoints: &Endpoints,
+    open_browser: &dyn Fn(&str) -> Result<()>,
+    cmd: Cmd,
+) -> Msg {
     let text = |e: anyhow::Error| format!("{e:#}");
     match cmd {
-        Cmd::Connect { client_id, client_secret } => match authorize(&client_id, &client_secret) {
-            Ok(refresh_token) => Msg::Connected { refresh_token },
-            Err(e) => Msg::ConnectFailed(text(e)),
-        },
-        Cmd::Sync { creds, from, to, tokens } => match sync_all(client_for(client, creds), from, to, &tokens) {
-            Ok((calendars, changes)) => Msg::Synced { calendars, changes },
-            Err(e) => Msg::SyncFailed(text(e)),
-        },
-        Cmd::Save { creds, google_calendar_id, event } => {
-            match client_for(client, creds).save_event(&google_calendar_id, &event) {
-                Ok(remote_id) => Msg::Saved { local_id: event.id, google_calendar_id, rev: event.rev, remote_id },
-                Err(e) => Msg::SaveFailed { local_id: event.id, google_calendar_id, kind: classify(&e), error: text(e) },
+        Cmd::Connect { client_id, client_secret } => {
+            match authorize(endpoints, &client_id, &client_secret, open_browser) {
+                Ok(refresh_token) => Msg::Connected { refresh_token },
+                Err(e) => Msg::ConnectFailed(text(e)),
             }
         }
-        Cmd::Delete { creds, google_calendar_id, remote_id } => {
-            match client_for(client, creds).delete_event(&google_calendar_id, &remote_id) {
+        Cmd::Sync { creds, from, to, tokens } => {
+            match sync_all(client_for(client, endpoints, creds), from, to, &tokens) {
+                Ok((calendars, changes)) => Msg::Synced { calendars, changes },
+                Err(e) => Msg::SyncFailed(text(e)),
+            }
+        }
+        Cmd::Save { creds, google_calendar_id, event } => {
+            let c = client_for(client, endpoints, creds);
+            let failed = |e: anyhow::Error, local_id: String, google_calendar_id: String| Msg::SaveFailed {
+                local_id,
+                google_calendar_id,
+                kind: classify(&e),
+                error: text(e),
+            };
+            match c.save_event(&google_calendar_id, &event) {
+                Ok((remote_id, etag)) => {
+                    Msg::Saved { local_id: event.id, google_calendar_id, rev: event.rev, remote_id, etag }
+                }
+                // Changed on Google since we last saw it: fetch their copy.
+                Err(e) if http_status(&e) == Some(412) => {
+                    let rid = event.remote_id.clone().unwrap_or_default();
+                    match c.get_event(&google_calendar_id, &rid) {
+                        Ok(server) => Msg::SaveConflict { local_id: event.id, server },
+                        Err(e) => failed(e, event.id, google_calendar_id),
+                    }
+                }
+                // Updating an event that was deleted on Google.
+                Err(e) if classify(&e) == Failure::Gone && event.remote_id.is_some() => {
+                    Msg::SaveConflict { local_id: event.id, server: None }
+                }
+                Err(e) => failed(e, event.id, google_calendar_id),
+            }
+        }
+        Cmd::Delete { creds, google_calendar_id, remote_id, etag } => {
+            let c = client_for(client, endpoints, creds);
+            match c.delete_event(&google_calendar_id, &remote_id, etag.as_deref()) {
                 Ok(()) => Msg::Deleted { remote_id },
+                // Changed on Google after we decided to delete it.
+                Err(e) if http_status(&e) == Some(412) => match c.get_event(&google_calendar_id, &remote_id) {
+                    Ok(server) => Msg::DeleteConflict { remote_id, google_calendar_id, server },
+                    Err(e) => Msg::DeleteFailed { remote_id, google_calendar_id, kind: classify(&e), error: text(e) },
+                },
                 Err(e) => Msg::DeleteFailed { remote_id, google_calendar_id, kind: classify(&e), error: text(e) },
             }
         }
@@ -238,7 +320,13 @@ enum Query<'a> {
 // OAuth
 
 /// Runs the browser sign-in flow and returns a refresh token.
-fn authorize(client_id: &str, client_secret: &str) -> Result<String> {
+/// `open_browser` shows the sign-in page (tests drive it over HTTP instead).
+fn authorize(
+    endpoints: &Endpoints,
+    client_id: &str,
+    client_secret: &str,
+    open_browser: &dyn Fn(&str) -> Result<()>,
+) -> Result<String> {
     if client_id.trim().is_empty() {
         bail!("Enter a Google OAuth client ID first");
     }
@@ -249,7 +337,7 @@ fn authorize(client_id: &str, client_secret: &str) -> Result<String> {
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = uuid::Uuid::new_v4().simple().to_string();
 
-    let mut url = Url::parse(AUTH_URL)?;
+    let mut url = Url::parse(&endpoints.auth)?;
     url.query_pairs_mut()
         .append_pair("client_id", client_id.trim())
         .append_pair("redirect_uri", &redirect)
@@ -260,12 +348,12 @@ fn authorize(client_id: &str, client_secret: &str) -> Result<String> {
         .append_pair("state", &state)
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent");
-    open::that(url.as_str()).context("opening the browser")?;
+    open_browser(url.as_str())?;
 
     let code = wait_for_code(&listener, &state)?;
 
     let resp: Value = reqwest::blocking::Client::new()
-        .post(TOKEN_URL)
+        .post(&endpoints.token)
         .form(&[
             ("code", code.as_str()),
             ("client_id", client_id.trim()),
@@ -343,17 +431,13 @@ struct Client {
     http: reqwest::blocking::Client,
     creds: Creds,
     access: Option<(String, Instant)>,
-    /// Base URL of the Calendar API (overridable for tests).
+    /// Base URL of the Calendar API.
     api: String,
     token_url: String,
 }
 
 impl Client {
-    fn new(creds: Creds) -> Self {
-        Self::with_endpoints(creds, API, TOKEN_URL)
-    }
-
-    fn with_endpoints(creds: Creds, api: &str, token_url: &str) -> Self {
+    fn new(creds: Creds, endpoints: &Endpoints) -> Self {
         Client {
             http: reqwest::blocking::Client::builder()
                 .timeout(StdDuration::from_secs(30))
@@ -361,8 +445,8 @@ impl Client {
                 .expect("http client"),
             creds,
             access: None,
-            api: api.to_owned(),
-            token_url: token_url.to_owned(),
+            api: endpoints.api.clone(),
+            token_url: endpoints.token.clone(),
         }
     }
 
@@ -511,25 +595,67 @@ impl Client {
     }
 
     /// Creates or updates the event and returns its Google id.
-    fn save_event(&mut self, cal_id: &str, ev: &Event) -> Result<String> {
-        let body = event_to_json(ev);
+    /// Creates or updates the event; returns its Google id and new etag.
+    ///
+    /// Updates send `If-Match` with the event's etag, so Google answers 412
+    /// instead of overwriting someone else's newer change. New events carry
+    /// an id derived from the local id, so retrying a create whose reply was
+    /// lost can't produce a duplicate.
+    fn save_event(&mut self, cal_id: &str, ev: &Event) -> Result<(String, Option<String>)> {
+        let mut body = event_to_json(ev);
         let token = self.token()?;
         let req = match &ev.remote_id {
-            Some(rid) => self.http.patch(self.url(&["calendars", cal_id, "events", rid])),
-            None => self.http.post(self.url(&["calendars", cal_id, "events"])),
+            Some(rid) => {
+                let req = self.http.patch(self.url(&["calendars", cal_id, "events", rid]));
+                match &ev.etag {
+                    Some(etag) => req.header("If-Match", etag),
+                    None => req,
+                }
+            }
+            None => {
+                if let Some(id) = client_event_id(&ev.id) {
+                    body["id"] = json!(id);
+                }
+                self.http.post(self.url(&["calendars", cal_id, "events"]))
+            }
         };
-        let resp: Value = Self::check(req.bearer_auth(token).json(&body).send()?)?.json()?;
-        resp["id"].as_str().map(str::to_owned).ok_or_else(|| anyhow!("Google returned no event id"))
+        let result = req.bearer_auth(token).json(&body).send().map_err(anyhow::Error::from).and_then(Self::check);
+        let resp: Value = match result {
+            Ok(resp) => resp.json()?,
+            // Our id already exists: an earlier attempt got through.
+            Err(e) if http_status(&e) == Some(409) && ev.remote_id.is_none() => {
+                let id = client_event_id(&ev.id).ok_or(e)?;
+                return match self.get_event(cal_id, &id)? {
+                    Some(existing) => Ok((id, existing.etag)),
+                    None => Err(anyhow!("Google reported event {id} as a duplicate but doesn't have it")),
+                };
+            }
+            Err(e) => return Err(e),
+        };
+        let id = resp["id"].as_str().ok_or_else(|| anyhow!("Google returned no event id"))?.to_owned();
+        Ok((id, resp["etag"].as_str().map(str::to_owned)))
     }
 
-    fn delete_event(&mut self, cal_id: &str, remote_id: &str) -> Result<()> {
-        let resp = self
-            .http
-            .delete(self.url(&["calendars", cal_id, "events", remote_id]))
-            .bearer_auth(self.token()?)
-            .send()?;
+    /// Google's current copy of an event; `None` if it was deleted.
+    fn get_event(&mut self, cal_id: &str, remote_id: &str) -> Result<Option<Event>> {
+        let resp = self.http.get(self.url(&["calendars", cal_id, "events", remote_id])).bearer_auth(self.token()?).send()?;
+        if matches!(resp.status().as_u16(), 404 | 410) {
+            return Ok(None);
+        }
+        let v: Value = Self::check(resp)?.json()?;
+        // Deleted events can linger with status "cancelled".
+        Ok(event_from_json(cal_id, &v))
+    }
+
+    /// Deletes the event, only if it's still at `etag` when one is given.
+    fn delete_event(&mut self, cal_id: &str, remote_id: &str, etag: Option<&str>) -> Result<()> {
+        let mut req = self.http.delete(self.url(&["calendars", cal_id, "events", remote_id])).bearer_auth(self.token()?);
+        if let Some(etag) = etag {
+            req = req.header("If-Match", etag);
+        }
+        let resp = req.send()?;
         // Already gone is fine.
-        if resp.status().as_u16() == 404 || resp.status().as_u16() == 410 {
+        if matches!(resp.status().as_u16(), 404 | 410) {
             return Ok(());
         }
         Self::check(resp)?;
@@ -547,6 +673,15 @@ pub fn local_event_id(google_calendar_id: &str, remote_id: &str) -> String {
 
 pub fn local_calendar_id(google_calendar_id: &str) -> String {
     format!("google:{google_calendar_id}")
+}
+
+/// The Google id to request for a new event, derived from its local id
+/// ("local:<uuid hex>"). Google accepts lowercase base32hex (a–v, 0–9),
+/// 5–1024 characters, which hex UUIDs satisfy.
+fn client_event_id(local_id: &str) -> Option<String> {
+    let id = local_id.strip_prefix("local:")?;
+    let ok = (5..=1024).contains(&id.len()) && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='v'));
+    ok.then(|| id.to_owned())
 }
 
 enum Item {
@@ -581,6 +716,8 @@ fn event_from_json(cal_id: &str, v: &Value) -> Option<Event> {
         recurring_id: v["recurringEventId"].as_str().map(str::to_owned),
         pending: false,
         rev: 0,
+        etag: v["etag"].as_str().map(str::to_owned),
+        base: None,
     })
 }
 
@@ -660,6 +797,12 @@ mod tests {
 
 #[cfg(test)]
 mod http_tests;
+
+#[cfg(test)]
+mod emulator_tests;
+
+#[cfg(test)]
+mod live_tests;
 
 #[cfg(test)]
 mod failure_tests {
