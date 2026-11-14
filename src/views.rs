@@ -458,11 +458,16 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
     }
 
     // Ghost block while drag-creating.
+    // It may span several days: draw a piece in each day's column.
     if let Some((s, e)) = app.pointer.ghost() {
-        let i = (s.date() - lay.first).num_days();
-        if (0..lay.ndays).contains(&i) {
-            let y0 = g.y_of(minute_of_day(s));
-            let y1 = g.y_of(minute_of_day(s) + (e - s).num_minutes()).max(y0 + HOUR_H / 4.0);
+        for i in 0..lay.ndays {
+            let ds = midnight(lay.first + Duration::days(i));
+            let (ps, pe) = (s.max(ds), e.min(ds + Duration::days(1)));
+            if ps >= pe {
+                continue;
+            }
+            let y0 = g.y_of((ps - ds).num_minutes());
+            let y1 = g.y_of((pe - ds).num_minutes()).max(y0 + HOUR_H / 4.0);
             let r = Rect::from_min_max(Pos2::new(g.col_x(i) + 0.5, y0 + 0.5), Pos2::new(g.col_x(i + 1) - 0.5, y1 - 0.5));
             let ghost = Event {
                 id: String::new(),

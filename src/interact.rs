@@ -238,10 +238,10 @@ fn day_offset(a: NaiveDate, b: NaiveDate) -> i64 {
 fn update_drag(drag: &mut Drag, pos: Pos2, grid: &TimeGrid, out: &mut Vec<Action>) {
     let set = |id: &str, start, end| Action::SetTimes { id: id.to_owned(), start, end };
     match drag {
-        Drag::Create { anchor, current } => {
-            let t = snap(grid.time_at(pos));
-            // Drag-to-create stays within the day it started on.
-            *current = if t.date() == anchor.date() { t } else { midnight(anchor.date()) + Duration::minutes(minute_of_day(t)) };
+        Drag::Create { current, .. } => {
+            // Like macOS Calendar, dragging onto another day runs the new
+            // event from the anchor to that time on that day.
+            *current = snap(grid.time_at(pos));
         }
         Drag::Move { id, grab, len } => {
             let start = snap(grid.time_at(pos) - *grab);
