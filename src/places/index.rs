@@ -31,6 +31,27 @@ const MAGIC: &[u8; 8] = b"CCPLACE1";
 const ZSTD_LEVEL: i32 = 19;
 /// The most candidates one search looks at, to keep a vague query quick.
 const MAX_CANDIDATES: usize = 400_000;
+/// Largest header (JSON) a places file may have.
+const MAX_HEADER: usize = 1 << 20;
+/// Most a section may unpack to: a multiple of its packed size on top of a
+/// floor (columns that are mostly the same value pack extremely well), and
+/// never more than `MAX_SECTION`.
+const MAX_RATIO: u64 = 1024;
+const SECTION_FLOOR: u64 = 256 << 20;
+const MAX_SECTION: u64 = 4 << 30;
+
+/// Sorted entries (id << 1 | in name) with each id once, flagged "in name"
+/// if any of its copies was.
+fn merge_flags(sorted: Vec<u64>) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::with_capacity(sorted.len());
+    for v in sorted {
+        match out.last_mut() {
+            Some(last) if *last >> 1 == v >> 1 => *last |= v & 1,
+            _ => out.push(v),
+        }
+    }
+    out
+}
 
 /// What kind of place an entry is. Lower sorts (and ranks) first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -208,7 +229,13 @@ fn read_header(r: &mut impl Read) -> Result<Meta> {
     }
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
-    let mut header = vec![0u8; u32::from_le_bytes(len) as usize];
+    // The header is a small JSON object; a damaged length mustn't make us
+    // allocate gigabytes (this runs for every file in the folder).
+    let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_HEADER {
+        bail!("damaged places file");
+    }
+    let mut header = vec![0u8; len];
     r.read_exact(&mut header)?;
     Ok(serde_json::from_slice(&header)?)
 }
@@ -231,7 +258,7 @@ impl Column {
         let mut strings = Vec::with_capacity(n.min(dict.len()));
         for _ in 0..n {
             let len = get_varint(dict, &mut pos).ok_or_else(bad)? as usize;
-            let s = dict.get(pos..pos + len).ok_or_else(bad)?;
+            let s = pos.checked_add(len).and_then(|end| dict.get(pos..end)).ok_or_else(bad)?;
             strings.push(String::from_utf8_lossy(s).into_owned());
             pos += len;
         }
@@ -307,15 +334,30 @@ pub struct Hit {
 
 impl Index {
     pub fn load(path: &Path) -> Result<Index> {
-        let mut r = BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?);
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let file_len = file.metadata()?.len();
+        let mut r = BufReader::new(file);
         let meta = read_header(&mut r)?;
         let mut sections = Vec::new();
         for _ in 0..11 {
             let mut len = [0u8; 8];
             r.read_exact(&mut len)?;
-            let mut packed = vec![0u8; u64::from_le_bytes(len) as usize];
+            // Lengths come from the file: never more than the file holds, and
+            // no more unpacked than a generous ratio (a crafted file could
+            // otherwise unpack to gigabytes).
+            let len = u64::from_le_bytes(len);
+            if len > file_len {
+                bail!("damaged places file");
+            }
+            let mut packed = vec![0u8; len as usize];
             r.read_exact(&mut packed)?;
-            sections.push(zstd::decode_all(&packed[..])?);
+            let limit = len.saturating_mul(MAX_RATIO).saturating_add(SECTION_FLOOR).min(MAX_SECTION);
+            let mut out = Vec::new();
+            zstd::stream::Decoder::new(&packed[..])?.take(limit + 1).read_to_end(&mut out)?;
+            if out.len() as u64 > limit {
+                bail!("damaged places file");
+            }
+            sections.push(out);
         }
         let n = sections[0].len();
         let col = |d: usize| Column::read(&sections[d], &sections[d + 1], n);
@@ -360,7 +402,9 @@ impl Index {
             let mut v = 0u64;
             for _ in 0..n {
                 let Some(d) = get_varint(&self.postings, &mut pos) else { break };
-                v += d;
+                // A damaged list: stop rather than wrap into nonsense ids.
+                let Some(next) = v.checked_add(d) else { break };
+                v = next;
                 out.push(v);
                 if out.len() >= MAX_CANDIDATES {
                     return out;
@@ -400,7 +444,10 @@ impl Index {
         }
         let mut candidates = self.postings(&per_word[0].2);
         candidates.sort_unstable();
-        candidates.dedup_by_key(|v| *v >> 1);
+        // One entry can come in under several words of a prefix ("amsterdam"
+        // matches both "amsterdam" in its town and "amsterdamse" in its
+        // name): keep it once, matched by name if any of them was.
+        let candidates = merge_flags(candidates);
 
         let rest: Vec<&str> = per_word[1..].iter().map(|(_, w, _)| *w).collect();
         // With a house number typed ("Damrak 70") the user means a street:
@@ -505,6 +552,52 @@ mod tests {
 
     fn labels(idx: &Index, q: &str) -> Vec<String> {
         idx.search(&Query::parse(q), 5).into_iter().map(|h| h.suggestion.label()).collect()
+    }
+
+    #[test]
+    fn a_place_matched_by_name_under_any_word_keeps_that_rank() {
+        // "Amsterdamse Bos" is in Amsterdam: "amsterdam" reaches it through
+        // its town (not in name) and through "amsterdamse" (in name).
+        let dir = tempdir::Dir::new();
+        let path = dir.0.join("x.places");
+        let records = vec![
+            rec(Kind::Poi, "Amsterdamse Bos", "Bosbaanweg", "", "Amsterdam"),
+            rec(Kind::Street, "Amsterdamweg", "", "", "Arnhem"),
+        ];
+        let meta = Meta { id: "x".into(), name: "X".into(), country: "X".into(), ..Default::default() };
+        write(&path, meta, records).unwrap();
+        let idx = Index::load(&path).unwrap();
+        let hits = idx.search(&Query::parse("amsterdam"), 5);
+        let bos = hits.iter().find(|h| h.suggestion.title == "Amsterdamse Bos").expect("found");
+        assert_eq!(bos.rank.0, 1, "matched by its name: {hits:?}");
+        assert_eq!(merge_flags(vec![4, 5, 6, 9]), [5, 6, 9]);
+    }
+
+    #[test]
+    fn damaged_files_are_refused_without_huge_allocations() {
+        let dir = tempdir::Dir::new();
+        let path = dir.0.join("bad.places");
+        // A header length of 4 GiB.
+        let mut data = MAGIC.to_vec();
+        data.extend(u32::MAX.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+        assert!(read_meta(&path).is_err());
+        assert!(Index::load(&path).is_err());
+
+        // A valid header, then a section claiming 2^64 - 1 bytes.
+        let header = serde_json::to_vec(&Meta { id: "x".into(), ..Default::default() }).unwrap();
+        let mut data = MAGIC.to_vec();
+        data.extend((header.len() as u32).to_le_bytes());
+        data.extend(&header);
+        data.extend(u64::MAX.to_le_bytes());
+        std::fs::write(&path, &data).unwrap();
+        assert!(Index::load(&path).is_err());
+
+        // A dictionary string whose length overflows.
+        let mut dict = Vec::new();
+        put_varint(&mut dict, 1);
+        put_varint(&mut dict, u64::MAX);
+        assert!(Column::read(&dict, &[], 0).is_err());
     }
 
     #[test]
