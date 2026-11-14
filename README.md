@@ -11,6 +11,7 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Direct manipulation:** drag on empty space to create an event, drag an event to move it, drag its bottom edge to resize. Everything snaps to 15 minutes.
 - **Right-click menu** like Apple Calendar's: Get Info, move to another calendar, Delete, Cut, Copy, Paste, Duplicate, go to the next/previous occurrence of a repeating event, and e-mail the event (or its series). Right-click on empty space to create an event or paste there.
 - **Month view:** multi-day banners span across days, timed events show a colored dot and their time, and overflow collapses to "N more".
+- **Search** (Ctrl+F, or the magnifier at the right of the toolbar), like Apple Calendar's: matches every word of the query against titles, locations, notes and invitees on the shown calendars, and lists the results (every occurrence of a repeating event) beside the calendar, scrolled to what's coming up. Click a result to go to it, double-click to open it, Enter goes to the next upcoming one, Esc clears the search.
 - **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar, invitees and notes.
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
 - **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
@@ -41,6 +42,7 @@ The MSVC toolchain works too if you have the Visual Studio C++ Build Tools.
 |---|---|
 | Ctrl+1 / 2 / 3 / 4 | Day / Week / Month / Year |
 | Ctrl+T | Go to today |
+| Ctrl+F | Search |
 | Ctrl+, | Settings |
 | Ctrl+N | New event |
 | ← / → | Previous / next period |
@@ -102,6 +104,7 @@ The cache is attached to the same connection, so each save commits to both files
 
 Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (the token still goes to the credential store, under an entry named after that folder).
 Set `CLEANCALENDAR_START=month:2026-11-14` (or just `day`, `week`, `month`, `year`) to open on a given view and date, which is handy together with `CLEANCALENDAR_DATA` for screenshots and testing by hand.
+Set `CLEANCALENDAR_SEARCH=dentist` to open with that search already typed in.
 
 ## Code layout
 
@@ -110,6 +113,8 @@ Set `CLEANCALENDAR_START=month:2026-11-14` (or just `day`, `week`, `month`, `yea
 | `src/main.rs` | Window setup |
 | `src/app.rs` | App state, toolbar, sidebar, event editor, Accounts window, sync glue |
 | `src/app/settings_window.rs` | The Settings window (General, Accounts with the add-account sheet, Advanced) |
+| `src/app/search_ui.rs` | The toolbar's search field and the results list |
+| `src/search.rs` | Searching events (no UI) |
 | `src/settings.rs` | The user's preferences and their defaults |
 | `src/views.rs` | Painting: month grid, day/week time grid, year view, mini-month |
 | `src/layout.rs` | Pure geometry: where events and cells go, and what each screen area means to the pointer |
