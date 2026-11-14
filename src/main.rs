@@ -5,6 +5,7 @@ mod app_icon;
 mod date_icon;
 mod editor;
 mod dates;
+mod db;
 mod google;
 mod interact;
 mod layout;

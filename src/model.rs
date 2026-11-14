@@ -1,7 +1,6 @@
-//! Core data model: calendars, events, and the on-disk store.
+//! Core data model: calendars, events, and the in-memory store (saved by `db`).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use chrono::{Duration, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -23,7 +22,7 @@ pub enum Source {
     Google { calendar_id: String },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Calendar {
     pub id: String,
     pub name: String,
@@ -46,7 +45,7 @@ impl Calendar {
 /// An event. Times are naive local wall-clock times. For all-day events
 /// `start` is midnight of the first day and `end` is midnight of the day
 /// *after* the last day (exclusive), matching Google's convention.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub id: String,
     pub calendar_id: String,
@@ -132,7 +131,7 @@ impl Event {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GoogleSettings {
     pub client_id: String,
     pub client_secret: String,
@@ -157,7 +156,7 @@ pub struct PendingDelete {
 }
 
 /// Per-calendar incremental sync bookmark.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncState {
     /// Google's `nextSyncToken`; `None` forces a full sync.
     pub token: Option<String>,
@@ -165,7 +164,9 @@ pub struct SyncState {
     pub full_sync_on: Option<NaiveDate>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// Everything the app shows and syncs. `Deserialize` is only for importing
+/// the old `store.json`; saving is done by [`crate::db`].
+#[derive(Debug, Default, Deserialize)]
 pub struct Store {
     pub calendars: Vec<Calendar>,
     pub events: Vec<Event>,
@@ -176,37 +177,18 @@ pub struct Store {
     /// Keyed by Google calendar id.
     #[serde(default)]
     pub sync_state: HashMap<String, SyncState>,
+    /// Where this store is saved; `None` for one that isn't (tests).
+    #[serde(skip)]
+    pub(crate) db: Option<crate::db::Db>,
 }
 
 impl Store {
-    fn path() -> PathBuf {
-        if let Some(dir) = std::env::var_os("CLEANCALENDAR_DATA") {
-            return PathBuf::from(dir).join("store.json");
-        }
-        directories::ProjectDirs::from("com", "CleanCalendar", "CleanCalendar")
-            .map(|d| d.data_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("store.json")
-    }
-
+    /// Loads from the default location (see [`crate::db::Paths`]).
     pub fn load() -> Self {
-        let path = Self::path();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str(&text) {
-                Ok(store) => return store,
-                Err(e) => {
-                    eprintln!("Could not parse {}: {e}", path.display());
-                    let backup = path.with_extension("json.bak");
-                    let _ = std::fs::copy(&path, backup);
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("Could not read {}: {e}", path.display()),
-        }
-        Self::with_defaults()
+        crate::db::open(&crate::db::Paths::default_location())
     }
 
-    fn with_defaults() -> Self {
+    pub fn with_defaults() -> Self {
         Store {
             calendars: vec![
                 Calendar {
@@ -230,23 +212,18 @@ impl Store {
             google: GoogleSettings::default(),
             pending_deletes: Vec::new(),
             sync_state: HashMap::new(),
+            db: None,
         }
     }
 
-    pub fn save(&self) {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+    /// Writes what changed since the last save. Errors are logged and the
+    /// next save tries again.
+    pub fn save(&mut self) {
+        let Some(mut db) = self.db.take() else { return };
+        if let Err(e) = db.save(self) {
+            eprintln!("Could not save: {e:#}");
         }
-        let tmp = path.with_extension("json.tmp");
-        match serde_json::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(e) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)) {
-                    eprintln!("Could not save {}: {e}", path.display());
-                }
-            }
-            Err(e) => eprintln!("Could not serialize store: {e}"),
-        }
+        self.db = Some(db);
     }
 
     pub fn calendar(&self, id: &str) -> Option<&Calendar> {

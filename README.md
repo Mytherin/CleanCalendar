@@ -64,10 +64,16 @@ Google requires every app to have its own OAuth client:
 
 ## Data
 
-Everything is stored as JSON in `%APPDATA%\CleanCalendar\CleanCalendar\data\store.json` on Windows (`~/Library/Application Support/...` on macOS, `~/.local/share/...` on Linux).
-Set `CLEANCALENDAR_DATA=<dir>` to use a different folder.
+Data is kept in two SQLite databases, split by who owns it:
 
-> **Note:** the Google refresh token is stored in that file in plain text. Moving it into the OS keychain (e.g. with the `keyring` crate) is a good next step.
+- **`data.db`: things only this computer has.** Google sign-in settings, the calendar list (with your colours and which are shown), events on local calendars, and changes to Google events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\CleanCalendar\data\` on Windows (`~/Library/Application Support/...` on macOS, `~/.local/share/...` on Linux).
+- **`cache.db`: a copy of Google.** Google events as last downloaded, plus the sync tokens. Lives in `%LOCALAPPDATA%\CleanCalendar\CleanCalendar\cache\` on Windows (`~/Library/Caches/...` on macOS, `~/.cache/...` on Linux). It is safe to delete: the next sync downloads everything again. If it can't be read, it is started over automatically.
+
+The cache is attached to the same connection, so each save commits to both files at once. Only rows that changed are written. A `store.json` from an older version is imported on first start and renamed to `store.json.migrated`.
+
+Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice.
+
+> **Note:** the Google refresh token is stored in `data.db` in plain text. Moving it into the OS keychain (e.g. with the `keyring` crate) is a good next step.
 
 ## Code layout
 
@@ -80,7 +86,8 @@ Set `CLEANCALENDAR_DATA=<dir>` to use a different folder.
 | `src/interact.rs` | Pointer interaction (clicks, double-clicks, drags) as a testable state machine |
 | `src/sync.rs` | Sync bookkeeping (no UI, no I/O): what to upload, retries, merging Google's changes |
 | `src/google.rs` | OAuth flow, Calendar v3 REST client, background worker thread |
-| `src/model.rs` | `Calendar`, `Event`, and the JSON `Store` |
+| `src/model.rs` | `Calendar`, `Event`, and the in-memory `Store` |
+| `src/db.rs` | SQLite storage: persistent `data.db` and disposable `cache.db` |
 | `src/theme.rs` | Apple-like palette for light and dark mode, fonts |
 | `src/dates.rs` | Date helpers |
 
