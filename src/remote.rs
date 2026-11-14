@@ -117,8 +117,11 @@ pub trait Remote {
     fn fetch(&mut self, cal: &CalRef, remote_id: &str) -> Result<Option<Event>>;
 
     /// Deletes the event; only if it is still at `etag` when one is given
-    /// (HTTP 412 otherwise). Already deleted is not an error.
-    fn delete(&mut self, cal: &CalRef, remote_id: &str, etag: Option<&str>) -> Result<()>;
+    /// (HTTP 412 otherwise). Already deleted is not an error. When the event
+    /// was part of a resource that remains (one occurrence of a CalDAV
+    /// series), returns the resource's new version tag, which the other
+    /// events from it now have too.
+    fn delete(&mut self, cal: &CalRef, remote_id: &str, etag: Option<&str>) -> Result<Option<String>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +261,9 @@ pub enum Msg {
     /// The event changed on the service since we last saw it (or was
     /// deleted there: `server` is `None`). Carries the current copy.
     SaveConflict { local_id: String, server: Option<Event> },
-    Deleted { remote_id: String },
+    /// `etag`: the new version of the resource the event was part of, if
+    /// it remains (see [`Remote::delete`]).
+    Deleted { remote_id: String, etag: Option<String> },
     DeleteFailed { remote_id: String, calendar: CalRef, error: String, kind: Failure },
     /// Someone changed the event after we decided to delete it; nothing
     /// was deleted. Carries the current copy (`None` if it's gone).
@@ -405,7 +410,7 @@ pub fn run(conns: &mut Connections, cmd: Cmd) -> Msg {
         Cmd::Delete { login, calendar, remote_id, etag } => {
             let c = conns.client(&calendar.account, &login);
             match c.delete(&calendar, &remote_id, etag.as_deref()) {
-                Ok(()) => Msg::Deleted { remote_id },
+                Ok(etag) => Msg::Deleted { remote_id, etag },
                 // Changed there after we decided to delete it.
                 Err(e) if http_status(&e) == Some(412) => match c.fetch(&calendar, &remote_id) {
                     Ok(server) => Msg::DeleteConflict { remote_id, calendar, server },
@@ -546,10 +551,10 @@ mod tests {
             self.calls.push(format!("fetch {rid}"));
             Ok(self.server_copy.clone())
         }
-        fn delete(&mut self, _: &CalRef, _: &str, _: Option<&str>) -> Result<()> {
+        fn delete(&mut self, _: &CalRef, _: &str, _: Option<&str>) -> Result<Option<String>> {
             match self.delete_status {
                 Some(s) => Err(fail(s)),
-                None => Ok(()),
+                None => Ok(None),
             }
         }
     }
