@@ -5,6 +5,7 @@ use std::time::{Duration as StdDuration, Instant};
 use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, Stroke, Vec2};
 
+use crate::app_icon::AppIcon;
 use crate::dates::*;
 use crate::google::{self, Cmd, Worker};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
@@ -96,6 +97,7 @@ pub struct App {
     last_sync: Option<Instant>,
     status: Option<(String, bool)>,
     show_google: bool,
+    icon: AppIcon,
 }
 
 impl App {
@@ -119,6 +121,7 @@ impl App {
             last_sync: None,
             status: None,
             show_google: false,
+            icon: AppIcon::new(&cc.egui_ctx),
         };
         SyncEngine::prepare(&mut app.store);
         app.sync();
@@ -809,10 +812,11 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         theme::apply_style(ctx);
         let p = Palette::get(ctx);
         self.today = Local::now().date_naive();
+        self.icon.update(ctx, frame, self.today);
 
         self.handle_messages();
         let interval = if self.store.unsynced_count() > 0 { RETRY_SYNC } else { AUTO_SYNC };
