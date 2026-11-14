@@ -215,6 +215,7 @@ impl App {
                     }
                     self.status = Some((text, error));
                 }
+                Notice::ClearStatus => self.status = None,
                 Notice::Renamed { from, to } => self.rename_shown(&from, &to),
             }
         }
@@ -1035,8 +1036,10 @@ impl App {
                         }
                         let connected = !self.store.accounts().is_empty();
                         if connected {
-                            let label = if self.worker.busy > 0 { "Syncing…" } else { "⟳" };
-                            if icon_button(ui, label, "Sync now").clicked() {
+                            if self.worker.busy > 0 {
+                                ui.add_sized(Vec2::new(28.0, 26.0), egui::Spinner::new().size(14.0).color(p.secondary))
+                                    .on_hover_text("Syncing…");
+                            } else if icon_button(ui, "⟳", "Sync now").clicked() {
                                 self.sync();
                             }
                         }
