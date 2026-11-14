@@ -590,6 +590,52 @@ fn span(ev: &Component, s: &Series) -> Option<(NaiveDateTime, NaiveDateTime)> {
     Some((start, end.max(start)))
 }
 
+/// The guests of a VEVENT (ATTENDEE lines), and its ORGANIZER, as the app
+/// shows them. Rooms and other resources are kept but marked as such.
+fn attendees_of(vevent: &Component) -> Vec<crate::model::Attendee> {
+    use crate::model::{Attendee, Response};
+    let email = |p: &Prop| {
+        let v = p.value.trim();
+        let addr = v.get(..7).filter(|s| s.eq_ignore_ascii_case("mailto:")).map_or(v, |_| &v[7..]);
+        addr.trim().to_owned()
+    };
+    let mut out: Vec<Attendee> = Vec::new();
+    for p in vevent.props.iter().filter(|p| p.name == "ATTENDEE") {
+        let addr = email(p);
+        if addr.is_empty() {
+            continue;
+        }
+        let mut a = Attendee::new(&addr);
+        a.name = p.param("CN").unwrap_or_default().trim_matches('"').to_owned();
+        a.response = match p.param("PARTSTAT").map(str::to_ascii_uppercase).as_deref() {
+            Some("ACCEPTED") => Response::Accepted,
+            Some("TENTATIVE") => Response::Tentative,
+            Some("DECLINED") => Response::Declined,
+            _ => Response::NeedsAction,
+        };
+        a.optional = p.param("ROLE").is_some_and(|r| r.eq_ignore_ascii_case("OPT-PARTICIPANT"));
+        a.resource = p.param("CUTYPE").is_some_and(|c| ["RESOURCE", "ROOM"].iter().any(|k| c.eq_ignore_ascii_case(k)));
+        out.push(a);
+    }
+    if let Some(p) = vevent.prop("ORGANIZER") {
+        let addr = email(p);
+        let has_guests = !out.is_empty();
+        match out.iter_mut().find(|a| a.email.eq_ignore_ascii_case(&addr)) {
+            Some(a) => a.organizer = true,
+            // Only worth listing when there are guests to organize.
+            None if has_guests && !addr.is_empty() => {
+                let mut a = Attendee::new(&addr);
+                a.name = p.param("CN").unwrap_or_default().trim_matches('"').to_owned();
+                a.organizer = true;
+                a.response = Response::Accepted;
+                out.insert(0, a);
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 /// The app's event for one VEVENT.
 #[allow(clippy::too_many_arguments)]
 fn to_event(
@@ -624,9 +670,9 @@ fn to_event(
         all_day,
         location: vevent.text("LOCATION").unwrap_or_default(),
         notes: vevent.text("DESCRIPTION").unwrap_or_default(),
-        // Invitations go through Google only; a CalDAV event's ATTENDEEs
-        // stay in its .ics (saving keeps them) but aren't edited here.
-        attendees: Vec::new(),
+        // Shown (and searchable), but not edited here: saving leaves the
+        // .ics file's own ATTENDEE lines as they are.
+        attendees: attendees_of(vevent),
         remote_id: Some(remote_id),
         recurring_id,
         pending: false,
