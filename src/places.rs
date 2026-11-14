@@ -568,12 +568,28 @@ pub struct Lookup {
     pub selected: Option<usize>,
     tx: Sender<(String, Vec<Suggestion>)>,
     rx: Receiver<(String, Vec<Suggestion>)>,
+    /// A search is running. Only one at a time: on a big index a short
+    /// prefix takes a while, and slow typing would otherwise pile them up.
+    /// Text typed meanwhile waits in `pending` and is searched next.
+    busy: bool,
+    /// Searches started (for tests).
+    started: usize,
 }
 
 impl Default for Lookup {
     fn default() -> Self {
         let (tx, rx) = channel();
-        Lookup { pending: None, asked: None, shown_for: String::new(), suggestions: Vec::new(), selected: None, tx, rx }
+        Lookup {
+            pending: None,
+            asked: None,
+            shown_for: String::new(),
+            suggestions: Vec::new(),
+            selected: None,
+            tx,
+            rx,
+            busy: false,
+            started: 0,
+        }
     }
 }
 
@@ -601,6 +617,7 @@ impl Lookup {
     /// every frame the field is shown.
     pub fn poll(&mut self, ctx: &eframe::egui::Context, lib: &'static Library) {
         while let Ok((query, found)) = self.rx.try_recv() {
+            self.busy = false;
             if self.asked.as_deref() == Some(query.as_str()) {
                 self.suggestions = found;
                 self.shown_for = query;
@@ -613,15 +630,23 @@ impl Lookup {
             ctx.request_repaint_after(DEBOUNCE - waited);
             return;
         }
+        if self.busy {
+            // Its answer repaints, and then this text is searched.
+            return;
+        }
         let query = text.clone();
         self.pending = None;
         if self.asked.as_deref() == Some(query.as_str()) {
             return;
         }
         self.asked = Some(query.clone());
+        self.busy = true;
+        self.started += 1;
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let found = lib.search(&query);
+            // Always answer, even if the search panics, or `busy` would stay
+            // set and the field would never suggest anything again.
+            let found = std::panic::catch_unwind(|| lib.search(&query)).unwrap_or_default();
             let _ = tx.send((query, found));
             ctx.request_repaint();
         });
@@ -637,6 +662,34 @@ mod tests {
         let t: Vec<String> = tokens("Café-de Jaren, Straße ŁÓDŹ 12a").collect();
         assert_eq!(t, ["cafe", "de", "jaren", "strasse", "lodz", "12a"]);
         assert_eq!(tokens("İstanbul").collect::<Vec<_>>(), ["istanbul"]);
+    }
+
+    #[test]
+    fn one_suggestion_search_runs_at_a_time_and_the_latest_text_goes_next() {
+        let dir = std::env::temp_dir().join(format!("cc-lookup-{}", uuid::Uuid::new_v4()));
+        let lib: &'static Library = Box::leak(Box::new(Library::new(dir, "http://127.0.0.1:1/".into())));
+        let ctx = eframe::egui::Context::default();
+        let mut l = Lookup::default();
+        // Hold the answers back, to control when a search "finishes".
+        let (answer, rx) = channel();
+        l.rx = rx;
+        let ago = || Instant::now() - DEBOUNCE * 2;
+
+        l.typed("am");
+        l.pending.as_mut().unwrap().1 = ago();
+        l.poll(&ctx, lib);
+        assert_eq!(l.started, 1);
+        for text in ["ams", "amst", "amste"] {
+            l.typed(text);
+            l.pending.as_mut().unwrap().1 = ago();
+            l.poll(&ctx, lib);
+        }
+        assert_eq!(l.started, 1, "no new search while one runs");
+
+        answer.send(("am".into(), Vec::new())).unwrap();
+        l.poll(&ctx, lib);
+        assert_eq!(l.started, 2);
+        assert_eq!(l.asked.as_deref(), Some("amste"), "only the latest text");
     }
 
     #[test]
