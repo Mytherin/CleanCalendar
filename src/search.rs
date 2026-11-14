@@ -51,6 +51,45 @@ fn matches(ev: &Event, terms: &[String]) -> bool {
     terms.iter().all(|t| fields.iter().any(|f| f.contains(t.as_str())))
 }
 
+/// Remembers the last search, so the results list (drawn every frame)
+/// doesn't search every event again on each repaint.
+#[derive(Default)]
+pub struct Cache {
+    key: Option<(String, NaiveDate, u64)>,
+    results: Vec<Event>,
+    /// How many searches actually ran (for tests).
+    pub runs: usize,
+}
+
+impl Cache {
+    /// The results for `query`, searching again only when the query, the
+    /// day, or the events (or which calendars are shown) changed.
+    pub fn get(&mut self, store: &Store, query: &str, today: NaiveDate) -> &[Event] {
+        let key = (query.to_owned(), today, fingerprint(store));
+        if self.key.as_ref() != Some(&key) {
+            self.results = search(store, query, today);
+            self.key = Some(key);
+            self.runs += 1;
+        }
+        &self.results
+    }
+}
+
+/// A cheap summary of everything search results depend on. Hashing a few
+/// fields per event is far less work than matching them.
+fn fingerprint(store: &Store) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for c in &store.calendars {
+        (&c.id, c.visible, store.is_visible(&c.id)).hash(&mut h);
+    }
+    for e in &store.events {
+        (&e.id, e.rev, &e.etag, &e.title, &e.location, e.notes.len(), e.start, e.end, e.attendees.len()).hash(&mut h);
+        e.recurrence.is_some().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Index of the first result on or after `today` (else the last one), to
 /// scroll to: like Apple Calendar, the list opens at what's coming up.
 pub fn first_upcoming(results: &[Event], today: NaiveDate) -> Option<usize> {
@@ -113,6 +152,26 @@ mod tests {
         assert_eq!(ids(&search(&store, "example.com", day(11, 14))), ["c"], "invitee addresses");
         assert!(search(&store, "   ", day(11, 14)).is_empty());
         assert!(search(&store, "dentist zebra", day(11, 14)).is_empty());
+    }
+
+    #[test]
+    fn the_cache_searches_again_only_when_something_changed() {
+        let mut store = Store::with_defaults();
+        store.events = vec![ev("a", "Standup", day(11, 20))];
+        let mut cache = Cache::default();
+        for _ in 0..5 {
+            assert_eq!(cache.get(&store, "stand", day(11, 1)).len(), 1);
+        }
+        assert_eq!(cache.runs, 1, "repaints reuse the results");
+
+        store.events[0].title = "Retro".into();
+        assert!(cache.get(&store, "stand", day(11, 1)).is_empty(), "an edit is noticed");
+        store.events.push(ev("b", "Standup again", day(11, 21)));
+        assert_eq!(cache.get(&store, "stand", day(11, 1)).len(), 1, "a new event is noticed");
+        assert_eq!(cache.get(&store, "retro", day(11, 1)).len(), 1, "a new query is noticed");
+        store.calendars[0].visible = false;
+        assert!(cache.get(&store, "retro", day(11, 1)).is_empty(), "hiding a calendar is noticed");
+        assert_eq!(cache.runs, 5);
     }
 
     #[test]
