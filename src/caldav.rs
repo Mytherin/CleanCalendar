@@ -271,7 +271,8 @@ impl Client {
 /// "#RRGGBB" or "#RRGGBBAA" → RGB.
 fn parse_color(s: &str) -> Option<[u8; 3]> {
     let hex = s.trim().trim_start_matches('#');
-    if hex.len() != 6 && hex.len() != 8 {
+    // ASCII only: slicing a multi-byte character would panic.
+    if !hex.is_ascii() || (hex.len() != 6 && hex.len() != 8) {
         return None;
     }
     let n = u32::from_str_radix(&hex[..6], 16).ok()?;
@@ -491,6 +492,7 @@ mod unit_tests {
         assert_eq!(parse_color("#FF2968FF"), Some([0xFF, 0x29, 0x68]));
         assert_eq!(parse_color("#1badf8"), Some([0x1B, 0xAD, 0xF8]));
         assert_eq!(parse_color("red"), None);
+        assert_eq!(parse_color("#abcde€"), None, "8 bytes, but byte 6 is inside '€'");
         assert_eq!(normalize_server("caldav.icloud.com").unwrap().as_str(), "https://caldav.icloud.com/");
         assert_eq!(normalize_server("http://127.0.0.1:5232/dav").unwrap().as_str(), "http://127.0.0.1:5232/dav/");
         assert!(normalize_server("http://").is_err());
