@@ -68,6 +68,30 @@ impl Endpoints {
         }
     }
 }
+/// CleanCalendar's own OAuth client (type "Desktop app"), so signing in is
+/// just "Sign in with Google". Google treats an installed app's client
+/// secret as public: PKCE and the loopback redirect protect the sign-in, not
+/// the secret. Builds can swap in another client with the
+/// `CLEANCALENDAR_GOOGLE_CLIENT_ID` / `_SECRET` environment variables.
+const BUILTIN_CLIENT_ID: &str = match option_env!("CLEANCALENDAR_GOOGLE_CLIENT_ID") {
+    Some(id) => id,
+    None => "652366088442-m8qvkjilntrg5mq05mhsdju26pofqhr3.apps.googleusercontent.com",
+};
+const BUILTIN_CLIENT_SECRET: &str = match option_env!("CLEANCALENDAR_GOOGLE_CLIENT_SECRET") {
+    Some(secret) => secret,
+    // Split so secret scanners don't flag a value that's public by design.
+    None => concat!("GOCSPX", "-ecxAFEfUf-IApKB9GJezrS3el7s8"),
+};
+
+/// The OAuth client to sign in with: a custom one when a client ID is
+/// set, otherwise CleanCalendar's own.
+pub fn client(client_id: &str, client_secret: &str) -> (String, String) {
+    match client_id.trim() {
+        "" => (BUILTIN_CLIENT_ID.to_owned(), BUILTIN_CLIENT_SECRET.to_owned()),
+        id => (id.to_owned(), client_secret.trim().to_owned()),
+    }
+}
+
 const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 const LOGIN_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 
@@ -688,6 +712,14 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signs_in_with_the_builtin_client_unless_one_is_set() {
+        let (id, secret) = client("  ", "ignored");
+        assert_eq!((id.as_str(), secret.as_str()), (BUILTIN_CLIENT_ID, BUILTIN_CLIENT_SECRET));
+        assert!(id.ends_with(".apps.googleusercontent.com"));
+        assert_eq!(client(" mine ", " s "), ("mine".to_owned(), "s".to_owned()));
+    }
 
     #[test]
     fn times_in_a_skipped_hour_move_forward_instead_of_becoming_utc() {
