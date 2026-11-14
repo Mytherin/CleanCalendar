@@ -511,6 +511,7 @@ mod tests {
             all_day: false,
             location: String::new(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: None,
             recurring_id: None,
             pending: false,

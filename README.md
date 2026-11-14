@@ -10,7 +10,8 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Week/Day time grid:** overlapping events sit side by side; all-day and multi-day events span the all-day lane.
 - **Direct manipulation:** drag on empty space to create an event, drag an event to move it, drag its bottom edge to resize. Everything snaps to 15 minutes.
 - **Month view:** multi-day banners span across days, timed events show a colored dot and their time, and overflow collapses to "N more".
-- **Event editor:** title, location, all-day, start/end date and time, calendar and notes.
+- **Event editor:** title, location, all-day, start/end date and time, calendar, invitees and notes.
+- **Invitees:** on Google calendars, type addresses into "Add Invitees" (Enter, comma or semicolon adds one). Google emails the invitations, updates and cancellations, and each guest's reply (accepted, maybe, declined, no response) is shown next to their name.
 - **Google Calendar:** OAuth sign-in in your browser (loopback + PKCE), imports all your calendars, and sends creates, edits, moves and deletes back to Google. Read-only calendars (holidays, shared calendars) are shown but can't be edited.
 - Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows).
 

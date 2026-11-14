@@ -57,6 +57,9 @@ pub struct Event {
     pub location: String,
     #[serde(default)]
     pub notes: String,
+    /// People invited to the event (empty for an event without guests).
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
     /// The event's id on the remote service, if it lives on one.
     #[serde(default)]
     pub remote_id: Option<String>,
@@ -89,6 +92,95 @@ pub struct EventFields {
     pub start: NaiveDateTime,
     pub end: NaiveDateTime,
     pub all_day: bool,
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
+}
+
+/// How an invitee answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Response {
+    #[default]
+    NeedsAction,
+    Accepted,
+    Tentative,
+    Declined,
+}
+
+impl Response {
+    /// Google's `responseStatus` value.
+    pub fn as_google(self) -> &'static str {
+        match self {
+            Response::NeedsAction => "needsAction",
+            Response::Accepted => "accepted",
+            Response::Tentative => "tentative",
+            Response::Declined => "declined",
+        }
+    }
+
+    pub fn from_google(s: &str) -> Self {
+        match s {
+            "accepted" => Response::Accepted,
+            "tentative" => Response::Tentative,
+            "declined" => Response::Declined,
+            _ => Response::NeedsAction,
+        }
+    }
+}
+
+/// Someone invited to an event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attendee {
+    pub email: String,
+    /// Display name, if known.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub response: Response,
+    #[serde(default)]
+    pub organizer: bool,
+    /// This is the signed-in user.
+    #[serde(default)]
+    pub is_self: bool,
+    #[serde(default)]
+    pub optional: bool,
+    /// A room or other resource rather than a person. Kept so that saving
+    /// the guest list doesn't drop it, but not shown.
+    #[serde(default)]
+    pub resource: bool,
+}
+
+impl Attendee {
+    pub fn new(email: &str) -> Self {
+        Attendee {
+            email: email.trim().to_owned(),
+            name: String::new(),
+            response: Response::NeedsAction,
+            organizer: false,
+            is_self: false,
+            optional: false,
+            resource: false,
+        }
+    }
+
+    /// The name if there is one, else the email address.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.email
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// A loose check that `s` looks like one email address ("a@b.c").
+pub fn looks_like_email(s: &str) -> bool {
+    let s = s.trim();
+    let Some((user, domain)) = s.split_once('@') else { return false };
+    !user.is_empty()
+        && !s.chars().any(|c| c.is_whitespace() || c == ',' || c == ';')
+        && !domain.contains('@')
+        && domain.split('.').count() >= 2
+        && domain.split('.').all(|part| !part.is_empty())
 }
 
 impl Event {
@@ -100,6 +192,7 @@ impl Event {
             start: self.start,
             end: self.end,
             all_day: self.all_day,
+            attendees: self.attendees.clone(),
         }
     }
 
@@ -110,6 +203,7 @@ impl Event {
         self.start = f.start;
         self.end = f.end;
         self.all_day = f.all_day;
+        self.attendees = f.attendees;
     }
 
     pub fn occurs_on(&self, day: NaiveDate) -> bool {
@@ -254,5 +348,20 @@ impl Store {
 
     pub fn writable_calendars(&self) -> impl Iterator<Item = &Calendar> {
         self.calendars.iter().filter(|c| !c.read_only)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_check() {
+        for ok in ["a@b.co", "first.last+tag@mail.example.org", " x@y.z "] {
+            assert!(looks_like_email(ok), "{ok}");
+        }
+        for bad in ["", "a", "a@", "@b.c", "a@b", "a@b.", "a b@c.d", "a@b@c.d", "a@b.c, d@e.f"] {
+            assert!(!looks_like_email(bad), "{bad}");
+        }
     }
 }
