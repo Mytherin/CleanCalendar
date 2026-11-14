@@ -220,7 +220,7 @@ fn calendar_chip(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
     }
     egui::popup::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
         ui.set_min_width(180.0);
-        for c in store.calendars.iter().filter(|c| !c.read_only) {
+        for c in store.calendars.iter().filter(|c| !c.read_only && store.is_listed(c)) {
             let label = RichText::new(format!("●  {}", c.name)).color(theme::rgb(c.color));
             ui.selectable_value(&mut ed.draft.calendar_id, c.id.clone(), label);
         }

@@ -12,14 +12,16 @@ use eframe::egui::{Pos2, Rect, Vec2};
 use crate::dates::*;
 use crate::model::{Event, Store};
 
-/// Matches macOS Calendar's hour spacing (~53px at 100% scaling).
+/// A typical hour height (macOS Calendar showing 12 hours), for tests. The
+/// views size hours to the "Show N hours at a time" setting.
+#[cfg(test)]
 pub const HOUR_H: f32 = 52.0;
 /// Shortest drawn height of a timed event, enough for one line of title.
 pub const MIN_EVENT_H: f32 = 18.0;
 
-/// `MIN_EVENT_H` in minutes of the time grid.
-fn min_event_minutes() -> i64 {
-    (MIN_EVENT_H / HOUR_H * 60.0).ceil() as i64
+/// `MIN_EVENT_H` in minutes of a time grid with hours `hour_h` tall.
+fn min_event_minutes(hour_h: f32) -> i64 {
+    (MIN_EVENT_H / hour_h * 60.0).ceil() as i64
 }
 pub const GUTTER: f32 = 58.0;
 pub const BANNER_H: f32 = 20.0;
@@ -119,6 +121,8 @@ pub struct TimeGrid {
     pub col_w: f32,
     /// y of the midnight line.
     pub top: f32,
+    /// Height of one hour.
+    pub hour_h: f32,
 }
 
 impl TimeGrid {
@@ -132,12 +136,12 @@ impl TimeGrid {
     }
 
     pub fn time_at(&self, pos: Pos2) -> NaiveDateTime {
-        let mins = (((pos.y - self.top) / HOUR_H) * 60.0).clamp(0.0, 24.0 * 60.0 - 1.0) as i64;
+        let mins = (((pos.y - self.top) / self.hour_h) * 60.0).clamp(0.0, 24.0 * 60.0 - 1.0) as i64;
         midnight(self.day_at(pos.x)) + Duration::minutes(mins)
     }
 
     pub fn y_of(&self, minutes: i64) -> f32 {
-        self.top + minutes as f32 / 60.0 * HOUR_H
+        self.top + minutes as f32 / 60.0 * self.hour_h
     }
 }
 
@@ -206,6 +210,8 @@ pub struct WeekRects {
     pub grid: Rect,
     /// The visible part of the hour grid.
     pub grid_clip: Rect,
+    /// Height of one hour in `grid` (see [`grid_height`]).
+    pub hour_h: f32,
 }
 
 pub struct WeekLayout {
@@ -225,8 +231,8 @@ pub fn allday_height(events: &[Event], first: NaiveDate, ndays: i64) -> f32 {
 }
 
 /// Total height of the scrollable hour grid.
-pub fn grid_height() -> f32 {
-    24.0 * HOUR_H + 2.0 * GRID_PAD
+pub fn grid_height(hour_h: f32) -> f32 {
+    24.0 * hour_h + 2.0 * GRID_PAD
 }
 
 pub fn week(
@@ -237,7 +243,14 @@ pub fn week(
     editable: &dyn Fn(&Event) -> bool,
 ) -> WeekLayout {
     let col_w = (rects.grid.width() - GUTTER) / ndays as f32;
-    let geom = TimeGrid { first, ndays, left: rects.grid.left() + GUTTER, col_w, top: rects.grid.top() + GRID_PAD };
+    let geom = TimeGrid {
+        first,
+        ndays,
+        left: rects.grid.left() + GUTTER,
+        col_w,
+        top: rects.grid.top() + GRID_PAD,
+        hour_h: rects.hour_h,
+    };
     let mut hits = HitMap { hits: Vec::new(), grid: Some(geom) };
 
     // Day headers (double-click to open that day).
@@ -276,7 +289,7 @@ pub fn week(
     for d in 0..ndays {
         // Edge to edge between the gridlines.
         let left = geom.col_x(d) + HALF_LINE;
-        for seg in layout_day(events, &timed_idx, first + Duration::days(d), col_w - 2.0 * HALF_LINE) {
+        for seg in layout_day(events, &timed_idx, first + Duration::days(d), col_w - 2.0 * HALF_LINE, rects.hour_h) {
             let ev = &events[seg.ev];
             let x0 = left + seg.x;
             let w = seg.w;
@@ -328,7 +341,7 @@ const NEST_INDENT: f32 = 8.0;
 ///
 /// Segments come back in drawing order (later ones on top), which is also
 /// the order their hit areas must be registered in.
-pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate, width: f32) -> Vec<Segment> {
+pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate, width: f32, hour_h: f32) -> Vec<Segment> {
     let ds = midnight(day);
     let de = ds + Duration::days(1);
     let mut segs: Vec<Segment> = idx
@@ -342,7 +355,7 @@ pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate, width: f32) -
             // Short events are drawn taller than their duration so the title
             // fits; lay them out at that drawn length, so the next event goes
             // beside them instead of underneath their text.
-            let end_min = ((end - ds).num_minutes()).max(start_min + min_event_minutes());
+            let end_min = ((end - ds).num_minutes()).max(start_min + min_event_minutes(hour_h));
             Segment { ev: i, start_min, end_min, x: 0.0, w: width, ends_here: e.end <= de }
         })
         .collect();
@@ -549,7 +562,7 @@ mod tests {
     fn events_starting_together_share_the_column() {
         // Like "hairdresser" 14:45 and "Engineering Process Meeting" 15:00.
         let all = [ev("a", (14, 45), (15, 45)), ev("b", (15, 0), (16, 0)), ev("c", (17, 0), (18, 0))];
-        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0);
+        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0, HOUR_H);
         let get = |id: &str| segs.iter().find(|s| all[s.ev].id == id).unwrap();
         assert_eq!((get("a").x, get("a").w), (0.0, 100.0));
         assert_eq!((get("b").x, get("b").w), (100.0, 100.0));
@@ -560,7 +573,7 @@ mod tests {
     fn later_overlapping_event_is_indented_on_top() {
         // Like "Colour Consultation" 17:30 inside "Nvidia sync" 17:00–18:00.
         let all = [ev("inner", (17, 30), (18, 0)), ev("outer", (17, 0), (18, 0))];
-        let segs = layout_day(&all, &[0, 1], day(), 200.0);
+        let segs = layout_day(&all, &[0, 1], day(), 200.0, HOUR_H);
         let order: Vec<&str> = segs.iter().map(|s| all[s.ev].id.as_str()).collect();
         assert_eq!(order, ["outer", "inner"], "the later one is drawn (and hit) on top");
         assert_eq!((segs[0].x, segs[0].w), (0.0, 200.0), "the one below keeps the full width");
@@ -573,7 +586,7 @@ mod tests {
         // koffie nests in the photoshoot; lunch starts 35 min after koffie, so
         // it nests again, one more indent in.
         let all = [ev("shoot", (10, 30), (11, 30)), ev("koffie", (11, 15), (12, 0)), ev("lunch", (11, 50), (12, 30))];
-        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0);
+        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0, HOUR_H);
         let x: Vec<f32> = segs.iter().map(|s| s.x).collect();
         assert_eq!(x, [0.0, NEST_INDENT, 2.0 * NEST_INDENT]);
     }

@@ -10,6 +10,7 @@ mod google;
 mod interact;
 mod layout;
 mod model;
+mod settings;
 mod sync;
 mod theme;
 mod views;
