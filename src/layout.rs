@@ -58,13 +58,14 @@ pub enum Target {
 /// What dragging an event from this spot does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Grip {
-    /// Not draggable (read-only calendar, or a view without dragging).
+    /// Not draggable (e.g. a read-only calendar).
     None,
     /// Move a timed event in time and across days.
     Move,
     /// Drag the end of a timed event.
     Resize,
-    /// Move an all-day / multi-day banner by whole days.
+    /// Move by whole days, keeping the times: an all-day / multi-day
+    /// banner, or any event in the month view.
     MoveDays,
 }
 
@@ -89,6 +90,18 @@ pub struct HitMap {
 impl HitMap {
     pub fn hit(&self, pos: Pos2) -> Option<&Target> {
         self.hits.iter().rev().find(|h| h.clip.contains(pos) && h.rect.contains(pos)).map(|h| &h.target)
+    }
+
+    /// The day under `pos`, for drags by whole days: a day/week column, or
+    /// a month cell (whatever is drawn on top of it). None between cells.
+    pub fn day_at(&self, pos: Pos2) -> Option<NaiveDate> {
+        if let Some(g) = self.grid {
+            return Some(g.day_at(pos.x));
+        }
+        self.hits.iter().find_map(|h| match h.target {
+            Target::MonthCell(day) if h.rect.contains(pos) => Some(day),
+            _ => None,
+        })
     }
 
     fn push(&mut self, rect: Rect, clip: Rect, target: Target) {
@@ -415,7 +428,15 @@ pub fn month_span(month: NaiveDate) -> (NaiveDate, i64) {
 
 /// Lays out the month containing `month` in `rect`. `number_w` measures a day
 /// number label (painting decides the font).
-pub fn month(events: &[Event], month: NaiveDate, rect: Rect, number_w: &dyn Fn(NaiveDate) -> f32) -> MonthLayout {
+pub fn month(
+    events: &[Event],
+    month: NaiveDate,
+    rect: Rect,
+    number_w: &dyn Fn(NaiveDate) -> f32,
+    editable: &dyn Fn(&Event) -> bool,
+) -> MonthLayout {
+    // Events move by whole days in the month grid, keeping their times.
+    let grip = |ev: &Event| if editable(ev) { Grip::MoveDays } else { Grip::None };
     let (grid_start, weeks) = month_span(month);
     let header_h = MONTH_HEADER_H;
     let cell_w = rect.width() / 7.0;
@@ -464,7 +485,7 @@ pub fn month(events: &[Event], month: NaiveDate, rect: Rect, number_w: &dyn Fn(N
                 Pos2::new(rect.left() + (c1 + 1) as f32 * cell_w - 3.0, top + 28.0 + lane as f32 * row_h + row_h - 2.0),
             );
             out.banners.push(Placed { ev: i, rect: r });
-            out.hits.push(r, rect, event_target(&events[i], Grip::None));
+            out.hits.push(r, rect, event_target(&events[i], grip(&events[i])));
         }
 
         // Timed events in each day cell.
@@ -482,7 +503,7 @@ pub fn month(events: &[Event], month: NaiveDate, rect: Rect, number_w: &dyn Fn(N
                 }
                 let r = Rect::from_min_size(Pos2::new(left + 3.0, top + 28.0 + row as f32 * row_h), Vec2::new(cell_w - 6.0, row_h - 2.0));
                 out.rows.push(Placed { ev: i, rect: r });
-                out.hits.push(r, rect, event_target(&events[i], Grip::None));
+                out.hits.push(r, rect, event_target(&events[i], grip(&events[i])));
                 row += 1;
             }
             if more > 0 {

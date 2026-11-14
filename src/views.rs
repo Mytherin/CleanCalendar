@@ -265,7 +265,7 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     let events = shown_events(app, grid_start, weeks * 7);
     let number_font = theme::font(14.0);
     let number_w = |day: NaiveDate| text_galley(ui, &month_label(day), number_font.clone(), p.text, 200.0).size().x;
-    let lay = layout::month(&events, app.date, rect, &number_w);
+    let lay = layout::month(&events, app.date, rect, &number_w, &|ev| !is_read_only(app, ev));
     record_rects(app, &events, lay.banners.iter().map(|b| (b.ev, b.rect)).chain(lay.rows.iter().map(|r| (r.ev, r.rect))));
 
     drive_pointer(app, ui, &lay.hits);
@@ -283,9 +283,14 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
     painter.hline(rect.x_range(), rect.top() + lay.header_h, Stroke::new(1.0_f32, p.grid));
 
+    let ghost = app.pointer.ghost_days();
     for cell in &lay.cells {
         if is_weekend(cell.day) {
             painter.rect_filled(cell.rect, 0.0, p.weekend);
+        }
+        // The days a new all-day event being dragged out will cover.
+        if ghost.is_some_and(|(a, b)| (a..=b).contains(&cell.day)) {
+            painter.rect_filled(cell.rect, 0.0, theme::ACCENT.gamma_multiply(0.15));
         }
         painter.hline(cell.rect.x_range(), cell.rect.bottom(), Stroke::new(1.0_f32, p.grid));
         if cell.rect.left() > rect.left() + 1.0 {
@@ -407,6 +412,13 @@ fn paint_day_headers(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayo
 fn paint_allday(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayout, events: &[Event], p: &Palette) {
     let r = lay.rects.allday;
     let x_range = lay.rects.header.x_range();
+    // The days a new all-day event being dragged out will cover.
+    if let Some((a, b)) = app.pointer.ghost_days() {
+        for i in (0..lay.ndays).filter(|&i| (a..=b).contains(&(lay.first + Duration::days(i)))) {
+            let cell = Rect::from_x_y_ranges(lay.geom.col_x(i)..=lay.geom.col_x(i + 1), r.y_range());
+            painter.rect_filled(cell, 0.0, theme::ACCENT.gamma_multiply(0.15));
+        }
+    }
     painter.hline(x_range, r.top(), Stroke::new(1.0_f32, p.grid));
     painter.hline(x_range, r.bottom(), Stroke::new(1.0_f32, p.grid_strong));
     painter.text(

@@ -372,6 +372,17 @@ fn double_click_all_day_lane_creates_all_day_event() {
 }
 
 #[test]
+fn drag_across_the_all_day_lane_creates_an_all_day_event() {
+    let mut sim = Sim::week(vec![]);
+    let y = sim.layout().rects.allday.center().y;
+    sim.press(sim.column("2026-11-12", y));
+    sim.move_to(sim.column("2026-11-10", y));
+    assert_eq!(sim.pointer.ghost_days(), Some((d("2026-11-10"), d("2026-11-12"))));
+    let out = sim.release();
+    assert_eq!(out, vec![Action::New { start: t("2026-11-10 00:00"), end: t("2026-11-13 00:00"), all_day: true }]);
+}
+
+#[test]
 fn double_click_day_header_opens_day_view() {
     let mut sim = Sim::week(vec![]);
     let out = sim.double_click(sim.column("2026-11-10", 10.0));
@@ -393,8 +404,17 @@ fn scrolled_out_events_are_not_hit() {
 // Month view
 
 fn month_hits(events: &[Event]) -> layout::MonthLayout {
+    month_layout(events, true)
+}
+
+fn month_layout(events: &[Event], editable: bool) -> layout::MonthLayout {
     let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 626.0));
-    layout::month(events, d("2026-11-14"), rect, &|_| 14.0)
+    layout::month(events, d("2026-11-14"), rect, &|_| 14.0, &|_| editable)
+}
+
+/// An empty spot in a month cell (below its day number).
+fn month_blank(lay: &layout::MonthLayout, day: &str) -> Pos2 {
+    lay.cells.iter().find(|c| c.day == d(day)).unwrap().rect.center() + Vec2::new(0.0, 20.0)
 }
 
 #[test]
@@ -417,9 +437,54 @@ fn month_day_number_opens_day_and_cell_double_click_creates() {
 }
 
 #[test]
-fn month_events_select_but_do_not_drag() {
+fn month_drag_across_empty_days_creates_an_all_day_event() {
+    let lay = month_hits(&[]);
+    let mut p = Pointer::default();
+    p.handle(Input::Press { pos: month_blank(&lay, "2026-11-18") }, &lay.hits);
+    // Across a week boundary: Wed 18th to Mon 23rd.
+    assert_eq!(p.handle(Input::Move { pos: month_blank(&lay, "2026-11-23") }, &lay.hits), vec![]);
+    assert_eq!(p.ghost_days(), Some((d("2026-11-18"), d("2026-11-23"))));
+    let out = p.handle(Input::Release { pos: month_blank(&lay, "2026-11-23"), time: 1.0 }, &lay.hits);
+    assert_eq!(out, vec![Action::New { start: t("2026-11-18 00:00"), end: t("2026-11-24 00:00"), all_day: true }]);
+}
+
+#[test]
+fn month_events_drag_to_another_day_keeping_their_times() {
     let events = vec![event("standup", "2026-11-10 09:00", "2026-11-10 10:00")];
     let lay = month_hits(&events);
+    let r = lay.rows[0].rect;
+    let mut p = Pointer::default();
+    p.handle(Input::Press { pos: r.center() }, &lay.hits);
+    let out = p.handle(Input::Move { pos: month_blank(&lay, "2026-11-19") }, &lay.hits);
+    assert_eq!(
+        out,
+        vec![
+            Action::Select(Some("standup".into())),
+            Action::BeginEdit("standup".into()),
+            Action::SetTimes { id: "standup".into(), start: t("2026-11-19 09:00"), end: t("2026-11-19 10:00") },
+        ]
+    );
+    let out = p.handle(Input::Release { pos: month_blank(&lay, "2026-11-19"), time: 1.0 }, &lay.hits);
+    assert_eq!(out, vec![Action::Committed("standup".into())]);
+}
+
+#[test]
+fn month_all_day_events_drag_by_the_day_grabbed() {
+    // Grabbed on its second day, dropped on the 20th: it now starts the 19th.
+    let events = vec![all_day("trip", "2026-11-10", "2026-11-13")];
+    let lay = month_hits(&events);
+    let r = lay.banners[0].rect;
+    let grab = Pos2::new(r.left() + lay.cell_w * 1.5, r.center().y);
+    let mut p = Pointer::default();
+    p.handle(Input::Press { pos: grab }, &lay.hits);
+    let out = p.handle(Input::Move { pos: month_blank(&lay, "2026-11-20") }, &lay.hits);
+    assert_eq!(out.last(), Some(&Action::SetTimes { id: "trip".into(), start: t("2026-11-19 00:00"), end: t("2026-11-22 00:00") }));
+}
+
+#[test]
+fn read_only_month_events_select_but_do_not_drag() {
+    let events = vec![event("standup", "2026-11-10 09:00", "2026-11-10 10:00")];
+    let lay = month_layout(&events, false);
     let r = lay.rows[0].rect;
     let mut p = Pointer::default();
     p.handle(Input::Press { pos: r.center() }, &lay.hits);

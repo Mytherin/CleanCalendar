@@ -35,6 +35,8 @@ pub enum Cursor {
 #[derive(Clone, Debug)]
 enum Drag {
     Create { anchor: NaiveDateTime, current: NaiveDateTime },
+    /// A new all-day event across whole days.
+    CreateDays { anchor: NaiveDate, current: NaiveDate },
     Move { id: String, grab: Duration, len: Duration },
     Resize { id: String, start: NaiveDateTime },
     MoveDays { id: String, grab: i64, start: NaiveDateTime, end: NaiveDateTime },
@@ -103,6 +105,15 @@ impl Pointer {
         }
     }
 
+    /// The days of a new all-day event being drawn by dragging across empty
+    /// days (month cells or the all-day lane), as (first, last).
+    pub fn ghost_days(&self) -> Option<(NaiveDate, NaiveDate)> {
+        match &self.gesture {
+            Gesture::Dragging(Drag::CreateDays { anchor, current }) => Some((*anchor.min(current), *anchor.max(current))),
+            _ => None,
+        }
+    }
+
     /// The cursor to show, given what the pointer hovers.
     pub fn cursor(&self, hover: Option<&Target>) -> Option<Cursor> {
         match &self.gesture {
@@ -129,15 +140,15 @@ impl Pointer {
             Input::Move { pos } => {
                 if let Gesture::Pressed { pos: origin, target } = &self.gesture {
                     if origin.distance(pos) >= DRAG_DIST {
-                        self.gesture = match start_drag(target, *origin, hits.grid, &mut out) {
+                        self.gesture = match start_drag(target, *origin, hits, &mut out) {
                             Some(drag) => Gesture::Dragging(drag),
                             None => Gesture::Ignored,
                         };
                         self.last_click = None;
                     }
                 }
-                if let (Gesture::Dragging(drag), Some(grid)) = (&mut self.gesture, hits.grid) {
-                    update_drag(drag, pos, &grid, &mut out);
+                if let Gesture::Dragging(drag) = &mut self.gesture {
+                    update_drag(drag, pos, hits, &mut out);
                 }
             }
             Input::Release { pos, time } => match std::mem::take(&mut self.gesture) {
@@ -207,24 +218,28 @@ fn double_click(target: &Target, pos: Pos2, grid: Option<TimeGrid>, out: &mut Ve
     }
 }
 
-fn start_drag(target: &Target, origin: Pos2, grid: Option<TimeGrid>, out: &mut Vec<Action>) -> Option<Drag> {
-    let grid = grid?;
+fn start_drag(target: &Target, origin: Pos2, hits: &HitMap, out: &mut Vec<Action>) -> Option<Drag> {
     let drag = match target {
         Target::TimeGrid => {
-            let t = snap(grid.time_at(origin));
+            let t = snap(hits.grid?.time_at(origin));
             return Some(Drag::Create { anchor: t, current: t });
         }
+        // Empty days (the all-day lane, or month cells): a new all-day event.
+        Target::AllDayLane | Target::MonthCell(_) | Target::MonthDayNumber(_) => {
+            let day = hits.day_at(origin)?;
+            return Some(Drag::CreateDays { anchor: day, current: day });
+        }
         Target::Event { id, start, end, grip } => match grip {
-            Grip::Move => Drag::Move { id: id.clone(), grab: grid.time_at(origin) - *start, len: *end - *start },
+            Grip::Move => Drag::Move { id: id.clone(), grab: hits.grid?.time_at(origin) - *start, len: *end - *start },
             Grip::Resize => Drag::Resize { id: id.clone(), start: *start },
-            Grip::MoveDays => Drag::MoveDays { id: id.clone(), grab: day_offset(grid.day_at(origin.x), start.date()), start: *start, end: *end },
+            Grip::MoveDays => Drag::MoveDays { id: id.clone(), grab: day_offset(hits.day_at(origin)?, start.date()), start: *start, end: *end },
             Grip::None => return None,
         },
         _ => return None,
     };
     let id = match &drag {
         Drag::Move { id, .. } | Drag::Resize { id, .. } | Drag::MoveDays { id, .. } => id.clone(),
-        Drag::Create { .. } => unreachable!(),
+        Drag::Create { .. } | Drag::CreateDays { .. } => unreachable!(),
     };
     out.push(Action::Select(Some(id.clone())));
     out.push(Action::BeginEdit(id));
@@ -235,8 +250,27 @@ fn day_offset(a: NaiveDate, b: NaiveDate) -> i64 {
     (a - b).num_days()
 }
 
-fn update_drag(drag: &mut Drag, pos: Pos2, grid: &TimeGrid, out: &mut Vec<Action>) {
+fn update_drag(drag: &mut Drag, pos: Pos2, hits: &HitMap, out: &mut Vec<Action>) {
     let set = |id: &str, start, end| Action::SetTimes { id: id.to_owned(), start, end };
+    // Drags by whole days work in the month view too; between cells (or
+    // off the grid) they stay where they were.
+    match drag {
+        Drag::CreateDays { current, .. } => {
+            if let Some(day) = hits.day_at(pos) {
+                *current = day;
+            }
+            return;
+        }
+        Drag::MoveDays { id, grab, start, end } => {
+            if let Some(day) = hits.day_at(pos) {
+                let delta = day - Duration::days(*grab) - start.date();
+                out.push(set(id, *start + delta, *end + delta));
+            }
+            return;
+        }
+        _ => {}
+    }
+    let Some(grid) = hits.grid else { return };
     match drag {
         Drag::Create { current, .. } => {
             // Like macOS Calendar, dragging onto another day runs the new
@@ -251,10 +285,7 @@ fn update_drag(drag: &mut Drag, pos: Pos2, grid: &TimeGrid, out: &mut Vec<Action
             let end = snap(grid.time_at(pos)).max(*start + Duration::minutes(15));
             out.push(set(id, *start, end));
         }
-        Drag::MoveDays { id, grab, start, end } => {
-            let delta = grid.day_at(pos.x) - Duration::days(*grab) - start.date();
-            out.push(set(id, *start + delta, *end + delta));
-        }
+        Drag::CreateDays { .. } | Drag::MoveDays { .. } => unreachable!(),
     }
 }
 
@@ -267,6 +298,10 @@ fn finish_drag(drag: Drag, out: &mut Vec<Action>) {
                 e = anchor + Duration::hours(1);
             }
             out.push(Action::New { start: s, end: e, all_day: false });
+        }
+        Drag::CreateDays { anchor, current } => {
+            let (first, last) = if current < anchor { (current, anchor) } else { (anchor, current) };
+            out.push(Action::New { start: midnight(first), end: midnight(last + Duration::days(1)), all_day: true });
         }
         Drag::Move { id, .. } | Drag::Resize { id, .. } | Drag::MoveDays { id, .. } => out.push(Action::Committed(id)),
     }
