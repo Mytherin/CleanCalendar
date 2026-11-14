@@ -131,6 +131,16 @@ fn a_new_location_drops_apples_map_pin() {
 }
 
 #[test]
+fn a_character_split_by_another_clients_fold_is_joined_back() {
+    // "café" folded between the two bytes of "é" (C3 A9).
+    let data = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:a\r\nSUMMARY:x\r\n\
+        DTSTART:20261114T090000Z\r\nDESCRIPTION:caf\xC3\r\n \xA9 au lait\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let c = parse_bytes(data).unwrap();
+    let ev = c.events().next().unwrap();
+    assert_eq!(ev.text("DESCRIPTION").as_deref(), Some("café au lait"));
+}
+
+#[test]
 fn durations() {
     assert_eq!(parse_duration("PT1H30M"), Some(Duration::minutes(90)));
     assert_eq!(parse_duration("P2D"), Some(Duration::days(2)));

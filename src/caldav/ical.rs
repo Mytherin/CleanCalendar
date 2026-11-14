@@ -221,6 +221,30 @@ fn raw_line(line: &str) -> Option<Prop> {
 
 /// Parses an iCalendar object (the outermost component, usually VCALENDAR).
 /// Lines that can't be read are skipped rather than failing the whole file.
+/// Parses a resource as the server sent it. Lines are unfolded before the
+/// bytes are decoded: other clients fold at 75 octets, which may split a
+/// multi-byte character, and RFC 5545 §3.1 says to join it back up.
+/// (Decoding first would turn both halves into U+FFFD, and saving the event
+/// would then write that damage back.)
+pub fn parse_bytes(data: &[u8]) -> Result<Component> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let fold = match &data[i..] {
+            [b'\r', b'\n', b' ' | b'\t', ..] => 3,
+            [b'\n', b' ' | b'\t', ..] => 2,
+            _ => 0,
+        };
+        if fold > 0 {
+            i += fold;
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    parse(&String::from_utf8_lossy(&out))
+}
+
 pub fn parse(text: &str) -> Result<Component> {
     let mut lines: Vec<String> = Vec::new();
     for raw in text.split('\n') {
