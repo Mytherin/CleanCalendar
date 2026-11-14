@@ -61,7 +61,7 @@ The executable is `target/release/CleanCalendar.exe`. On Windows, `build.rs` emb
 ## Connecting iCloud
 
 1. At [account.apple.com](https://account.apple.com/account/manage) go to **Sign-In and Security → App-Specific Passwords** and create one (e.g. "CleanCalendar"). Apple doesn't let other apps use your normal Apple ID password.
-2. In CleanCalendar click **Add Account** (or **Accounts**), choose **iCloud**, enter your Apple ID and the app-specific password, and click **Sign In**.
+2. In CleanCalendar open **Settings** (⚙) → **Accounts**, click **+**, choose **iCloud**, enter your Apple ID and the app-specific password, and click **Sign In**.
 
 For another CalDAV server choose **Other CalDAV server** and enter its address (e.g. `https://caldav.fastmail.com/`); the calendars are found from there (`/.well-known/caldav`, the user's principal, then the calendar home). The password is kept in the OS credential store.
 
