@@ -304,4 +304,63 @@ mod tests {
         }
         println!("{}", dir.display());
     }
+
+    /// Regenerates `assets/CleanCalendar.ico`, the icon `build.rs` embeds in
+    /// the Windows executable (what Explorer, shortcuts and the Start menu
+    /// show before the app runs and draws today's date):
+    /// `cargo test date_icon::tests::write_exe_icon -- --ignored`
+    #[test]
+    #[ignore]
+    fn write_exe_icon() {
+        // A fixed, two-digit day reads well at every size.
+        let date = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let sizes = [16u32, 20, 24, 32, 40, 48, 64, 256];
+        let images: Vec<Vec<u8>> = sizes.iter().map(|&size| ico_image(&render(date, size), size)).collect();
+
+        let mut ico = Vec::new();
+        ico.extend([0u16, 1, sizes.len() as u16].iter().flat_map(|v| v.to_le_bytes()));
+        let mut offset = 6 + 16 * sizes.len() as u32;
+        for (&size, image) in sizes.iter().zip(&images) {
+            let dim = if size >= 256 { 0 } else { size as u8 };
+            ico.extend([dim, dim, 0, 0]);
+            ico.extend(1u16.to_le_bytes()); // planes
+            ico.extend(32u16.to_le_bytes()); // bits per pixel
+            ico.extend((image.len() as u32).to_le_bytes());
+            ico.extend(offset.to_le_bytes());
+            offset += image.len() as u32;
+        }
+        images.iter().for_each(|image| ico.extend(image));
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join("CleanCalendar.ico");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, ico).unwrap();
+        println!("{}", path.display());
+    }
+
+    /// One icon image: PNG at 256px (keeps the file small), a classic 32-bit
+    /// DIB below that, which every Windows shell component reads.
+    fn ico_image(rgba: &[u8], size: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        if size >= 256 {
+            let mut enc = png::Encoder::new(&mut out, size, size);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.set_compression(png::Compression::Best);
+            enc.write_header().unwrap().write_image_data(rgba).unwrap();
+            return out;
+        }
+        out.extend(40u32.to_le_bytes());
+        out.extend((size as i32).to_le_bytes());
+        out.extend((2 * size as i32).to_le_bytes()); // XOR image + AND mask
+        out.extend(1u16.to_le_bytes());
+        out.extend(32u16.to_le_bytes());
+        out.extend([0u8; 24]);
+        // Bottom-up BGRA rows, then an all-zero AND mask (alpha does the work)
+        // with rows padded to 32 bits.
+        for row in rgba.chunks_exact(size as usize * 4).rev() {
+            out.extend(row.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]));
+        }
+        out.extend(std::iter::repeat(0u8).take(size.div_ceil(32) as usize * 4 * size as usize));
+        out
+    }
 }

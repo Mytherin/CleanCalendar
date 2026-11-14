@@ -36,6 +36,8 @@ cargo test
 On Windows this project was set up with the `x86_64-pc-windows-gnu` toolchain plus WinLibs MinGW (for `dlltool`).
 The MSVC toolchain works too if you have the Visual Studio C++ Build Tools.
 
+The executable is `target/release/CleanCalendar.exe`. On Windows, `build.rs` embeds `assets/CleanCalendar.ico` and version info into it (no `rc.exe`/`windres` needed). The icon is rendered by the same code as the live date icon; to regenerate it run `cargo test date_icon::tests::write_exe_icon -- --ignored`.
+
 ## Keyboard shortcuts
 
 | Keys | Action |
