@@ -76,6 +76,9 @@ pub struct App {
     /// The week view's first day while scrolling by days (see
     /// [`App::grid_first`]).
     week_first: Option<NaiveDate>,
+    /// While stepping by months or years: the day of the month to go back
+    /// to, so 31 Jan → Feb → Mar lands on 31 Mar, not 28 Mar.
+    month_anchor: Option<u32>,
     pub actions: Vec<Action>,
     /// The event being edited (in a popover, or the day view's inspector).
     pub editor: Option<Editor>,
@@ -127,6 +130,7 @@ impl App {
             selected: None,
             pointer: Pointer::default(),
             week_first: None,
+            month_anchor: None,
             actions: Vec::new(),
             editor: None,
             event_rects: HashMap::new(),
@@ -800,6 +804,7 @@ impl App {
             self.scroll_to = Some(self.store.settings.scroll_hour());
         }
         self.date = date;
+        self.month_anchor = None;
         if view != self.view {
             self.finish_editor(Outcome::Done);
             // Still open (it can't be saved as is): the inspector only
@@ -852,9 +857,15 @@ impl App {
                 (self.date + Duration::days(dir as i64)).clamp(first, first + Duration::days(n - 1))
             }
             View::Week => self.date + Duration::days(7 * dir as i64),
-            View::Month => add_months(self.date, dir),
-            View::Year => add_months(self.date, 12 * dir),
+            View::Month | View::Year => {
+                let anchor = *self.month_anchor.get_or_insert(self.date.day());
+                let months = if self.view == View::Year { 12 * dir } else { dir };
+                step_months(self.date, months, anchor)
+            }
         };
+        if !matches!(self.view, View::Month | View::Year) {
+            self.month_anchor = None;
+        }
         self.mini_month = first_of_month(self.date);
         // Don't leave an event selected (and deletable with Backspace)
         // that's no longer on screen.
@@ -1154,6 +1165,7 @@ impl App {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 7.0 * 24.0), Sense::hover());
         if let Some(day) = views::mini_month(ui, rect, self.mini_month, self.today, Some(self.date), p, true, None) {
             self.date = day;
+            self.month_anchor = None;
             if self.view == View::Year {
                 self.view = View::Day;
             }

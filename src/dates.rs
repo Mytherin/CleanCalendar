@@ -75,6 +75,14 @@ pub fn add_months(d: NaiveDate, n: i32) -> NaiveDate {
     r.unwrap_or(d)
 }
 
+/// `n` months from `d`'s month, on day `day` (or that month's last day if
+/// it's shorter). Stepping with the same `day` doesn't drift:
+/// 31 Jan → 28 Feb → 31 Mar, not → 28 Mar.
+pub fn step_months(d: NaiveDate, n: i32, day: u32) -> NaiveDate {
+    let month = add_months(first_of_month(d), n);
+    month.with_day(day.clamp(1, days_in_month(month))).unwrap_or(month)
+}
+
 pub fn days_in_month(d: NaiveDate) -> u32 {
     let first = first_of_month(d);
     (add_months(first, 1) - first).num_days() as u32
@@ -196,6 +204,18 @@ mod tests {
         assert_eq!(add_months(d(2026, 1, 31), 1), d(2026, 2, 28));
         assert_eq!(add_months(d(2026, 1, 15), -1), d(2025, 12, 15));
         assert_eq!(days_in_month(d(2028, 2, 10)), 29);
+    }
+
+    #[test]
+    fn stepping_months_does_not_drift() {
+        let feb = step_months(d(2026, 1, 31), 1, 31);
+        assert_eq!(feb, d(2026, 2, 28));
+        assert_eq!(step_months(feb, 1, 31), d(2026, 3, 31), "back to the 31st");
+        assert_eq!(step_months(d(2026, 3, 31), -1, 31), d(2026, 2, 28));
+        // Years: 29 Feb → 28 Feb → 29 Feb in the next leap year.
+        let y = step_months(d(2028, 2, 29), 12, 29);
+        assert_eq!(y, d(2029, 2, 28));
+        assert_eq!(step_months(y, 36, 29), d(2032, 2, 29));
     }
 
     #[test]

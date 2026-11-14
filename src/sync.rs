@@ -356,6 +356,9 @@ impl SyncEngine {
                 let name = store.account_name(&calendar.account);
                 if kind == Failure::Retry {
                     self.status(offline(&name), true);
+                } else if kind == Failure::SignedOut {
+                    // Kept for when the user connects again.
+                    self.status(error, true);
                 } else {
                     // The service won't delete it: drop the request and show
                     // what it has.
@@ -452,6 +455,8 @@ impl SyncEngine {
         match kind {
             // Stays pending; the next sync retries it.
             Failure::Retry => self.status(offline(&name), true),
+            // Stays pending until the user connects again.
+            Failure::SignedOut => self.status(error, true),
             // Creating failed because the calendar itself is gone (updates of
             // deleted events arrive as conflicts instead), or it was refused.
             Failure::Gone | Failure::Rejected => {
@@ -1100,6 +1105,27 @@ mod tests {
         assert!(!ev.pending);
         assert_eq!(ev.base, None);
         assert!(sent(&mut engine).is_empty());
+    }
+
+    #[test]
+    fn a_revoked_sign_in_keeps_the_edit_and_says_so() {
+        let id = google::local_event_id(CAL, "a");
+        let mut store = store_with(vec![gev("a", "old")]);
+        let mut engine = SyncEngine::default();
+        edit(&mut store, &mut engine, &id, "new");
+        sent(&mut engine);
+        let msg = Msg::SaveFailed {
+            local_id: id.clone(),
+            calendar: CalRef::google(CAL),
+            error: "Google sign-in expired or was revoked (invalid_grant); connect again".into(),
+            kind: Failure::SignedOut,
+        };
+        engine.handle(&mut store, msg, None, today());
+        assert!(store.event(&id).unwrap().pending, "kept for when the user connects again");
+        assert_eq!(titles(&store), ["new"]);
+        let st = statuses(&engine);
+        assert!(st.iter().any(|s| s.contains("connect again")), "{st:?}");
+        assert!(!st.iter().any(|s| *s == offline("Google")), "not reported as being offline");
     }
 
     #[test]
