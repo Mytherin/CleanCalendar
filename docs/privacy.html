@@ -19,8 +19,8 @@
     <h2>Summary</h2>
     <p>
       CleanCalendar is a desktop app. Everything it stores stays on your computer. It has no servers,
-      no user accounts of its own, no analytics and no advertising. If you connect a Google account,
-      your calendar data travels only between your computer and Google.
+      no user accounts of its own, no analytics and no advertising. If you connect a Google, iCloud or
+      other CalDAV account, your calendar data travels only between your computer and that service.
     </p>
   </section>
 
@@ -29,10 +29,13 @@
     <ul>
       <li>The calendars and events you create or sync, and your display settings (such as calendar colors).</li>
       <li>If you connect Google: a sign-in token issued by Google, which lets the app access your calendars without asking you to sign in again, and your Google account's email address, shown in the app's sidebar.</li>
+      <li>If you connect iCloud or another CalDAV server: the server address, your user name (for iCloud, your Apple ID), and the password you entered (for iCloud, an app-specific password).</li>
     </ul>
     <p>
-      This information is saved in a file in your user profile's application-data folder. It is not sent
-      anywhere else. Uninstalling the app and deleting that folder removes it.
+      This information is saved in files in your user profile's application-data and cache folders.
+      Sign-in tokens and passwords are kept in your operating system's credential store (Windows Credential
+      Manager, macOS Keychain, or the Secret Service on Linux) when one is available. None of it is sent
+      anywhere else. Uninstalling the app and deleting those folders removes it.
     </p>
   </section>
 
@@ -59,12 +62,23 @@
   </section>
 
   <section>
+    <h2>iCloud and other CalDAV servers</h2>
+    <p>
+      Connecting an iCloud or other CalDAV account is optional. If you connect one, CleanCalendar signs in to
+      that server with the user name and password you entered, and uses that access only to read your
+      calendars and events and to create, update and delete events when you make those changes in the app.
+      Your data and password are not sent to anyone else.
+    </p>
+  </section>
+
+  <section>
     <h2>Removing access</h2>
     <p>
-      You can disconnect Google at any time with <strong>Disconnect</strong> in the app's Google dialog,
-      which deletes the token and synced Google data from your computer. You can also revoke the app's
+      You can disconnect any account at any time with <strong>Disconnect</strong> in the app's Accounts window,
+      which deletes its token or password and its synced data from your computer. You can also revoke the app's
       access from your Google account at
-      <a href="https://myaccount.google.com/connections">myaccount.google.com/connections</a>.
+      <a href="https://myaccount.google.com/connections">myaccount.google.com/connections</a>, and revoke an
+      iCloud app-specific password at <a href="https://account.apple.com/account/manage">account.apple.com</a>.
     </p>
   </section>
 

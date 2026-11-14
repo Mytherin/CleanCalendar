@@ -10,7 +10,8 @@ use eframe::egui::{
 use super::App;
 use crate::dates::{fmt_hour, CLOCK_24H};
 use crate::editor::Outcome;
-use crate::google::Cmd;
+use crate::model::{Event, Store};
+use crate::remote::{Cmd, GOOGLE};
 use crate::settings::{
     self, duration_label, refresh_label, weekday_from_monday, weekday_name, Settings, WeekScroll, DURATION_CHOICES,
     REFRESH_CHOICES,
@@ -464,7 +465,7 @@ impl App {
             self.status = None;
             self.store.save();
             let g = &self.store.google;
-            self.worker.send(Cmd::Connect { client_id: g.client_id.clone(), client_secret: g.client_secret.clone() });
+            self.worker.send(Cmd::ConnectGoogle { client_id: g.client_id.clone(), client_secret: g.client_secret.clone() });
         }
     }
 
@@ -512,10 +513,11 @@ impl App {
             self.settings_ui.confirm_remove = false;
         }
         if remove {
-            if self.editor.as_ref().is_some_and(|ed| self.store.google_calendar_of(&ed.draft).is_some()) {
+            let on_google = |s: &Store, ev: &Event| s.remote_of(ev).is_some_and(|c| c.account == GOOGLE);
+            if self.editor.as_ref().is_some_and(|ed| on_google(&self.store, &ed.draft)) {
                 self.editor = None;
             }
-            self.engine.disconnect(&mut self.store);
+            self.engine.disconnect(&mut self.store, GOOGLE);
             // Account settings start over for the next account.
             let s = &mut self.store.settings;
             s.google_enabled = true;

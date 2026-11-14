@@ -2,6 +2,7 @@
 
 mod app;
 mod app_icon;
+mod caldav;
 mod date_icon;
 mod editor;
 mod dates;
@@ -12,6 +13,7 @@ mod layout;
 mod menu;
 mod model;
 mod recurrence;
+mod remote;
 mod settings;
 mod sync;
 mod theme;

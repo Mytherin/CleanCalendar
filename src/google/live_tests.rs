@@ -34,9 +34,6 @@ fn creds() -> Creds {
     }
 }
 
-fn no_browser(_: &str) -> Result<()> {
-    panic!("only live_sign_in opens a browser")
-}
 
 /// One-time interactive sign-in: opens the browser, waits for approval, and
 /// writes the refresh token to CLEANCALENDAR_LIVE_TOKEN_FILE (never prints it).
@@ -113,7 +110,7 @@ struct Device {
     name: &'static str,
     store: Store,
     engine: SyncEngine,
-    client: Option<Client>,
+    conns: Connections,
     cal: String,
     today: NaiveDate,
     /// Notices the engine reported, for assertions.
@@ -134,7 +131,7 @@ impl Device {
             name,
             store,
             engine: SyncEngine::default(),
-            client: None,
+            conns: test_conns(&Endpoints::google()),
             cal: cal.id.clone(),
             today: Local::now().date_naive(),
             said: Vec::new(),
@@ -149,7 +146,7 @@ impl Device {
                 break;
             }
             for cmd in cmds {
-                let msg = run(&mut self.client, &Endpoints::google(), &no_browser, cmd);
+                let msg = run(&mut self.conns, cmd);
                 self.engine.handle(&mut self.store, msg, None, self.today);
             }
             for n in self.engine.notices.drain(..) {
@@ -377,17 +374,12 @@ fn live_retried_create_does_not_duplicate() {
     let mut laptop = Device::new("laptop", &cal);
     laptop.sync();
     let id = laptop.create_offline("Flight", at(5, 8), 180);
-    let Some(Cmd::Save { creds, google_calendar_id, event }) = laptop.engine.outbox.pop() else { panic!("expected a save") };
+    let Some(Cmd::Save { login, calendar, event }) = laptop.engine.outbox.pop() else { panic!("expected a save") };
     // The first attempt reaches Google but "the reply is lost"...
-    let lost = run(
-        &mut laptop.client,
-        &Endpoints::google(),
-        &no_browser,
-        Cmd::Save { creds: creds.clone(), google_calendar_id: google_calendar_id.clone(), event: event.clone() },
-    );
+    let lost = run(&mut laptop.conns, Cmd::Save { login: login.clone(), calendar: calendar.clone(), event: event.clone() });
     assert!(matches!(lost, Msg::Saved { .. }));
     // ...so the app retries the same upload.
-    let retried = run(&mut laptop.client, &Endpoints::google(), &no_browser, Cmd::Save { creds, google_calendar_id, event });
+    let retried = run(&mut laptop.conns, Cmd::Save { login, calendar, event });
     match &retried {
         Msg::Saved { remote_id, .. } => assert_eq!(Some(remote_id.as_str()), id.strip_prefix("local:")),
         _ => panic!("retry should resolve to the same event"),

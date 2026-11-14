@@ -1,14 +1,16 @@
 //! On-disk storage, split by who owns the data:
 //!
-//! - `data.db` (persistent, in the user's data folder): Google sign-in
-//!   settings, the calendar list with the user's colours and visibility,
-//!   events on local calendars, and local changes to Google events that
-//!   haven't been uploaded yet (`outbox`, `pending_deletes`). None of this
-//!   can be rebuilt from Google, so it is never thrown away.
-//! - `cache.db` (disposable, in the user's cache folder): Google events as
-//!   last downloaded, and the incremental-sync tokens. Google is the source
-//!   of truth here; if the file is deleted or unreadable it is started over
-//!   and the next sync downloads everything again.
+//! - `data.db` (persistent, in the user's data folder): account settings
+//!   (Google sign-in, CalDAV accounts), the calendar list with the user's
+//!   colours and visibility, events on local calendars, and local changes to
+//!   synced events that haven't been uploaded yet (`outbox`,
+//!   `pending_deletes`). None of this can be rebuilt from a server, so it is
+//!   never thrown away. Secrets (the Google refresh token, CalDAV passwords)
+//!   go to the OS credential store instead when it works.
+//! - `cache.db` (disposable, in the user's cache folder): synced events as
+//!   last downloaded, and the incremental-sync tokens. The server is the
+//!   source of truth here; if the file is deleted or unreadable it is started
+//!   over and the next sync downloads everything again.
 //!
 //! The cache is ATTACHed to the same connection, so one save commits to both
 //! files atomically (an event whose upload was just confirmed moves from the
@@ -23,19 +25,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection, Row, Transaction};
 
-use crate::model::{Calendar, Event, GoogleSettings, PendingDelete, Source, Store, SyncState};
+use crate::model::{CalDavAccount, Calendar, Event, GoogleSettings, PendingDelete, Source, Store, SyncState};
+use crate::remote::{CalRef, GOOGLE};
 use crate::settings::Settings;
 
 /// The `main.settings` row holding the app's preferences (as JSON).
 const PREFS_KEY: &str = "app.settings";
 
-/// 2 added repeating events and time zones, 3 added invitees.
-const DATA_VERSION: i32 = 3;
-/// Bumped when cached events gain fields, so they are downloaded again.
-const CACHE_VERSION: i32 = 3;
+/// 2 added repeating events and time zones, 3 invitees, 4 CalDAV accounts.
+const DATA_VERSION: i32 = 4;
+/// Bumped when cached events gain fields (or sync state changes meaning),
+/// so they are downloaded again.
+const CACHE_VERSION: i32 = 4;
 
 /// Where the two databases (and the old JSON store, for migration) live, and
-/// where the Google refresh token is kept.
+/// where secrets are kept.
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub data: PathBuf,
@@ -62,17 +66,17 @@ impl Paths {
     pub fn default_location() -> Self {
         if let Some(dir) = std::env::var_os("CLEANCALENDAR_DATA") {
             let dir = PathBuf::from(dir);
-            let account = format!("{REFRESH_TOKEN}@{}", std::path::absolute(&dir).unwrap_or(dir.clone()).display());
-            return Paths::in_dir(&dir, Secrets::Keyring(account));
+            let suffix = format!("@{}", std::path::absolute(&dir).unwrap_or(dir.clone()).display());
+            return Paths::in_dir(&dir, Secrets::Keyring(suffix));
         }
         let Some(base) = directories::BaseDirs::new() else {
-            return Paths::in_dir(Path::new("."), Secrets::Keyring(REFRESH_TOKEN.into()));
+            return Paths::in_dir(Path::new("."), Secrets::Keyring(String::new()));
         };
         let paths = Paths {
             data: base.data_dir().join(APP_DIR).join("data.db"),
             cache: base.cache_dir().join(APP_DIR).join("cache.db"),
             legacy_json: base.data_dir().join(APP_DIR).join("store.json"),
-            secrets: Secrets::Keyring(REFRESH_TOKEN.into()),
+            secrets: Secrets::Keyring(String::new()),
         };
         if let Some(old) = directories::ProjectDirs::from("com", "CleanCalendar", "CleanCalendar") {
             move_from_old_folders(old.data_dir(), old.cache_dir(), &paths);
@@ -132,48 +136,54 @@ fn move_files(from: &Path, to: &Path, names: &[&str]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The credential-store entry the refresh token is kept under.
+/// The credential-store service secrets are kept under.
 const KEYRING_SERVICE: &str = "CleanCalendar";
+/// The key of the Google refresh token.
 const REFRESH_TOKEN: &str = "google-refresh-token";
 
-/// Where the Google refresh token is kept: the OS credential store (Windows
-/// Credential Manager, macOS Keychain, Secret Service on Linux) under the
-/// given account name. Tests use an in-memory one so they never touch the
-/// real store.
+/// The key of a CalDAV account's password.
+fn password_key(account: &str) -> String {
+    format!("{account}-password")
+}
+
+/// Where secrets are kept: the OS credential store (Windows Credential
+/// Manager, macOS Keychain, Secret Service on Linux), one entry per key, its
+/// name the key plus the given suffix (to keep separate data folders apart).
+/// Tests use an in-memory one so they never touch the real store.
 #[derive(Clone, Debug)]
 pub enum Secrets {
     Keyring(String),
     #[cfg(test)]
-    Memory(std::sync::Arc<std::sync::Mutex<Option<String>>>),
+    Memory(std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>),
     /// A credential store that always fails, to test the fallback.
     #[cfg(test)]
     Unavailable,
 }
 
 impl Secrets {
-    fn entry(account: &str) -> keyring::Result<keyring::Entry> {
-        keyring::Entry::new(KEYRING_SERVICE, account)
+    fn entry(name: &str) -> keyring::Result<keyring::Entry> {
+        keyring::Entry::new(KEYRING_SERVICE, name)
     }
 
-    fn get(&self) -> Result<Option<String>> {
+    fn get(&self, key: &str) -> Result<Option<String>> {
         match self {
-            Secrets::Keyring(account) => match Self::entry(account)?.get_password() {
-                Ok(token) => Ok(Some(token)),
+            Secrets::Keyring(suffix) => match Self::entry(&format!("{key}{suffix}"))?.get_password() {
+                Ok(secret) => Ok(Some(secret)),
                 Err(keyring::Error::NoEntry) => Ok(None),
                 Err(e) => Err(e.into()),
             },
             #[cfg(test)]
-            Secrets::Memory(m) => Ok(m.lock().unwrap().clone()),
+            Secrets::Memory(m) => Ok(m.lock().unwrap().get(key).cloned()),
             #[cfg(test)]
             Secrets::Unavailable => bail!("no credential store"),
         }
     }
 
-    fn set(&self, token: Option<&str>) -> Result<()> {
+    fn set(&self, key: &str, secret: Option<&str>) -> Result<()> {
         match self {
-            Secrets::Keyring(account) => {
-                let entry = Self::entry(account)?;
-                match token {
+            Secrets::Keyring(suffix) => {
+                let entry = Self::entry(&format!("{key}{suffix}"))?;
+                match secret {
                     Some(t) => entry.set_password(t)?,
                     None => match entry.delete_credential() {
                         Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -184,7 +194,11 @@ impl Secrets {
             }
             #[cfg(test)]
             Secrets::Memory(m) => {
-                *m.lock().unwrap() = token.map(str::to_owned);
+                let mut m = m.lock().unwrap();
+                match secret {
+                    Some(s) => m.insert(key.to_owned(), s.to_owned()),
+                    None => m.remove(key),
+                };
                 Ok(())
             }
             #[cfg(test)]
@@ -198,9 +212,9 @@ impl Secrets {
 enum Place {
     /// On a local calendar: `main.events`.
     Local,
-    /// On a Google calendar with unconfirmed local changes: `main.outbox`.
+    /// On a synced calendar with unconfirmed local changes: `main.outbox`.
     Outbox,
-    /// On a Google calendar, as the server has it: `cache.events`.
+    /// On a synced calendar, as the server has it: `cache.events`.
     Cache,
 }
 
@@ -219,6 +233,7 @@ impl Place {
 struct Saved {
     calendars: Vec<Calendar>,
     google: GoogleSettings,
+    caldav: Vec<CalDavAccount>,
     pending_deletes: Vec<PendingDelete>,
     sync_state: HashMap<String, SyncState>,
     settings: Settings,
@@ -230,9 +245,9 @@ pub struct Db {
     conn: Connection,
     saved: Saved,
     secrets: Secrets,
-    /// The refresh token is in `main.settings` because the credential store
-    /// couldn't be used (or it was saved by an older version).
-    token_in_db: bool,
+    /// Keys of secrets kept in `data.db` because the credential store
+    /// couldn't be used (or that an older version saved there).
+    in_db: HashSet<String>,
 }
 
 /// `data.db` was written by a newer version of the app; leave it alone.
@@ -338,9 +353,9 @@ pub fn open(paths: &Paths) -> Store {
         }
     };
 
-    let mut db = Db { conn, saved: Saved::default(), secrets: paths.secrets.clone(), token_in_db: false };
+    let mut db = Db { conn, saved: Saved::default(), secrets: paths.secrets.clone(), in_db: HashSet::new() };
     let mut data = data;
-    db.load_token(&mut data.google);
+    db.load_secrets(&mut data);
 
     if fresh || data.is_empty() {
         // Nothing saved yet: bring over the old JSON store, or start with defaults.
@@ -373,6 +388,8 @@ pub fn open(paths: &Paths) -> Store {
 /// What `data.db` holds.
 struct DataPart {
     google: GoogleSettings,
+    /// With the password if it was kept in `data.db`.
+    caldav: Vec<CalDavAccount>,
     calendars: Vec<Calendar>,
     local: Vec<Event>,
     outbox: Vec<Event>,
@@ -387,9 +404,40 @@ impl DataPart {
             && self.local.is_empty()
             && self.outbox.is_empty()
             && self.pending_deletes.is_empty()
+            && self.caldav.is_empty()
             && self.google == GoogleSettings::default()
             && self.settings == Settings::default()
     }
+}
+
+/// Whether `table` exists and has `column`.
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA main.table_info({table})"))?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|n| n == column))
+}
+
+/// Version 4 added CalDAV accounts: calendars and pending deletes say which
+/// account they belong to, and their Google-specific columns got neutral
+/// names. Everything already there is Google's. Safe to run on a file that
+/// already has these changes.
+fn upgrade_to_accounts(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if has_column(&tx, "calendars", "google_id")? {
+        tx.execute_batch(
+            "ALTER TABLE main.calendars RENAME COLUMN google_id TO remote_id;
+             ALTER TABLE main.calendars ADD COLUMN account TEXT;
+             UPDATE main.calendars SET account = 'google' WHERE remote_id IS NOT NULL;",
+        )?;
+    }
+    if has_column(&tx, "pending_deletes", "google_calendar_id")? {
+        tx.execute_batch(
+            "ALTER TABLE main.pending_deletes RENAME COLUMN google_calendar_id TO calendar_id;
+             ALTER TABLE main.pending_deletes ADD COLUMN account TEXT NOT NULL DEFAULT 'google';",
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// What `cache.db` holds.
@@ -419,8 +467,11 @@ fn open_data(path: &Path) -> Result<(Connection, DataPart)> {
                 sql += &format!("ALTER TABLE main.{table} ADD COLUMN {col} {decl};");
             }
         }
-        sql += &format!("PRAGMA main.user_version = {DATA_VERSION}; COMMIT;");
+        sql += "COMMIT;";
         conn.execute_batch(&sql)?;
+        upgrade_to_accounts(&conn)?;
+        // The version is raised below, once every table is in place; if the
+        // app stops before then, these steps simply run again.
     }
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS main.settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -430,16 +481,27 @@ fn open_data(path: &Path) -> Result<(Connection, DataPart)> {
              name TEXT NOT NULL,
              color INTEGER NOT NULL,
              visible INTEGER NOT NULL,
-             google_id TEXT,
-             read_only INTEGER NOT NULL
+             remote_id TEXT,
+             read_only INTEGER NOT NULL,
+             account TEXT
          );
          {}
          {}
          CREATE TABLE IF NOT EXISTS main.pending_deletes (
              position INTEGER PRIMARY KEY,
-             google_calendar_id TEXT NOT NULL,
+             calendar_id TEXT NOT NULL,
              remote_id TEXT NOT NULL,
-             etag TEXT
+             etag TEXT,
+             account TEXT NOT NULL DEFAULT 'google'
+         );
+         CREATE TABLE IF NOT EXISTS main.accounts (
+             id TEXT PRIMARY KEY,
+             position INTEGER NOT NULL,
+             label TEXT NOT NULL,
+             server TEXT NOT NULL,
+             username TEXT NOT NULL,
+             -- Only when the credential store can't be used.
+             password TEXT
          );
          PRAGMA main.user_version = {DATA_VERSION};",
         event_table("main.events"),
@@ -459,7 +521,7 @@ fn attach_cache(conn: &Connection, path: &Path) -> Result<CachePart> {
     conn.execute_batch(&format!(
         "{}
          CREATE TABLE IF NOT EXISTS cache.sync_state (
-             google_calendar_id TEXT PRIMARY KEY,
+             calendar_id TEXT PRIMARY KEY,
              token TEXT,
              full_sync_on TEXT
          );
@@ -491,18 +553,21 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
     };
 
     let calendars = conn
-        .prepare("SELECT id, name, color, visible, google_id, read_only FROM main.calendars ORDER BY position")?
+        .prepare("SELECT id, name, color, visible, remote_id, read_only, account FROM main.calendars ORDER BY position")?
         .query_map([], |r| {
             let color: i64 = r.get(2)?;
-            let google_id: Option<String> = r.get(4)?;
+            let remote_id: Option<String> = r.get(4)?;
+            let account: Option<String> = r.get(6)?;
             Ok(Calendar {
                 id: r.get(0)?,
                 name: r.get(1)?,
                 color: [(color >> 16) as u8, (color >> 8) as u8, color as u8],
                 visible: r.get(3)?,
-                source: match google_id {
-                    Some(calendar_id) => Source::Google { calendar_id },
-                    None => Source::Local,
+                source: match (remote_id, account) {
+                    (None, _) => Source::Local,
+                    (Some(calendar_id), None) => Source::Google { calendar_id },
+                    (Some(calendar_id), Some(a)) if a == GOOGLE => Source::Google { calendar_id },
+                    (Some(url), Some(account)) => Source::CalDav { account, url },
                 },
                 read_only: r.get(5)?,
             })
@@ -510,12 +575,29 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
         .collect::<rusqlite::Result<_>>()?;
 
     let pending_deletes = conn
-        .prepare("SELECT google_calendar_id, remote_id, etag FROM main.pending_deletes ORDER BY position")?
-        .query_map([], |r| Ok(PendingDelete { google_calendar_id: r.get(0)?, remote_id: r.get(1)?, etag: r.get(2)? }))?
+        .prepare("SELECT account, calendar_id, remote_id, etag FROM main.pending_deletes ORDER BY position")?
+        .query_map([], |r| {
+            let (account, calendar): (String, String) = (r.get(0)?, r.get(1)?);
+            Ok(PendingDelete { calendar: CalRef::new(&account, &calendar), remote_id: r.get(2)?, etag: r.get(3)? })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let caldav = conn
+        .prepare("SELECT id, label, server, username, password FROM main.accounts ORDER BY position")?
+        .query_map([], |r| {
+            Ok(CalDavAccount {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                server: r.get(2)?,
+                username: r.get(3)?,
+                password: r.get(4)?,
+            })
+        })?
         .collect::<rusqlite::Result<_>>()?;
 
     Ok(DataPart {
         google,
+        caldav,
         calendars,
         local: load_events(conn, Place::Local)?,
         outbox: load_events(conn, Place::Outbox)?,
@@ -526,7 +608,7 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
 
 fn load_cache(conn: &Connection) -> Result<CachePart> {
     let sync_state = conn
-        .prepare("SELECT google_calendar_id, token, full_sync_on FROM cache.sync_state")?
+        .prepare("SELECT calendar_id, token, full_sync_on FROM cache.sync_state")?
         .query_map([], |r| Ok((r.get(0)?, SyncState { token: r.get(1)?, full_sync_on: r.get(2)? })))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(CachePart { events: load_events(conn, Place::Cache)?, sync_state })
@@ -610,8 +692,13 @@ fn load_legacy_json(path: &Path) -> Option<Store> {
             return None;
         }
     };
-    match serde_json::from_str(&text) {
-        Ok(store) => Some(store),
+    match serde_json::from_str::<Store>(&text) {
+        Ok(mut store) => {
+            // Its sync state was keyed by Google calendar id.
+            store.sync_state =
+                store.sync_state.into_iter().map(|(id, s)| (CalRef::google(&id).local_id(), s)).collect();
+            Some(store)
+        }
         Err(e) => {
             eprintln!("Could not parse {}: {e}", path.display());
             let _ = std::fs::copy(path, path.with_extension("json.bak"));
@@ -646,46 +733,72 @@ impl Db {
     /// Builds the in-memory store from what was loaded and remembers it as
     /// saved. An event in both the outbox and the cache is the outbox's
     /// (unconfirmed local edits win); the stale cached copy is dropped.
-    /// Fills in the refresh token. A token found in `main.settings` (saved by
-    /// an older version, or because the credential store failed last time) is
-    /// the newest one; it is moved into the credential store when possible.
-    fn load_token(&mut self, google: &mut GoogleSettings) {
-        if let Some(token) = &google.refresh_token {
-            match self.secrets.set(Some(token)) {
-                Ok(()) => match self.conn.execute("DELETE FROM main.settings WHERE key = 'google.refresh_token'", []) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("Could not remove the refresh token from data.db: {e}");
-                        self.token_in_db = true;
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Credential store unavailable ({e:#}); the refresh token stays in data.db");
-                    self.token_in_db = true;
-                }
-            }
-            return;
-        }
-        match self.secrets.get() {
-            Ok(token) => google.refresh_token = token,
-            Err(e) => eprintln!("Could not read the refresh token from the credential store: {e:#}"),
+    /// Fills in the refresh token and CalDAV passwords.
+    fn load_secrets(&mut self, data: &mut DataPart) {
+        let token = data.google.refresh_token.take();
+        data.google.refresh_token =
+            self.load_secret(REFRESH_TOKEN, token, "DELETE FROM main.settings WHERE key = 'google.refresh_token'", "");
+        for a in &mut data.caldav {
+            let pw = a.password.take();
+            a.password =
+                self.load_secret(&password_key(&a.id), pw, "UPDATE main.accounts SET password = NULL WHERE id = ?1", &a.id);
         }
     }
 
-    /// Writes the refresh token to the credential store. Returns whether it
-    /// must go in `main.settings` instead, because that failed.
-    fn store_token(&mut self, token: Option<&String>) -> bool {
-        let changed = token != self.saved.google.refresh_token.as_ref();
-        if changed || self.token_in_db {
-            match self.secrets.set(token.map(String::as_str)) {
-                Ok(()) => self.token_in_db = false,
+    /// Reads one secret. One found in `data.db` (saved by an older version,
+    /// or because the credential store failed last time) is the newest; it
+    /// is moved into the credential store when possible (`forget` with
+    /// `param` removes it from `data.db`).
+    fn load_secret(&mut self, key: &str, in_db: Option<String>, forget: &str, param: &str) -> Option<String> {
+        if let Some(secret) = in_db {
+            match self.secrets.set(key, Some(&secret)) {
+                Ok(()) => {
+                    let removed = if forget.contains("?1") {
+                        self.conn.execute(forget, [param])
+                    } else {
+                        self.conn.execute(forget, [])
+                    };
+                    if let Err(e) = removed {
+                        eprintln!("Could not remove {key} from data.db: {e}");
+                        self.in_db.insert(key.to_owned());
+                    }
+                }
                 Err(e) => {
-                    eprintln!("Credential store unavailable ({e:#}); keeping the refresh token in data.db");
-                    self.token_in_db = true;
+                    eprintln!("Credential store unavailable ({e:#}); {key} stays in data.db");
+                    self.in_db.insert(key.to_owned());
+                }
+            }
+            return Some(secret);
+        }
+        match self.secrets.get(key) {
+            Ok(secret) => secret,
+            Err(e) => {
+                eprintln!("Could not read {key} from the credential store: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Writes a secret to the credential store if it `changed` (or is still
+    /// waiting in `data.db`). Returns whether it must be kept in `data.db`
+    /// instead, because that failed.
+    fn store_secret(&mut self, key: &str, secret: Option<&String>, changed: bool) -> bool {
+        if changed || self.in_db.contains(key) {
+            match self.secrets.set(key, secret.map(String::as_str)) {
+                Ok(()) => {
+                    self.in_db.remove(key);
+                }
+                Err(e) if secret.is_some() => {
+                    eprintln!("Credential store unavailable ({e:#}); keeping {key} in data.db");
+                    self.in_db.insert(key.to_owned());
+                }
+                Err(e) => {
+                    eprintln!("Could not remove {key} from the credential store: {e:#}");
+                    self.in_db.remove(key);
                 }
             }
         }
-        self.token_in_db
+        self.in_db.contains(key)
     }
 
     fn assemble(mut self, data: DataPart, cache: CachePart) -> Store {
@@ -707,6 +820,7 @@ impl Db {
         }
         self.saved.calendars = data.calendars.clone();
         self.saved.google = data.google.clone();
+        self.saved.caldav = data.caldav.clone();
         self.saved.pending_deletes = data.pending_deletes.clone();
         self.saved.sync_state = cache.sync_state.clone();
         self.saved.settings = data.settings.clone();
@@ -715,6 +829,7 @@ impl Db {
             calendars: data.calendars,
             events,
             google: data.google,
+            caldav: data.caldav,
             pending_deletes: data.pending_deletes,
             sync_state: cache.sync_state,
             settings: data.settings,
@@ -730,10 +845,9 @@ impl Db {
     /// Writes whatever changed since the last save, in one transaction. If it
     /// fails nothing is written and the next save tries again.
     pub fn save(&mut self, s: &Store) -> Result<()> {
-        let google_cals: HashSet<&str> =
-            s.calendars.iter().filter(|c| c.google_id().is_some()).map(|c| c.id.as_str()).collect();
+        let remote_cals: HashSet<&str> = s.calendars.iter().filter(|c| c.is_remote()).map(|c| c.id.as_str()).collect();
         let place = |e: &Event| {
-            if !google_cals.contains(e.calendar_id.as_str()) {
+            if !remote_cals.contains(e.calendar_id.as_str()) {
                 Place::Local
             } else if e.pending {
                 Place::Outbox
@@ -768,6 +882,7 @@ impl Db {
         }
         let calendars_changed = s.calendars != self.saved.calendars;
         let google_changed = s.google != self.saved.google;
+        let caldav_changed = s.caldav != self.saved.caldav;
         let deletes_changed = s.pending_deletes != self.saved.pending_deletes;
         let sync_changed = s.sync_state != self.saved.sync_state;
         let settings_changed = s.settings != self.saved.settings;
@@ -776,6 +891,7 @@ impl Db {
             && deletes.is_empty()
             && !calendars_changed
             && !google_changed
+            && !caldav_changed
             && !deletes_changed
             && !sync_changed
             && !settings_changed
@@ -783,7 +899,24 @@ impl Db {
             return Ok(());
         }
 
-        let token_in_db = google_changed && self.store_token(s.google.refresh_token.as_ref());
+        let token_changed = s.google.refresh_token != self.saved.google.refresh_token;
+        let token_in_db = google_changed && self.store_secret(REFRESH_TOKEN, s.google.refresh_token.as_ref(), token_changed);
+        let mut passwords_in_db = HashSet::new();
+        if caldav_changed {
+            let saved = std::mem::take(&mut self.saved.caldav);
+            for a in &s.caldav {
+                let before = saved.iter().find(|b| b.id == a.id).and_then(|b| b.password.as_ref());
+                let changed = before != a.password.as_ref();
+                if self.store_secret(&password_key(&a.id), a.password.as_ref(), changed) {
+                    passwords_in_db.insert(a.id.clone());
+                }
+            }
+            // Removed accounts take their passwords along.
+            for gone in saved.iter().filter(|b| !s.caldav.iter().any(|a| a.id == b.id)) {
+                self.store_secret(&password_key(&gone.id), None, true);
+            }
+            self.saved.caldav = saved;
+        }
 
         let tx = self.conn.transaction()?;
         for (p, id) in &deletes {
@@ -817,10 +950,31 @@ impl Db {
             tx.execute("DELETE FROM main.calendars", [])?;
             for (i, c) in s.calendars.iter().enumerate() {
                 let color = (c.color[0] as i64) << 16 | (c.color[1] as i64) << 8 | c.color[2] as i64;
+                let remote = c.remote();
                 tx.execute(
-                    "INSERT INTO main.calendars (id, position, name, color, visible, google_id, read_only)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![c.id, i as i64, c.name, color, c.visible, c.google_id(), c.read_only],
+                    "INSERT INTO main.calendars (id, position, name, color, visible, remote_id, read_only, account)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        c.id,
+                        i as i64,
+                        c.name,
+                        color,
+                        c.visible,
+                        remote.as_ref().map(|r| &r.id),
+                        c.read_only,
+                        remote.as_ref().map(|r| &r.account)
+                    ],
+                )?;
+            }
+        }
+        if caldav_changed {
+            tx.execute("DELETE FROM main.accounts", [])?;
+            for (i, a) in s.caldav.iter().enumerate() {
+                let password = a.password.as_ref().filter(|_| passwords_in_db.contains(&a.id));
+                tx.execute(
+                    "INSERT INTO main.accounts (id, position, label, server, username, password)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![a.id, i as i64, a.label, a.server, a.username, password],
                 )?;
             }
         }
@@ -828,9 +982,9 @@ impl Db {
             tx.execute("DELETE FROM main.pending_deletes", [])?;
             for (i, d) in s.pending_deletes.iter().enumerate() {
                 tx.execute(
-                    "INSERT INTO main.pending_deletes (position, google_calendar_id, remote_id, etag)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![i as i64, d.google_calendar_id, d.remote_id, d.etag],
+                    "INSERT INTO main.pending_deletes (position, account, calendar_id, remote_id, etag)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![i as i64, d.calendar.account, d.calendar.id, d.remote_id, d.etag],
                 )?;
             }
         }
@@ -838,7 +992,7 @@ impl Db {
             tx.execute("DELETE FROM cache.sync_state", [])?;
             for (id, st) in &s.sync_state {
                 tx.execute(
-                    "INSERT INTO cache.sync_state (google_calendar_id, token, full_sync_on) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO cache.sync_state (calendar_id, token, full_sync_on) VALUES (?1, ?2, ?3)",
                     params![id, st.token, st.full_sync_on],
                 )?;
             }
@@ -856,6 +1010,9 @@ impl Db {
         }
         if google_changed {
             self.saved.google = s.google.clone();
+        }
+        if caldav_changed {
+            self.saved.caldav = s.caldav.clone();
         }
         if deletes_changed {
             self.saved.pending_deletes = s.pending_deletes.clone();
@@ -890,7 +1047,7 @@ mod tests {
             Paths::in_dir(&self.0, self.1.clone())
         }
         fn token(&self) -> Option<String> {
-            self.1.get().unwrap()
+            self.1.get(REFRESH_TOKEN).unwrap()
         }
     }
 
@@ -963,12 +1120,12 @@ mod tests {
         edited.base = Some(EventFields { title: "Before".into(), ..edited.fields() });
         store.events.push(edited);
         store.pending_deletes.push(PendingDelete {
-            google_calendar_id: "me@example.com".into(),
+            calendar: CalRef::google("me@example.com"),
             remote_id: "r9".into(),
             etag: Some("\"9\"".into()),
         });
         store.sync_state.insert(
-            "me@example.com".into(),
+            "g:me@example.com".into(),
             SyncState { token: Some("tok".into()), full_sync_on: Some(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()) },
         );
         store.settings.days_per_week = 5;
@@ -1144,7 +1301,7 @@ mod tests {
         let mut again = open(&dir.paths());
         assert!(again.event("g1").is_none());
         assert!(again.event("local1").is_some());
-        again.sync_state.insert("me@example.com".into(), SyncState::default());
+        again.sync_state.insert("g:me@example.com".into(), SyncState::default());
         again.save();
         assert!(rows(&dir.paths().cache, "events").is_empty());
     }
@@ -1184,12 +1341,12 @@ mod tests {
     #[ignore]
     fn real_credential_store() {
         let s = Secrets::Keyring(format!("test-{}", uuid::Uuid::new_v4().simple()));
-        assert_eq!(s.get().unwrap(), None);
-        s.set(Some("secret")).unwrap();
-        assert_eq!(s.get().unwrap().as_deref(), Some("secret"));
-        s.set(None).unwrap();
-        assert_eq!(s.get().unwrap(), None);
-        s.set(None).unwrap(); // deleting twice is fine
+        assert_eq!(s.get("k").unwrap(), None);
+        s.set("k", Some("secret")).unwrap();
+        assert_eq!(s.get("k").unwrap().as_deref(), Some("secret"));
+        s.set("k", None).unwrap();
+        assert_eq!(s.get("k").unwrap(), None);
+        s.set("k", None).unwrap(); // deleting twice is fine
     }
 
     #[test]
@@ -1278,7 +1435,7 @@ mod tests {
         let again = open(&dir.paths());
         assert_eq!(again.calendars.len(), 2);
         assert_eq!(again.event("b").unwrap().etag.as_deref(), Some("\"2\""));
-        assert_eq!(again.sync_state["me@example.com"].token.as_deref(), Some("t"));
+        assert_eq!(again.sync_state["google:me@example.com"].token.as_deref(), Some("t"));
         assert_eq!(rows(&dir.paths().cache, "events"), ["b"]);
     }
 
@@ -1412,5 +1569,160 @@ mod tests {
         let again = open(&p);
         assert_eq!(again.event("local1").unwrap().time_zone.as_deref(), Some("Europe/Amsterdam"));
         assert_eq!(user_version(&Connection::open(&p.data).unwrap(), "main").unwrap(), DATA_VERSION);
+    }
+
+    // ---- CalDAV accounts ------------------------------------------------------
+
+    const DAV_CAL: &str = "https://p01-caldav.icloud.com/1234/calendars/home/";
+
+    fn icloud() -> CalDavAccount {
+        CalDavAccount {
+            id: "caldav-1a2b".into(),
+            label: "iCloud".into(),
+            server: crate::caldav::ICLOUD.into(),
+            username: "me@icloud.com".into(),
+            password: Some("abcd-efgh-ijkl-mnop".into()),
+        }
+    }
+
+    /// A signed-in iCloud account with a calendar, a cached event, an
+    /// unsynced edit, a pending delete and a sync token.
+    fn with_icloud(dir: &TempDir) -> Store {
+        let mut store = open(&dir.paths());
+        store.caldav.push(icloud());
+        let r = CalRef::new("caldav-1a2b", DAV_CAL);
+        store.calendars.push(Calendar {
+            id: r.local_id(),
+            name: "Home".into(),
+            color: [255, 41, 104],
+            visible: true,
+            source: Source::CalDav { account: "caldav-1a2b".into(), url: DAV_CAL.into() },
+            read_only: false,
+        });
+        let mut cached = event(&r.event_id("/1234/calendars/home/a.ics"), &r.local_id(), "Cached");
+        cached.remote_id = Some("/1234/calendars/home/a.ics".into());
+        let mut edited = event(&r.event_id("/1234/calendars/home/s.ics#20261116T070000"), &r.local_id(), "Edited");
+        edited.remote_id = Some("/1234/calendars/home/s.ics#20261116T070000".into());
+        edited.recurring_id = Some("/1234/calendars/home/s.ics".into());
+        edited.pending = true;
+        store.events.extend([cached, edited]);
+        store.pending_deletes.push(PendingDelete { calendar: r.clone(), remote_id: "/1234/calendars/home/b.ics".into(), etag: None });
+        store.sync_state.insert(r.local_id(), SyncState { token: Some("https://x/sync/1".into()), full_sync_on: None });
+        store.save();
+        store
+    }
+
+    #[test]
+    fn caldav_accounts_round_trip_with_the_password_in_the_credential_store() {
+        let dir = TempDir::new();
+        let store = with_icloud(&dir);
+        let (calendars, events, caldav, deletes, sync) = (
+            store.calendars.clone(),
+            sorted(&store.events),
+            store.caldav.clone(),
+            store.pending_deletes.clone(),
+            store.sync_state.clone(),
+        );
+        drop(store);
+        assert_eq!(dir.1.get("caldav-1a2b-password").unwrap().as_deref(), Some("abcd-efgh-ijkl-mnop"));
+        let conn = Connection::open(dir.paths().data).unwrap();
+        let in_db: Option<String> = conn.query_row("SELECT password FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(in_db, None, "no password in data.db");
+        drop(conn);
+
+        let again = open(&dir.paths());
+        assert_eq!(again.caldav, caldav);
+        assert_eq!(again.calendars, calendars);
+        assert_eq!(sorted(&again.events), events);
+        assert_eq!(again.pending_deletes, deletes);
+        assert_eq!(again.sync_state, sync);
+        // Synced events are split between cache and outbox like Google's.
+        assert_eq!(rows(&dir.paths().data, "outbox").len(), 1);
+        assert_eq!(rows(&dir.paths().cache, "events").len(), 1);
+    }
+
+    #[test]
+    fn removing_an_account_forgets_its_password() {
+        let dir = TempDir::new();
+        let mut store = with_icloud(&dir);
+        store.caldav.clear();
+        store.save();
+        assert_eq!(dir.1.get("caldav-1a2b-password").unwrap(), None);
+        drop(store);
+        assert!(open(&dir.paths()).caldav.is_empty());
+    }
+
+    #[test]
+    fn a_changed_password_replaces_the_old_one() {
+        let dir = TempDir::new();
+        let mut store = with_icloud(&dir);
+        store.caldav[0].password = Some("new-app-password".into());
+        store.save();
+        drop(store);
+        assert_eq!(open(&dir.paths()).caldav[0].password.as_deref(), Some("new-app-password"));
+    }
+
+    #[test]
+    fn without_a_credential_store_passwords_stay_in_data_db() {
+        let dir = TempDir::new();
+        let broken = Paths { secrets: Secrets::Unavailable, ..dir.paths() };
+        let mut store = open(&broken);
+        store.caldav.push(icloud());
+        store.save();
+        drop(store);
+        assert_eq!(open(&broken).caldav[0].password.as_deref(), Some("abcd-efgh-ijkl-mnop"));
+
+        // A working credential store takes it over.
+        let store = open(&dir.paths());
+        assert_eq!(store.caldav[0].password.as_deref(), Some("abcd-efgh-ijkl-mnop"));
+        assert_eq!(dir.1.get("caldav-1a2b-password").unwrap().as_deref(), Some("abcd-efgh-ijkl-mnop"));
+        drop(store);
+        let conn = Connection::open(dir.paths().data).unwrap();
+        let in_db: Option<String> = conn.query_row("SELECT password FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(in_db, None);
+    }
+
+    #[test]
+    fn a_version_2_data_file_is_upgraded_to_accounts() {
+        let dir = TempDir::new();
+        let p = dir.paths();
+        {
+            // The tables as version 2 had them, with a Google calendar and a
+            // pending Google delete.
+            let conn = Connection::open(&p.data).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE calendars (id TEXT PRIMARY KEY, position INTEGER NOT NULL, name TEXT NOT NULL,
+                     color INTEGER NOT NULL, visible INTEGER NOT NULL, google_id TEXT, read_only INTEGER NOT NULL);
+                 {} {}
+                 CREATE TABLE pending_deletes (position INTEGER PRIMARY KEY, google_calendar_id TEXT NOT NULL,
+                     remote_id TEXT NOT NULL, etag TEXT);
+                 INSERT INTO calendars VALUES ('local:home', 0, 'Home', 255, 1, NULL, 0);
+                 INSERT INTO calendars VALUES ('google:me@example.com', 1, 'Me', 65280, 1, 'me@example.com', 0);
+                 INSERT INTO pending_deletes VALUES (0, 'me@example.com', 'r9', '\"9\"');
+                 INSERT INTO settings VALUES ('google.client_id', 'cid');
+                 PRAGMA user_version = 2;",
+                event_table("events"),
+                event_table("outbox"),
+            ))
+            .unwrap();
+        }
+        let store = open(&p);
+        assert_eq!(user_version(&Connection::open(&p.data).unwrap(), "main").unwrap(), DATA_VERSION);
+        assert_eq!(store.calendars[0].source, Source::Local);
+        assert_eq!(store.calendars[1].source, Source::Google { calendar_id: "me@example.com".into() });
+        assert_eq!(store.calendars[1].remote(), Some(CalRef::google("me@example.com")));
+        assert_eq!(
+            store.pending_deletes,
+            [PendingDelete { calendar: CalRef::google("me@example.com"), remote_id: "r9".into(), etag: Some("\"9\"".into()) }]
+        );
+        assert_eq!(store.google.client_id, "cid");
+        drop(store);
+        // And it keeps working after the upgrade.
+        let mut again = open(&p);
+        again.caldav.push(icloud());
+        again.save();
+        drop(again);
+        assert_eq!(open(&p).caldav.len(), 1);
     }
 }
