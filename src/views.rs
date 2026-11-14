@@ -641,10 +641,13 @@ fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Colo
     let title_font = theme::bold_font(12.0);
 
     if r.height() < 2.0 * LINE + 4.0 {
-        // Too short for a second line: title only, centered (e.g. a 15-min stand-up).
-        draw_text_centered(ui, &p_clip, x, r, &ev.title, title_font, text_color, title_w);
+        // Too short for a second line: title only (e.g. a 15-min stand-up),
+        // centered in the shortest block's height, so short events that
+        // start together (15 and 30 min) have their titles on one line.
+        let line = Rect::from_min_size(r.min, Vec2::new(r.width(), r.height().min(layout::MIN_EVENT_H)));
+        draw_text_centered(ui, &p_clip, x, line, &ev.title, title_font, text_color, title_w);
         if repeat {
-            draw_repeat_marker(&p_clip, Pos2::new(r.right() - 5.0, r.center().y), text_color);
+            draw_repeat_marker(&p_clip, Pos2::new(r.right() - 5.0, line.center().y), text_color);
         }
         return;
     }
