@@ -424,3 +424,25 @@ fn month_overflow_shows_more_link() {
     assert_eq!(p.cursor(lay.hits.hit(r.center())), None); // pressed, not idle
     assert_eq!(p.handle(Input::Release { pos: r.center(), time: 1.05 }, &lay.hits), vec![Action::GoTo(day, View::Day)]);
 }
+
+#[test]
+fn clicks_go_to_the_event_drawn_on_top() {
+    // "colour" starts 30 min into "nvidia", so it's drawn indented on top.
+    let mut sim = Sim::week(vec![
+        event("nvidia", "2026-11-09 17:00", "2026-11-09 18:00"),
+        event("colour", "2026-11-09 17:30", "2026-11-09 18:00"),
+    ]);
+    let below = sim.hit_rect("nvidia", |g| g != Grip::Resize);
+    let above = sim.hit_rect("colour", |g| g != Grip::Resize);
+    assert!(above.left() > below.left() && above.right() >= below.right() - 0.5, "indented on top");
+
+    // Where the top event covers the bottom one, the top one is hit.
+    let covered = Pos2::new(above.center().x, above.top() + 6.0);
+    assert_eq!(sim.click(covered), vec![Action::Select(Some("colour".into()))]);
+    // The bottom event's exposed left strip still belongs to it.
+    let strip = Pos2::new(below.left() + 3.0, above.top() + 6.0);
+    assert_eq!(sim.click(strip), vec![Action::Select(Some("nvidia".into()))]);
+    // Above the top event, the bottom one is hit across its full width.
+    let upper = Pos2::new(above.center().x, below.top() + 6.0);
+    assert_eq!(sim.click(upper), vec![Action::Select(Some("nvidia".into()))]);
+}

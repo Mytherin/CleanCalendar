@@ -3,6 +3,7 @@
 mod app;
 mod app_icon;
 mod date_icon;
+mod editor;
 mod dates;
 mod google;
 mod interact;

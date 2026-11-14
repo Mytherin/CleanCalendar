@@ -253,7 +253,7 @@ pub fn week(
         hits.push(rect, rects.allday, event_target(ev, grip));
     }
 
-    // Hour grid and timed events, side by side where they overlap.
+    // Hour grid and timed events, placed like macOS Calendar (see layout_day).
     let mut clip = rects.grid_clip;
     clip.max.x -= SCROLLBAR_W;
     let grid_area = Rect::from_x_y_ranges(geom.left..=rects.grid.right(), rects.grid.y_range());
@@ -261,14 +261,12 @@ pub fn week(
     let timed_idx: Vec<usize> = (0..events.len()).filter(|&i| !events[i].is_banner()).collect();
     let mut timed = Vec::new();
     for d in 0..ndays {
-        for seg in layout_day(events, &timed_idx, first + Duration::days(d)) {
+        // Edge to edge between the gridlines.
+        let left = geom.col_x(d) + HALF_LINE;
+        for seg in layout_day(events, &timed_idx, first + Duration::days(d), col_w - 2.0 * HALF_LINE) {
             let ev = &events[seg.ev];
-            // Edge to edge between the gridlines; overlapping events split
-            // the column evenly and touch each other.
-            let left = geom.col_x(d) + HALF_LINE;
-            let slot = (col_w - 2.0 * HALF_LINE) / seg.cols as f32;
-            let x0 = left + seg.col as f32 * slot;
-            let w = slot;
+            let x0 = left + seg.x;
+            let w = seg.w;
             let y0 = geom.y_of(seg.start_min) + HALF_LINE;
             let y1 = (geom.y_of(seg.end_min) - HALF_LINE).max(y0 + MIN_EVENT_H);
             let rect = Rect::from_min_max(Pos2::new(x0, y0), Pos2::new(x0 + w, y1));
@@ -293,15 +291,31 @@ pub struct Segment {
     pub ev: usize,
     pub start_min: i64,
     pub end_min: i64,
-    pub col: usize,
-    pub cols: usize,
+    /// Horizontal position within the day column, in px from its left edge.
+    pub x: f32,
+    pub w: f32,
     /// Whether the event ends on this day (so it can be resized here).
     pub ends_here: bool,
 }
 
-/// Clips the events `idx` (into `events`) to `day` and assigns side-by-side
-/// columns to overlapping ones.
-pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate) -> Vec<Segment> {
+/// Overlapping events that start less than this many minutes apart share the
+/// column side by side; a later one is drawn on top, indented.
+const SIDE_BY_SIDE_MIN: i64 = 30;
+/// How far an event drawn on top of an earlier one is indented.
+const NEST_INDENT: f32 = 8.0;
+
+/// Clips the events `idx` (into `events`) to `day` and places overlapping
+/// ones the way macOS Calendar does, in a day column `width` px wide:
+///
+/// - events that start close together (< 30 min apart) split the space
+///   side by side;
+/// - an event that starts later inside another is drawn on top of it,
+///   indented a little from that event's left edge and running to the
+///   column's right edge.
+///
+/// Segments come back in drawing order (later ones on top), which is also
+/// the order their hit areas must be registered in.
+pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate, width: f32) -> Vec<Segment> {
     let ds = midnight(day);
     let de = ds + Duration::days(1);
     let mut segs: Vec<Segment> = idx
@@ -316,40 +330,54 @@ pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate) -> Vec<Segmen
             // fits; lay them out at that drawn length, so the next event goes
             // beside them instead of underneath their text.
             let end_min = ((end - ds).num_minutes()).max(start_min + min_event_minutes());
-            Segment { ev: i, start_min, end_min, col: 0, cols: 1, ends_here: e.end <= de }
+            Segment { ev: i, start_min, end_min, x: 0.0, w: width, ends_here: e.end <= de }
         })
         .collect();
     segs.sort_by_key(|s| (s.start_min, -s.end_min));
 
-    let mut cluster_start = 0;
-    let mut cluster_end = i64::MIN;
-    let mut col_ends: Vec<i64> = Vec::new();
-    for i in 0..=segs.len() {
-        let new_cluster = i == segs.len() || segs[i].start_min >= cluster_end;
-        if new_cluster && i > cluster_start {
-            let n = col_ends.len().max(1);
-            for s in &mut segs[cluster_start..i] {
-                s.cols = n;
-            }
-        }
-        if i == segs.len() {
-            break;
-        }
-        if new_cluster {
-            cluster_start = i;
-            col_ends.clear();
-            cluster_end = i64::MIN;
-        }
-        let col = match col_ends.iter().position(|&end| end <= segs[i].start_min) {
-            Some(c) => c,
+    // A group is a horizontal span shared side by side by its members.
+    struct Group {
+        x0: f32,
+        x1: f32,
+        members: Vec<usize>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut group_of: Vec<usize> = Vec::with_capacity(segs.len());
+    let place = |g: &Group, k: usize| {
+        let w = (g.x1 - g.x0) / g.members.len() as f32;
+        (g.x0 + k as f32 * w, w)
+    };
+
+    for i in 0..segs.len() {
+        // The topmost already-placed event this one overlaps, if any.
+        let under = (0..i).rev().find(|&j| segs[j].start_min < segs[i].end_min && segs[i].start_min < segs[j].end_min);
+        let g = match under {
             None => {
-                col_ends.push(0);
-                col_ends.len() - 1
+                groups.push(Group { x0: 0.0, x1: width, members: vec![i] });
+                groups.len() - 1
+            }
+            Some(j) if segs[i].start_min - segs[j].start_min < SIDE_BY_SIDE_MIN => {
+                // Starts with it: share its span side by side.
+                let g = group_of[j];
+                groups[g].members.push(i);
+                g
+            }
+            Some(j) => {
+                // Starts later: on top, indented from the event below.
+                let (x, _) = place(&groups[group_of[j]], groups[group_of[j]].members.iter().position(|&m| m == j).unwrap());
+                let x0 = (x + NEST_INDENT).min(width * 0.6);
+                groups.push(Group { x0, x1: width, members: vec![i] });
+                groups.len() - 1
             }
         };
-        col_ends[col] = segs[i].end_min;
-        segs[i].col = col;
-        cluster_end = cluster_end.max(segs[i].end_min);
+        group_of.push(g);
+    }
+    for g in &groups {
+        for (k, &m) in g.members.iter().enumerate() {
+            let (x, w) = place(g, k);
+            segs[m].x = x;
+            segs[m].w = w;
+        }
     }
     segs
 }
@@ -492,13 +520,40 @@ mod tests {
         }
     }
 
+    fn day() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 11, 10).unwrap()
+    }
+
     #[test]
-    fn overlapping_events_share_columns() {
-        let all = [ev("a", (13, 0), (14, 30)), ev("b", (13, 30), (14, 15)), ev("c", (16, 0), (17, 0))];
-        let segs = layout_day(&all, &[0, 1, 2], NaiveDate::from_ymd_opt(2026, 11, 10).unwrap());
+    fn events_starting_together_share_the_column() {
+        // Like "hairdresser" 14:45 and "Engineering Process Meeting" 15:00.
+        let all = [ev("a", (14, 45), (15, 45)), ev("b", (15, 0), (16, 0)), ev("c", (17, 0), (18, 0))];
+        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0);
         let get = |id: &str| segs.iter().find(|s| all[s.ev].id == id).unwrap();
-        assert_eq!((get("a").col, get("a").cols), (0, 2));
-        assert_eq!((get("b").col, get("b").cols), (1, 2));
-        assert_eq!((get("c").col, get("c").cols), (0, 1));
+        assert_eq!((get("a").x, get("a").w), (0.0, 100.0));
+        assert_eq!((get("b").x, get("b").w), (100.0, 100.0));
+        assert_eq!((get("c").x, get("c").w), (0.0, 200.0), "no overlap: full width");
+    }
+
+    #[test]
+    fn later_overlapping_event_is_indented_on_top() {
+        // Like "Colour Consultation" 17:30 inside "Nvidia sync" 17:00–18:00.
+        let all = [ev("inner", (17, 30), (18, 0)), ev("outer", (17, 0), (18, 0))];
+        let segs = layout_day(&all, &[0, 1], day(), 200.0);
+        let order: Vec<&str> = segs.iter().map(|s| all[s.ev].id.as_str()).collect();
+        assert_eq!(order, ["outer", "inner"], "the later one is drawn (and hit) on top");
+        assert_eq!((segs[0].x, segs[0].w), (0.0, 200.0), "the one below keeps the full width");
+        assert_eq!((segs[1].x, segs[1].x + segs[1].w), (NEST_INDENT, 200.0), "indented, to the right edge");
+    }
+
+    #[test]
+    fn nesting_builds_on_the_event_below() {
+        // Profile photoshoot 10:30–11:30, koffie 11:15–12:00, lunch 11:50–12:30:
+        // koffie nests in the photoshoot; lunch starts 35 min after koffie, so
+        // it nests again, one more indent in.
+        let all = [ev("shoot", (10, 30), (11, 30)), ev("koffie", (11, 15), (12, 0)), ev("lunch", (11, 50), (12, 30))];
+        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0);
+        let x: Vec<f32> = segs.iter().map(|s| s.x).collect();
+        assert_eq!(x, [0.0, NEST_INDENT, 2.0 * NEST_INDENT]);
     }
 }

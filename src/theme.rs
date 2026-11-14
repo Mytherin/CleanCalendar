@@ -33,6 +33,11 @@ pub struct Palette {
     /// Segmented Day/Week/Month/Year control.
     pub seg_track: Color32,
     pub seg_knob: Color32,
+    /// Event popover / inspector background, its grouped cards, and the
+    /// placeholder text in empty fields.
+    pub popover: Color32,
+    pub card: Color32,
+    pub placeholder: Color32,
 }
 
 impl Palette {
@@ -53,6 +58,9 @@ impl Palette {
                 button: Color32::from_rgb(0x35, 0x39, 0x3B),
                 seg_track: Color32::from_rgb(0x1C, 0x1F, 0x21),
                 seg_knob: Color32::from_rgb(0x3A, 0x3D, 0x40),
+                popover: Color32::from_rgb(0x1F, 0x22, 0x24),
+                card: Color32::from_rgb(0x29, 0x2B, 0x2E),
+                placeholder: Color32::from_rgb(0x6A, 0x6C, 0x6F),
             }
         } else {
             Palette {
@@ -70,6 +78,9 @@ impl Palette {
                 button: Color32::from_rgb(0xE9, 0xE9, 0xEB),
                 seg_track: Color32::from_rgb(0xE3, 0xE3, 0xE8),
                 seg_knob: Color32::WHITE,
+                popover: Color32::from_rgb(0xF6, 0xF6, 0xF6),
+                card: Color32::WHITE,
+                placeholder: Color32::from_rgb(0xA8, 0xA8, 0xAD),
             }
         }
     }
