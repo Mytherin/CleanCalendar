@@ -223,6 +223,10 @@ impl App {
             time_zone: None,
         };
         self.finish_editor(Outcome::Done);
+        if self.editor.is_some() {
+            // The open editor can't be saved yet; it shows why.
+            return;
+        }
         let placement = if self.view == View::Day {
             Placement::Inspector
         } else {
@@ -238,6 +242,9 @@ impl App {
             return;
         }
         self.finish_editor(Outcome::Done);
+        if self.editor.is_some() {
+            return;
+        }
         if let Some(ev) = self.store.find_event(id) {
             let placement = if self.view == View::Day {
                 Placement::Inspector
@@ -404,6 +411,9 @@ impl App {
         if self.selected.as_deref() == Some(id) {
             self.selected = None;
         }
+        // An editor left open on it (e.g. the day view's inspector when
+        // Delete is pressed) would save it right back when it closes.
+        self.close_editor_if(|draft| draft.id == id);
         if is_occurrence(&self.store, id) {
             let Some((series_id, stamp)) = recurrence::split_occurrence(id) else { return };
             let Some(mut series) = self.store.event(series_id).cloned() else { return };
@@ -417,6 +427,13 @@ impl App {
         self.store.events.retain(|e| e.id != id);
         self.engine.event_deleted(&mut self.store, &ev, true);
         self.flush();
+    }
+
+    /// Drops the editor, unsaved, when its draft matches (its event is gone).
+    fn close_editor_if(&mut self, gone: impl Fn(&Event) -> bool) {
+        if self.editor.as_ref().is_some_and(|ed| gone(&ed.draft)) {
+            self.editor = None;
+        }
     }
 
     /// Deletes every occurrence of the repeating event `id` belongs to.
@@ -443,6 +460,11 @@ impl App {
             .cloned()
             .collect();
         self.store.events.retain(|e| !members.iter().any(|m| m.id == e.id));
+        self.close_editor_if(|draft| {
+            draft.id == id
+                || members.iter().any(|m| m.id == draft.id)
+                || recurrence::split_occurrence(&draft.id).is_some_and(|(s, _)| s == series_id)
+        });
         if local_series.is_some() {
             for m in &members {
                 self.engine.event_deleted(&mut self.store, m, true);
@@ -511,6 +533,13 @@ impl App {
         self.date = date;
         if view != self.view {
             self.finish_editor(Outcome::Done);
+            // Still open (it can't be saved as is): the inspector only
+            // exists in the day view, so show it as a popover elsewhere.
+            if let Some(ed) = self.editor.as_mut().filter(|_| view != View::Day) {
+                if ed.placement == Placement::Inspector {
+                    ed.placement = Placement::Popover { anchor: None };
+                }
+            }
         }
         self.view = view;
         self.mini_month = first_of_month(date);
@@ -524,6 +553,11 @@ impl App {
             View::Year => add_months(self.date, 12 * dir),
         };
         self.mini_month = first_of_month(self.date);
+        // Don't leave an event selected (and deletable with Backspace)
+        // that's no longer on screen.
+        if self.editor.is_none() {
+            self.selected = None;
+        }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -737,6 +771,10 @@ impl App {
             }
         }
         if let Some(id) = remove {
+            self.close_editor_if(|draft| draft.calendar_id == id);
+            if self.selected.as_ref().and_then(|s| self.store.find_event(s)).is_some_and(|e| e.calendar_id == id) {
+                self.selected = None;
+            }
             self.store.calendars.retain(|c| c.id != id);
             self.store.events.retain(|e| e.calendar_id != id);
             self.store.save();
