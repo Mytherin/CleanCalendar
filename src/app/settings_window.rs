@@ -1,6 +1,6 @@
 //! The Settings window, laid out like macOS Calendar's: a row of tabs with
-//! icons (General, Accounts, Advanced), forms with right-aligned labels, and
-//! an "Add Account" sheet that asks for the provider first.
+//! icons (General, Accounts, Locations, Advanced), forms with right-aligned
+//! labels, and an "Add Account" sheet that asks for the provider first.
 
 use eframe::egui::{
     self, text::LayoutJob, Align, Align2, Color32, FontId, Key, Layout, Order, Painter, Pos2, RichText, Sense, Stroke,
@@ -12,6 +12,7 @@ use crate::dates::{fmt_hour, CLOCK_24H};
 use crate::editor::Outcome;
 use crate::caldav;
 use crate::model::{CalDavAccount, Event, Store};
+use crate::places::{self, Phase};
 use crate::remote::{Cmd, GOOGLE};
 use crate::settings::{
     self, duration_label, history_label, refresh_label, weekday_from_monday, weekday_name, Settings, WeekScroll,
@@ -34,16 +35,18 @@ pub enum Tab {
     #[default]
     General,
     Accounts,
+    Locations,
     Advanced,
 }
 
 impl Tab {
-    const ALL: [Tab; 3] = [Tab::General, Tab::Accounts, Tab::Advanced];
+    const ALL: [Tab; 4] = [Tab::General, Tab::Accounts, Tab::Locations, Tab::Advanced];
 
     fn title(self) -> &'static str {
         match self {
             Tab::General => "General",
             Tab::Accounts => "Accounts",
+            Tab::Locations => "Locations",
             Tab::Advanced => "Advanced",
         }
     }
@@ -215,6 +218,8 @@ pub struct SettingsUi {
     form: CalDavForm,
     /// The provider sheet's help text is showing.
     help: bool,
+    /// The search text for regions to download.
+    region_filter: String,
 }
 
 impl App {
@@ -224,6 +229,12 @@ impl App {
             self.finish_editor(Outcome::Done);
         }
         self.settings_ui.open = true;
+    }
+
+    /// Opens Settings at `tab`.
+    pub(super) fn open_settings_at(&mut self, tab: Tab) {
+        self.settings_ui.tab = tab;
+        self.open_settings();
     }
 
     pub(super) fn settings_window(&mut self, ctx: &egui::Context, p: &Palette) {
@@ -252,6 +263,7 @@ impl App {
                 match tab {
                     Tab::General => self.general_tab(ui, p),
                     Tab::Accounts => self.accounts_tab(ui, p),
+                    Tab::Locations => self.locations_tab(ui, p),
                     Tab::Advanced => advanced_tab(ui, &mut self.store.settings),
                 }
                 ui.add_space(4.0);
@@ -981,6 +993,202 @@ impl App {
     }
 }
 
+// ---- Locations --------------------------------------------------------------
+
+/// "7.3 MB" for a size in bytes.
+fn fmt_bytes(n: u64) -> String {
+    match n {
+        n if n >= 1 << 30 => format!("{:.1} GB", n as f64 / (1u64 << 30) as f64),
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1u64 << 20) as f64),
+        n => format!("{} KB", n.div_ceil(1024)),
+    }
+}
+
+/// "546,328" for a count.
+fn fmt_count(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A bar filled to `frac` with `text` on it.
+fn progress(ui: &mut Ui, frac: Option<f32>, text: String) {
+    let bar = match frac {
+        Some(f) => egui::ProgressBar::new(f.clamp(0.0, 1.0)),
+        None => egui::ProgressBar::new(0.0).animate(true),
+    };
+    ui.add(bar.desired_width(220.0).desired_height(16.0).text(text));
+}
+
+impl App {
+    /// The countries whose location data is downloaded, downloads under
+    /// way, and a searchable list of countries to add.
+    fn locations_tab(&mut self, ui: &mut Ui, p: &Palette) {
+        let lib = places::library();
+        lib.set_context(ui.ctx());
+        ui.label(
+            RichText::new(
+                "Suggest places while you type an event's location. Each country's map data is downloaded \
+                 once and searched on this computer: what you type is never sent anywhere.",
+            )
+            .color(p.secondary)
+            .size(12.5),
+        );
+        ui.add_space(6.0);
+
+        let installed = lib.installed();
+        let jobs = lib.jobs();
+        egui::Frame::none()
+            .fill(p.sidebar)
+            .rounding(6.0)
+            .stroke(Stroke::new(1.0_f32, p.grid))
+            .inner_margin(egui::Margin::same(8.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(110.0);
+                ui.spacing_mut().item_spacing.y = 6.0;
+                if installed.is_empty() && jobs.is_empty() {
+                    ui.add_space(36.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new("No countries yet").color(p.placeholder)));
+                }
+                for inst in installed.iter().filter(|i| !jobs.iter().any(|j| j.region.id == i.meta.id)) {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(RichText::new(&inst.meta.name).font(theme::bold_font(13.5)).color(p.text));
+                            let info = format!(
+                                "{} places · {} · updated {}",
+                                fmt_count(inst.meta.entries),
+                                fmt_bytes(inst.bytes),
+                                inst.meta.updated
+                            );
+                            ui.label(RichText::new(info).color(p.secondary).size(11.5));
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Remove").clicked() {
+                                if let Err(e) = lib.remove(inst) {
+                                    self.status = Some((format!("{e:#}"), true));
+                                }
+                            }
+                            // Updating needs the country's download address,
+                            // which comes from the catalog.
+                            let region = lib.catalog().ok().flatten().and_then(|c| c.into_iter().find(|r| r.id == inst.meta.id));
+                            if ui.add_enabled(region.is_some(), egui::Button::new("Update")).on_hover_text("Download the latest map data").clicked() {
+                                lib.add(region.unwrap());
+                            }
+                        });
+                    });
+                }
+                for job in &jobs {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&job.region.name).font(theme::bold_font(13.5)).color(p.text));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let failed = matches!(job.phase, Phase::Failed(_));
+                            if ui.button(if failed { "Dismiss" } else { "Cancel" }).clicked() {
+                                lib.cancel(&job.region.id);
+                            }
+                            if failed && ui.button("Retry").clicked() {
+                                lib.add(job.region.clone());
+                            }
+                            match &job.phase {
+                                Phase::Downloading { done, total } => progress(
+                                    ui,
+                                    total.map(|t| *done as f32 / t as f32),
+                                    match total {
+                                        Some(t) => format!("Downloading {} of {}", fmt_bytes(*done), fmt_bytes(*t)),
+                                        None => format!("Downloading {}", fmt_bytes(*done)),
+                                    },
+                                ),
+                                Phase::Indexing { done, total } => progress(
+                                    ui,
+                                    (*total > 0).then(|| *done as f32 / *total as f32),
+                                    "Indexing…".into(),
+                                ),
+                                Phase::Saving => progress(ui, None, "Saving…".into()),
+                                Phase::Failed(_) => {}
+                            }
+                        });
+                    });
+                    if let Phase::Failed(e) = &job.phase {
+                        ui.label(RichText::new(e).color(RED).size(11.5));
+                    }
+                }
+            });
+
+        ui.add_space(8.0);
+        let s = &mut self.settings_ui;
+        ui.horizontal(|ui| {
+            ui.label("Add a country:");
+            ui.add(
+                egui::TextEdit::singleline(&mut s.region_filter)
+                    .hint_text("Search for a country")
+                    .desired_width(ui.available_width()),
+            );
+        });
+        match lib.catalog() {
+            Ok(None) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Getting the list of countries…").color(p.secondary));
+                });
+            }
+            Err(e) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(e).color(RED).size(12.0));
+                    if ui.button("Try Again").clicked() {
+                        lib.retry_catalog();
+                    }
+                });
+            }
+            Ok(Some(catalog)) => {
+                let words: Vec<String> = places::tokens(&s.region_filter).collect();
+                if !words.is_empty() {
+                    let all_in = |text: &str| {
+                        let have: Vec<String> = places::tokens(text).collect();
+                        words.iter().all(|w| have.iter().any(|h| h.starts_with(w.as_str())))
+                    };
+                    let matches: Vec<&places::Region> = catalog.iter().filter(|r| all_in(&r.name)).take(40).collect();
+                    egui::ScrollArea::vertical().max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+                        if matches.is_empty() {
+                            ui.label(RichText::new("No country by that name").color(p.secondary));
+                        }
+                        for r in matches {
+                            let row = Vec2::new(ui.available_width(), 30.0);
+                            ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
+                                ui.label(&r.name);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let busy = jobs.iter().any(|j| j.region.id == r.id && !matches!(j.phase, Phase::Failed(_)));
+                                    let have = installed.iter().any(|i| i.meta.id == r.id);
+                                    let label = if have { "Installed" } else { "Download" };
+                                    if ui.add_enabled(!busy && !have, egui::Button::new(label)).clicked() {
+                                        lib.add(r.clone());
+                                    }
+                                });
+                            });
+                        }
+                    });
+                }
+            }
+        }
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Map data © OpenStreetMap contributors (Open Database License), downloaded from Geofabrik, \
+                 which learns only which countries you pick. The download can be large (1.4 GB for the \
+                 Netherlands), but only a small index of it is kept (7 MB for the Netherlands).",
+            )
+            .color(p.secondary)
+            .size(11.0),
+        );
+    }
+}
+
 // ---- Advanced ---------------------------------------------------------------
 
 fn advanced_tab(ui: &mut Ui, s: &mut Settings) {
@@ -1064,6 +1272,17 @@ fn tab_icon(painter: &Painter, tab: Tab, center: Pos2, color: Color32) {
         }
         Tab::Accounts => {
             painter.text(center, Align2::CENTER_CENTER, "@", theme::font(24.0), color);
+        }
+        Tab::Locations => {
+            // A map pin.
+            let c = center - Vec2::new(0.0, 3.0);
+            painter.circle_filled(c, 7.5, color);
+            painter.add(egui::Shape::convex_polygon(
+                vec![Pos2::new(c.x - 6.4, c.y + 3.6), Pos2::new(c.x + 6.4, c.y + 3.6), Pos2::new(c.x, c.y + 13.0)],
+                color,
+                Stroke::NONE,
+            ));
+            painter.circle_filled(c, 2.8, Color32::WHITE);
         }
         Tab::Advanced => {
             painter.text(center + Vec2::new(-5.0, -3.0), Align2::CENTER_CENTER, "⚙", theme::font(17.0), color);
