@@ -414,6 +414,7 @@ impl Remote for Client {
                     events: self.parse_events(cal, &cal_url, &rs, window),
                     cancelled: Vec::new(),
                     next_token: token,
+                    skipped: None,
                 })
             }
             Query::Changes(token) => {
@@ -447,7 +448,7 @@ impl Remote for Client {
                 // Everything under a changed resource is replaced by what it
                 // has now (an occurrence may have been removed).
                 cancelled.extend(changed);
-                Ok(CalendarChanges { calendar_id: cal.id.clone(), full: false, events, cancelled, next_token: next })
+                Ok(CalendarChanges { calendar_id: cal.id.clone(), full: false, events, cancelled, next_token: next, skipped: None })
             }
         }
     }

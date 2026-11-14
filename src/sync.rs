@@ -257,8 +257,12 @@ impl SyncEngine {
                     return;
                 }
                 merge_calendars(store, &account, &calendars);
+                let skipped: Vec<String> = changes.iter().filter_map(|c| c.skipped.clone()).collect();
                 apply_changes(store, &account, changes, dragging, today);
-                if store.unsynced_count() == 0 {
+                if !skipped.is_empty() {
+                    let name = store.account_name(&account);
+                    self.status(format!("{name} wouldn't send {}", skipped.join("; ")), true);
+                } else if store.unsynced_count() == 0 {
                     self.status("Up to date", false);
                 }
                 self.sync_finished(store, &account, today);
@@ -683,6 +687,7 @@ mod tests {
             events,
             cancelled: cancelled.iter().map(|s| s.to_string()).collect(),
             next_token: token.map(str::to_owned),
+            skipped: None,
         }]
     }
 
@@ -1450,6 +1455,7 @@ mod account_tests {
             events: vec![theirs],
             cancelled: vec![],
             next_token: Some("t".into()),
+            skipped: None,
         }];
         apply_changes(&mut s, DAV2, changes, None, today());
         let mut titles: Vec<&str> = s.events.iter().map(|e| e.title.as_str()).collect();
