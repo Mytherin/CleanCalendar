@@ -55,6 +55,8 @@ pub fn offline(name: &str) -> String {
 #[derive(Debug, PartialEq)]
 pub enum Notice {
     Status { text: String, error: bool },
+    /// A sync finished cleanly: drop whatever status was showing.
+    ClearStatus,
     /// An event got a new id after its first upload.
     Renamed { from: String, to: String },
 }
@@ -376,7 +378,7 @@ impl SyncEngine {
                     let name = store.account_name(&account);
                     self.status(format!("{name} wouldn't send {}", skipped.join("; ")), true);
                 } else if store.unsynced_count() == 0 {
-                    self.status("Up to date", false);
+                    self.notices.push(Notice::ClearStatus);
                 }
                 self.sync_finished(store, &account, today);
             }
