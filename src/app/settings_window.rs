@@ -623,12 +623,12 @@ impl App {
                                     self.status = Some((format!("{e:#}"), true));
                                 }
                             }
-                            // Offered once a newer build is published.
+                            // Offered once the app knows of a newer build.
                             let newer = lib
                                 .catalog()
-                                .ok()
-                                .flatten()
-                                .and_then(|c| c.into_iter().find(|r| r.id == inst.meta.id && r.updated > inst.meta.updated));
+                                .iter()
+                                .find(|r| r.id == inst.meta.id && r.updated > inst.meta.updated)
+                                .cloned();
                             let hover = match &newer {
                                 Some(r) => format!("Download the map data of {}", r.updated),
                                 None => "This is the latest map data".to_owned(),
@@ -679,51 +679,33 @@ impl App {
                     .desired_width(ui.available_width()),
             );
         });
-        match lib.catalog() {
-            Ok(None) => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("Getting the list of countries…").color(p.secondary));
-                });
-            }
-            Err(e) => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(e).color(RED).size(12.0));
-                    if ui.button("Try Again").clicked() {
-                        lib.retry_catalog();
-                    }
-                });
-            }
-            Ok(Some(catalog)) => {
-                let words: Vec<String> = places::tokens(&s.region_filter).collect();
-                if !words.is_empty() {
-                    let all_in = |text: &str| {
-                        let have: Vec<String> = places::tokens(text).collect();
-                        words.iter().all(|w| have.iter().any(|h| h.starts_with(w.as_str())))
-                    };
-                    let matches: Vec<&places::Region> = catalog.iter().filter(|r| all_in(&r.name)).take(40).collect();
-                    egui::ScrollArea::vertical().max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
-                        if matches.is_empty() {
-                            ui.label(RichText::new("No country by that name").color(p.secondary));
-                        }
-                        for r in matches {
-                            let row = Vec2::new(ui.available_width(), 30.0);
-                            ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
-                                ui.label(&r.name);
-                                ui.label(RichText::new(fmt_bytes(r.bytes)).color(p.secondary).size(11.5));
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let busy = jobs.iter().any(|j| j.region.id == r.id && !matches!(j.phase, Phase::Failed(_)));
-                                    let have = installed.iter().any(|i| i.meta.id == r.id);
-                                    let label = if have { "Installed" } else { "Download" };
-                                    if ui.add_enabled(!busy && !have, egui::Button::new(label)).clicked() {
-                                        lib.add(r.clone());
-                                    }
-                                });
-                            });
-                        }
+        let words: Vec<String> = places::tokens(&s.region_filter).collect();
+        if !words.is_empty() {
+            let all_in = |text: &str| {
+                let have: Vec<String> = places::tokens(text).collect();
+                words.iter().all(|w| have.iter().any(|h| h.starts_with(w.as_str())))
+            };
+            let matches: Vec<&places::Region> = lib.catalog().iter().filter(|r| all_in(&r.name)).take(40).collect();
+            egui::ScrollArea::vertical().max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+                if matches.is_empty() {
+                    ui.label(RichText::new("No country by that name").color(p.secondary));
+                }
+                for r in matches {
+                    let row = Vec2::new(ui.available_width(), 30.0);
+                    ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(&r.name);
+                        ui.label(RichText::new(fmt_bytes(r.bytes)).color(p.secondary).size(11.5));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let busy = jobs.iter().any(|j| j.region.id == r.id && !matches!(j.phase, Phase::Failed(_)));
+                            let have = installed.iter().any(|i| i.meta.id == r.id);
+                            let label = if have { "Installed" } else { "Download" };
+                            if ui.add_enabled(!busy && !have, egui::Button::new(label)).clicked() {
+                                lib.add(r.clone());
+                            }
+                        });
                     });
                 }
-            }
+            });
         }
         ui.add_space(4.0);
         ui.label(
