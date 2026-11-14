@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 use eframe::egui::{
     self, text::LayoutJob, Align2, Color32, CursorIcon, FontId, Galley, PointerButton, Pos2, Rect, Sense, Stroke, Ui,
     Vec2,
@@ -77,7 +77,37 @@ fn shown_events(app: &App, first: NaiveDate, ndays: i64) -> Vec<Event> {
             events.sort_by(|x, y| x.start.cmp(&y.start).then(y.duration().cmp(&x.duration())));
         }
     }
+    // An all-day event being dragged out across days is drawn like a real
+    // one (laid out with the others), as in macOS Calendar.
+    if let Some((a, b)) = app.pointer.ghost_days() {
+        let (a, b) = (a.max(first), b.min(first + Duration::days(ndays - 1)));
+        if a <= b {
+            events.push(ghost_event(midnight(a), midnight(b + Duration::days(1)), true));
+            events.sort_by(|x, y| x.start.cmp(&y.start).then(y.duration().cmp(&x.duration())));
+        }
+    }
     events
+}
+
+/// A "New Event" being drawn by dragging; it has no calendar yet, so it's
+/// drawn in the accent color.
+fn ghost_event(start: NaiveDateTime, end: NaiveDateTime, all_day: bool) -> Event {
+    Event {
+        id: String::new(),
+        calendar_id: String::new(),
+        title: "New Event".into(),
+        start,
+        end,
+        all_day,
+        location: String::new(),
+        notes: String::new(),
+        remote_id: None,
+        recurring_id: None,
+        pending: false,
+        rev: 0,
+        etag: None,
+        base: None,
+    }
 }
 
 /// Remembers where each event was drawn this frame (its first piece), to
@@ -283,14 +313,9 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
     painter.hline(rect.x_range(), rect.top() + lay.header_h, Stroke::new(1.0_f32, p.grid));
 
-    let ghost = app.pointer.ghost_days();
     for cell in &lay.cells {
         if is_weekend(cell.day) {
             painter.rect_filled(cell.rect, 0.0, p.weekend);
-        }
-        // The days a new all-day event being dragged out will cover.
-        if ghost.is_some_and(|(a, b)| (a..=b).contains(&cell.day)) {
-            painter.rect_filled(cell.rect, 0.0, theme::ACCENT.gamma_multiply(0.15));
         }
         painter.hline(cell.rect.x_range(), cell.rect.bottom(), Stroke::new(1.0_f32, p.grid));
         if cell.rect.left() > rect.left() + 1.0 {
@@ -412,13 +437,6 @@ fn paint_day_headers(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayo
 fn paint_allday(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayout, events: &[Event], p: &Palette) {
     let r = lay.rects.allday;
     let x_range = lay.rects.header.x_range();
-    // The days a new all-day event being dragged out will cover.
-    if let Some((a, b)) = app.pointer.ghost_days() {
-        for i in (0..lay.ndays).filter(|&i| (a..=b).contains(&(lay.first + Duration::days(i)))) {
-            let cell = Rect::from_x_y_ranges(lay.geom.col_x(i)..=lay.geom.col_x(i + 1), r.y_range());
-            painter.rect_filled(cell, 0.0, theme::ACCENT.gamma_multiply(0.15));
-        }
-    }
     painter.hline(x_range, r.top(), Stroke::new(1.0_f32, p.grid));
     painter.hline(x_range, r.bottom(), Stroke::new(1.0_f32, p.grid_strong));
     painter.text(
@@ -481,23 +499,7 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
             let y0 = g.y_of((ps - ds).num_minutes());
             let y1 = g.y_of((pe - ds).num_minutes()).max(y0 + HOUR_H / 4.0);
             let r = Rect::from_min_max(Pos2::new(g.col_x(i) + 0.5, y0 + 0.5), Pos2::new(g.col_x(i + 1) - 0.5, y1 - 0.5));
-            let ghost = Event {
-                id: String::new(),
-                calendar_id: String::new(),
-                title: "New Event".into(),
-                start: s,
-                end: e,
-                all_day: false,
-                location: String::new(),
-                notes: String::new(),
-                remote_id: None,
-                recurring_id: None,
-                pending: false,
-                rev: 0,
-                etag: None,
-                base: None,
-            };
-            draw_timed(ui, &painter, r, &ghost, theme::ACCENT, false, p);
+            draw_timed(ui, &painter, r, &ghost_event(s, e, false), theme::ACCENT, false, p);
         }
     }
 
