@@ -55,6 +55,8 @@ pub struct Settings {
     /// Shade the year view's days by how many events they have.
     pub year_heatmap: bool,
     pub week_numbers: bool,
+    /// How many months of past events synced calendars keep; 0 = all.
+    pub history_months: u32,
 }
 
 impl Default for Settings {
@@ -75,6 +77,7 @@ impl Default for Settings {
             refresh_minutes: 5,
             year_heatmap: false,
             week_numbers: false,
+            history_months: 0,
         }
     }
 }
@@ -137,6 +140,19 @@ pub fn duration_label(minutes: u32) -> String {
         90 => "1.5 hours".into(),
         m if m % 60 == 0 => format!("{} hours", m / 60),
         m => format!("{m} minutes"),
+    }
+}
+
+/// Choices offered for "Keep past events", in months (0 = all).
+pub const HISTORY_CHOICES: [u32; 5] = [0, 60, 24, 12, 6];
+
+pub fn history_label(months: u32) -> String {
+    match months {
+        0 => "All".into(),
+        1 => "1 month".into(),
+        12 => "1 year".into(),
+        m if m % 12 == 0 => format!("{} years", m / 12),
+        m => format!("{m} months"),
     }
 }
 

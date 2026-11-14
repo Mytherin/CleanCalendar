@@ -21,6 +21,27 @@ use crate::remote::{CalRef, CalendarChanges, Cmd, Failure, Msg, RemoteCalendar, 
 /// that slide into the sync window are picked up by a periodic full sync.
 pub const FULL_SYNC_DAYS: i64 = 7;
 
+/// How far ahead events are kept, in months from the start of this month.
+/// Repeating events are stored as their occurrences, so this can't be open
+/// ended.
+pub const MONTHS_AHEAD: i32 = 13;
+
+/// Where "all past events" starts.
+pub fn earliest() -> NaiveDate {
+    NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+}
+
+/// The dates synced calendars are kept for: as far back as the "Keep past
+/// events" setting says (all of them by default), up to [`MONTHS_AHEAD`].
+pub fn window(store: &Store, today: NaiveDate) -> (NaiveDate, NaiveDate) {
+    let month = first_of_month(today);
+    let from = match store.settings.history_months {
+        0 => earliest(),
+        m => add_months(month, -(m as i32)),
+    };
+    (from, add_months(month, MONTHS_AHEAD))
+}
+
 /// The status shown while a service can't be reached.
 pub fn offline(name: &str) -> String {
     format!("Offline — changes will sync when {name} is reachable")
@@ -49,6 +70,9 @@ pub struct SyncEngine {
     running: HashSet<String>,
     /// Accounts asked to sync again while one was running.
     again: HashSet<String>,
+    /// The first day each running sync asked for: a full sync records it,
+    /// so a later sync knows whether that covered what's wanted now.
+    sync_from: HashMap<String, NaiveDate>,
     /// CalDAV accounts being added, until the server accepts the login.
     connecting: HashMap<String, CalDavAccount>,
 }
@@ -103,6 +127,7 @@ impl SyncEngine {
         self.retry_pending(store, account);
 
         let stale_before = today - Duration::days(FULL_SYNC_DAYS);
+        let (from, to) = window(store, today);
         let tokens: HashMap<String, String> = store
             .calendars
             .iter()
@@ -110,12 +135,14 @@ impl SyncEngine {
             .filter_map(|r| {
                 let s = store.sync_state.get(&r.local_id())?;
                 let fresh = s.full_sync_on.is_some_and(|d| d > stale_before);
-                Some((r.id, s.token.clone().filter(|_| fresh)?))
+                // The last full sync must reach back as far as wanted now
+                // (after "Keep past events" grew, everything is fetched again).
+                let covers = s.window_from.is_some_and(|d| d <= from);
+                Some((r.id, s.token.clone().filter(|_| fresh && covers)?))
             })
             .collect();
-        let from = add_months(first_of_month(today), -6);
-        let to = add_months(first_of_month(today), 13);
         self.running.insert(account.to_owned());
+        self.sync_from.insert(account.to_owned(), from);
         self.outbox.push(Cmd::Sync { account: account.to_owned(), login, from, to, tokens });
         true
     }
@@ -307,12 +334,18 @@ impl SyncEngine {
             }
             Msg::Synced { account, calendars, changes } => {
                 self.running.remove(&account);
+                let from = self.sync_from.remove(&account);
                 // Signed out while the sync was out: nothing to apply it to.
                 if store.login(&account).is_none() {
                     return;
                 }
                 merge_calendars(store, &account, &calendars);
+                let full: Vec<String> =
+                    changes.iter().filter(|c| c.full).map(|c| CalRef::new(&account, &c.calendar_id).local_id()).collect();
                 apply_changes(store, &account, changes, dragging, today);
+                for id in full {
+                    store.sync_state.entry(id).or_default().window_from = from;
+                }
                 if store.unsynced_count() == 0 {
                     self.status("Up to date", false);
                 }
@@ -320,6 +353,7 @@ impl SyncEngine {
             }
             Msg::SyncFailed { account, error } => {
                 self.running.remove(&account);
+                self.sync_from.remove(&account);
                 if store.login(&account).is_some() {
                     self.status(format!("Couldn't sync with {}: {error}", store.account_name(&account)), true);
                 }
@@ -1005,7 +1039,7 @@ mod tests {
     fn refused_delete_restores_googles_version() {
         let ev = gev("a", "x");
         let mut store = store_with(vec![]);
-        store.sync_state.insert(google::local_calendar_id(CAL), SyncState { token: Some("t".into()), full_sync_on: Some(today()) });
+        store.sync_state.insert(google::local_calendar_id(CAL), SyncState { token: Some("t".into()), full_sync_on: Some(today()), window_from: Some(earliest()) });
         let mut engine = SyncEngine::default();
         engine.event_deleted(&mut store, &ev, true);
         sent(&mut engine);
@@ -1357,7 +1391,7 @@ mod tests {
     fn rejected_edit_falls_back_to_googles_version() {
         let id = google::local_event_id(CAL, "a");
         let mut store = store_with(vec![gev("a", "x")]);
-        store.sync_state.insert(google::local_calendar_id(CAL), SyncState { token: Some("t".into()), full_sync_on: Some(today()) });
+        store.sync_state.insert(google::local_calendar_id(CAL), SyncState { token: Some("t".into()), full_sync_on: Some(today()), window_from: Some(earliest()) });
         let mut engine = SyncEngine::default();
 
         edit(&mut store, &mut engine, &id, "y");
@@ -1392,7 +1426,7 @@ mod tests {
     fn full_sync_is_forced_weekly() {
         let mut store = store_with(vec![]);
         let mut engine = SyncEngine::default();
-        let state = |days_ago| SyncState { token: Some("t".into()), full_sync_on: Some(today() - Duration::days(days_ago)) };
+        let state = |days_ago| SyncState { token: Some("t".into()), full_sync_on: Some(today() - Duration::days(days_ago)), window_from: Some(earliest()) };
 
         store.sync_state.insert(google::local_calendar_id(CAL), state(FULL_SYNC_DAYS - 1));
         engine.sync(&store, today());
@@ -1402,6 +1436,54 @@ mod tests {
         store.sync_state.insert(google::local_calendar_id(CAL), state(FULL_SYNC_DAYS));
         engine.sync(&store, today());
         assert_eq!(sent(&mut engine), [Sent::Sync(vec![])]);
+    }
+
+    #[test]
+    fn keeps_all_past_events_unless_told_otherwise() {
+        let date = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        let mut store = store_with(vec![]);
+        assert_eq!(window(&store, today()), (earliest(), date(2027, 12, 1)));
+        store.settings.history_months = 6;
+        assert_eq!(window(&store, today()), (date(2026, 5, 1), date(2027, 12, 1)));
+    }
+
+    #[test]
+    fn keeping_more_history_downloads_everything_again() {
+        let mut store = store_with(vec![]);
+        store.settings.history_months = 6;
+        let mut engine = SyncEngine::default();
+        let synced = |ch| Msg::Synced { account: GOOGLE.into(), calendars: vec![remote_cal()], changes: ch };
+
+        // A full sync of the last 6 months is recorded as such...
+        engine.sync(&store, today());
+        assert_eq!(sent(&mut engine), [Sent::Sync(vec![])]);
+        engine.handle(&mut store, synced(changes(true, vec![], &[], Some("t1"))), None, today());
+        let st = &store.sync_state[&google::local_calendar_id(CAL)];
+        assert_eq!(st.window_from, Some(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()));
+
+        // ...and is enough while that's what is wanted (also a month later,
+        // when the window has moved on): changes only.
+        engine.sync(&store, today());
+        assert_eq!(sent(&mut engine), [Sent::Sync(vec![CAL.into()])]);
+        engine.handle(&mut store, synced(changes(false, vec![], &[], Some("t2"))), None, today());
+        let later = today() + Duration::days(5);
+        engine.sync(&store, later);
+        assert_eq!(sent(&mut engine), [Sent::Sync(vec![CAL.into()])]);
+        engine.handle(&mut store, synced(changes(false, vec![], &[], Some("t3"))), None, later);
+        assert_eq!(
+            store.sync_state[&google::local_calendar_id(CAL)].window_from,
+            Some(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()),
+            "a sync of changes doesn't move the recorded window"
+        );
+
+        // Keeping all past events needs everything again.
+        store.settings.history_months = 0;
+        engine.sync(&store, today());
+        assert_eq!(sent(&mut engine), [Sent::Sync(vec![])]);
+        engine.handle(&mut store, synced(changes(true, vec![], &[], Some("t4"))), None, today());
+        assert_eq!(store.sync_state[&google::local_calendar_id(CAL)].window_from, Some(earliest()));
+        engine.sync(&store, today());
+        assert_eq!(sent(&mut engine), [Sent::Sync(vec![CAL.into()])]);
     }
 
     #[test]
