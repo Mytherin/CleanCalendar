@@ -262,6 +262,14 @@ impl Event {
         self.attendees = f.attendees;
     }
 
+    /// Whether it can move to another calendar. Moving re-creates the event
+    /// there, which for an event with guests would send every guest a new
+    /// invitation (from us, even for someone else's meeting) and a
+    /// cancellation for the old one. A new event not uploaded yet is fine.
+    pub fn can_change_calendar(&self) -> bool {
+        self.attendees.is_empty() || self.remote_id.is_none()
+    }
+
     /// Whether this is (an occurrence of) a repeating event.
     pub fn repeats(&self) -> bool {
         self.recurrence.is_some() || self.recurring_id.is_some()
@@ -618,6 +626,16 @@ pub mod tests {
 
     fn store(events: Vec<Event>) -> Store {
         Store { events, ..Store::with_defaults() }
+    }
+
+    #[test]
+    fn events_with_guests_on_a_service_keep_their_calendar() {
+        let mut ev = event_at("a", "2026-11-14 09:00", "2026-11-14 10:00");
+        assert!(ev.can_change_calendar(), "no guests");
+        ev.attendees.push(Attendee::new("ana@example.com"));
+        assert!(ev.can_change_calendar(), "not uploaded yet: nobody was invited");
+        ev.remote_id = Some("g1".into());
+        assert!(!ev.can_change_calendar(), "a move would re-invite every guest");
     }
 
     #[test]
