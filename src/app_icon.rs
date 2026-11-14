@@ -4,11 +4,17 @@
 //! sets `ICON_SMALL`, so the taskbar would keep the startup icon. We set both
 //! `ICON_BIG` and `ICON_SMALL` ourselves at the sizes Windows wants for the
 //! window's DPI, and also show a tray icon that opens the calendar.
+//!
+//! On macOS windows have no icons, and winit ignores `set_window_icon`; the
+//! Dock tile is the application icon, which we replace through AppKit (as
+//! Apple's Calendar does). The Dock already reopens the app, so no tray item.
+//!
+//! Elsewhere (Linux/X11) the window icon is all there is.
 
 use chrono::NaiveDate;
 use eframe::egui;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use crate::date_icon;
 
 pub struct AppIcon {
@@ -38,7 +44,14 @@ impl AppIcon {
                 self.shown = Some(today);
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let _ = (ctx, frame);
+            if self.shown != Some(today) && macos::set_dock_icon(today) {
+                self.shown = Some(today);
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let _ = frame;
             if self.shown != Some(today) {
@@ -47,6 +60,33 @@ impl AppIcon {
                 self.shown = Some(today);
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use chrono::NaiveDate;
+    use eframe::icon_data::IconDataExt as _;
+    use objc2::ClassType as _;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+
+    use crate::date_icon;
+
+    /// Dock tiles are drawn at up to 512 pt × 2 on Retina displays.
+    const SIZE: u32 = 1024;
+
+    /// Sets the Dock icon to `date`'s tile. Returns false if it couldn't, so
+    /// the caller retries next frame.
+    pub fn set_dock_icon(date: NaiveDate) -> bool {
+        // AppKit may only be touched from the main thread, which is where
+        // eframe calls `App::update`.
+        let Some(mtm) = MainThreadMarker::new() else { return false };
+        let Ok(png) = date_icon::icon_data(date, SIZE).to_png_bytes() else { return false };
+        let Some(image) = NSImage::initWithData(NSImage::alloc(), &NSData::from_vec(png)) else { return false };
+        // SAFETY: on the main thread with a valid image; AppKit retains it.
+        unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+        true
     }
 }
 
