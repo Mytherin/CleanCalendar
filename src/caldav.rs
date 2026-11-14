@@ -428,13 +428,26 @@ impl Remote for Client {
         // was changed elsewhere so this occurrence no longer exists, or a
         // plain event became a repeating one. Recreating it would duplicate
         // it, so the server's version wins.
-        let Some(theirs) = ical::find(cal, rid, server_etag.as_deref(), &existing) else {
-            return Err(Unworkable("it was changed into a different repeating event on another device".into()).into());
-        };
-        // Stale unless the server still has the version we started from, or
-        // what changed in the resource isn't this event (another occurrence).
-        if ev.etag.is_some() && ev.etag != server_etag && ev.base.as_ref() != Some(&theirs.fields()) {
-            return Err(dav_error(412, "Precondition Failed: changed on the server".into()));
+        match ical::find(cal, rid, server_etag.as_deref(), &existing) {
+            // Stale unless the server still has the version we started from,
+            // or what changed in the resource isn't this event (another
+            // occurrence).
+            Some(theirs) => {
+                if ev.etag.is_some() && ev.etag != server_etag && ev.base.as_ref() != Some(&theirs.fields()) {
+                    return Err(dav_error(412, "Precondition Failed: changed on the server".into()));
+                }
+            }
+            // A series made here, edited again before a sync brought back its
+            // occurrences: the whole resource is ours to rewrite, as long as
+            // nobody changed it since.
+            None if key.is_none() && ev.recurrence.is_some() && ical::is_series(&existing) => {
+                if ev.etag.is_some() && ev.etag != server_etag {
+                    return Err(dav_error(412, "Precondition Failed: changed on the server".into()));
+                }
+            }
+            None => {
+                return Err(Unworkable("it was changed into a different repeating event on another device".into()).into())
+            }
         }
         let uid = ical::uid(&existing).unwrap_or_else(|| uid_for(&ev.id));
         let ics = ical::put(Some(existing), ev, &uid, key).map_err(|e| Unworkable(format!("{e:#}")))?;
@@ -447,8 +460,13 @@ impl Remote for Client {
 
     fn fetch(&mut self, cal: &CalRef, remote_id: &str) -> Result<Option<Event>> {
         let cal_url = Self::calendar_url(cal)?;
-        let (href, _) = ical::split_remote_id(remote_id);
+        let (href, key) = ical::split_remote_id(remote_id);
         Ok(match self.get(&Self::resource_url(&cal_url, href)?)? {
+            // A whole series isn't one event the merge could compare; saying
+            // it's gone would make the caller recreate it as a duplicate.
+            Some((ics, _)) if key.is_none() && ical::is_series(&ics) => {
+                return Err(Unworkable("the repeating event was changed on another device".into()).into())
+            }
             Some((ics, etag)) => ical::find(cal, remote_id, etag.as_deref(), &ics),
             None => None,
         })
