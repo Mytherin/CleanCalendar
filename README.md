@@ -114,7 +114,7 @@ Installed location data (one `<country>.places` file per country) lives in a `pl
 
 ## Location data
 
-The countries offered under Settings → Locations are prebuilt indexes attached to a GitHub release (`v0.1`, listed by its `manifest.json`); the app downloads only the index of each country it adds, checks it against the checksum in the manifest, and searches it locally. `CLEANCALENDAR_PLACES_URL=<url>` points the app at another set (e.g. a local test server).
+The countries offered under Settings → Locations are prebuilt indexes attached to a GitHub release (`v0.1`). The list of them (file, size, date and SHA-256 of each) is built into the app from `src/places/countries.json`, so the app downloads only the index of each country it adds, checks it against that checksum, and searches it locally. `CLEANCALENDAR_PLACES_URL=<url>` points the app at another copy of the files (e.g. a local test server).
 
 An index is built from Geofabrik's OpenStreetMap extract of the country: towns and villages, streets, and named places (shops, museums, stations, offices, …), each placed in its nearest town. It is stored by column (kind, name, street, house number, town), each dictionary-encoded and zstd-compressed, with an [fst](https://docs.rs/fst) map from every search word to its entries. The Netherlands' 1.4 GB extract becomes a 7 MB index of 546,000 entries; a search takes well under a millisecond.
 
@@ -126,11 +126,14 @@ cargo run --release --features build-places -- --build-places places-out netherl
 cargo run --release --features build-places -- --build-places --list                 # country ids
 ```
 
-Each country's extract is downloaded, indexed and deleted again, and `places-out/manifest.json` is updated after each one; countries already built are skipped unless `--force` is given, so an interrupted run carries on where it stopped. Then attach everything in `places-out` to the release, replacing the old files:
+Each country's extract is downloaded, indexed and deleted again, and `places-out/manifest.json` is updated after each one; countries already built are skipped unless `--force` is given, so an interrupted run carries on where it stopped. Then attach the indexes to the release (replacing the old files), and build the new list into the app:
 
 ```sh
-gh release upload v0.1 places-out/* --clobber
+gh release upload v0.1 places-out/*.places --clobber
+cp places-out/manifest.json src/places/countries.json
 ```
+
+Upload before shipping the new list: an app whose list names a file or checksum the release doesn't have can't install that country. (`cargo test live_release -- --ignored` installs Monaco from the real release; set `CLEANCALENDAR_TEST_COUNTRY` for another.)
 
 Map data © OpenStreetMap contributors, under the [Open Database License](https://opendatacommons.org/licenses/odbl/); the app shows this credit under its suggestions.
 

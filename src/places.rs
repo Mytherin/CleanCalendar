@@ -32,11 +32,14 @@ use url::Url;
 use index::{Index, Meta, Query};
 
 /// Where the prebuilt country indexes are published: the files of a GitHub
-/// release, with `manifest.json` listing them. `CLEANCALENDAR_PLACES_URL`
-/// points elsewhere (e.g. a test server).
+/// release. `CLEANCALENDAR_PLACES_URL` points elsewhere (e.g. a test
+/// server).
 const PLACES_URL: &str = "https://github.com/Mytherin/CleanCalendar/releases/download/v0.1/";
 const PLACES_ENV: &str = "CLEANCALENDAR_PLACES_URL";
-pub const MANIFEST: &str = "manifest.json";
+/// The published countries, built into the app: the `manifest.json` that
+/// the last `--build-places` run wrote, copied here when its files are
+/// released.
+const COUNTRIES: &str = include_str!("places/countries.json");
 /// No personal details, just the app.
 const USER_AGENT: &str = concat!("CleanCalendar/", env!("CARGO_PKG_VERSION"));
 pub const EXT: &str = "places";
@@ -163,15 +166,12 @@ fn base_url() -> String {
     }
 }
 
-fn fetch_catalog(base: &str) -> Result<Vec<Region>> {
-    let url = format!("{base}{MANIFEST}");
-    let manifest: Manifest = http()?.get(url).timeout(Duration::from_secs(60)).send()?.error_for_status()?.json()?;
-    let mut list = manifest.countries;
-    if list.is_empty() {
-        bail!("no countries are published yet");
-    }
+/// The countries built into the app, by name.
+fn builtin_countries() -> Vec<Region> {
+    // Checked by a test, so a bad list never ships.
+    let mut list = serde_json::from_str::<Manifest>(COUNTRIES).map(|m| m.countries).unwrap_or_default();
     list.sort_by_key(|r| r.name.to_lowercase());
-    Ok(list)
+    list
 }
 
 pub fn sha256_hex(path: &Path) -> Result<String> {
@@ -240,25 +240,17 @@ pub struct JobStatus {
     pub phase: Phase,
 }
 
-#[derive(Default)]
-enum Catalog {
-    #[default]
-    NotAsked,
-    Loading,
-    Ready(Vec<Region>),
-    Failed(String),
-}
-
 /// The regions on disk, those being downloaded, and the loaded indexes.
 pub struct Library {
     dir: PathBuf,
-    /// Where the manifest and indexes are published (ends in '/').
+    /// Where the indexes are published (ends in '/').
     base: String,
+    /// The countries on offer, by name.
+    catalog: Vec<Region>,
     installed: Mutex<Option<Vec<Installed>>>,
     loaded: Mutex<HashMap<PathBuf, Arc<Index>>>,
     loading: AtomicBool,
     jobs: Mutex<Vec<Arc<Job>>>,
-    catalog: Mutex<Catalog>,
     /// Asks the UI to redraw when something changes in the background.
     repaint: Mutex<Option<eframe::egui::Context>>,
 }
@@ -266,19 +258,19 @@ pub struct Library {
 /// The app's one library.
 pub fn library() -> &'static Library {
     static LIB: OnceLock<Library> = OnceLock::new();
-    LIB.get_or_init(|| Library::new(dir(), base_url()))
+    LIB.get_or_init(|| Library::new(dir(), base_url(), builtin_countries()))
 }
 
 impl Library {
-    pub fn new(dir: PathBuf, base: String) -> Library {
+    pub fn new(dir: PathBuf, base: String, catalog: Vec<Region>) -> Library {
         Library {
             dir,
             base,
+            catalog,
             installed: Mutex::new(None),
             loaded: Mutex::new(HashMap::new()),
             loading: AtomicBool::new(false),
             jobs: Mutex::new(Vec::new()),
-            catalog: Mutex::new(Catalog::NotAsked),
             repaint: Mutex::new(None),
         }
     }
@@ -394,32 +386,9 @@ impl Library {
 
     // ---- The catalog
 
-    /// The regions on offer: `Ok(None)` while they load (asks for them the
-    /// first time), `Err` if they couldn't be fetched.
-    pub fn catalog(&'static self) -> Result<Option<Vec<Region>>, String> {
-        let mut c = self.catalog.lock().unwrap();
-        match &*c {
-            Catalog::Ready(list) => Ok(Some(list.clone())),
-            Catalog::Loading => Ok(None),
-            Catalog::Failed(e) => Err(e.clone()),
-            Catalog::NotAsked => {
-                *c = Catalog::Loading;
-                std::thread::spawn(move || {
-                    let got = fetch_catalog(&self.base);
-                    *self.catalog.lock().unwrap() = match got {
-                        Ok(list) => Catalog::Ready(list),
-                        Err(e) => Catalog::Failed(format!("Could not get the list of countries: {e:#}")),
-                    };
-                    self.repaint();
-                });
-                Ok(None)
-            }
-        }
-    }
-
-    /// Fetch the catalog again next time (after it failed).
-    pub fn retry_catalog(&self) {
-        *self.catalog.lock().unwrap() = Catalog::NotAsked;
+    /// The countries on offer, by name.
+    pub fn catalog(&self) -> &[Region] {
+        &self.catalog
     }
 
     // ---- Downloads
@@ -658,6 +627,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builtin_countries_are_well_formed() {
+        let m: Manifest = serde_json::from_str(COUNTRIES).expect("countries.json parses");
+        assert!(!m.countries.is_empty());
+        let mut ids = std::collections::HashSet::new();
+        for r in &m.countries {
+            assert!(ids.insert(&r.id), "{} twice", r.id);
+            assert_eq!(r.file, file_name(&r.id), "{r:?}");
+            assert!(r.sha256.len() == 64 && r.sha256.chars().all(|c| c.is_ascii_hexdigit()), "{r:?}");
+            assert!(r.bytes > 0 && r.entries > 0 && !r.name.is_empty(), "{r:?}");
+        }
+        assert_eq!(builtin_countries().len(), m.countries.len());
+    }
+
+    /// Against the real release: installs one country from the built-in
+    /// list and searches it. `CLEANCALENDAR_TEST_COUNTRY=netherlands cargo
+    /// test live_release -- --ignored`
+    #[test]
+    #[ignore]
+    fn live_release() {
+        let id = std::env::var("CLEANCALENDAR_TEST_COUNTRY").unwrap_or("monaco".into());
+        let dir = std::env::temp_dir().join(format!("cc-live-{}", uuid::Uuid::new_v4()));
+        let lib: &'static Library = Box::leak(Box::new(Library::new(dir.clone(), PLACES_URL.into(), builtin_countries())));
+        let region = lib.catalog().iter().find(|r| r.id == id).expect("in the built-in list").clone();
+        lib.add(region);
+        wait_for_long(|| !lib.is_downloading());
+        assert!(lib.jobs().is_empty(), "{:?}", lib.jobs());
+        wait_for_long(|| lib.has_regions());
+        let inst = lib.installed();
+        println!("installed {} ({} places, {} bytes)", inst[0].meta.name, inst[0].meta.entries, inst[0].bytes);
+        let found = lib.search(&std::env::var("CLEANCALENDAR_TEST_QUERY").unwrap_or("casino".into()));
+        println!("{found:#?}");
+        assert!(!found.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wait_for_long(mut done: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(300), "timed out");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
     fn words_are_folded() {
         let t: Vec<String> = tokens("Café-de Jaren, Straße ŁÓDŹ 12a").collect();
         assert_eq!(t, ["cafe", "de", "jaren", "strasse", "lodz", "12a"]);
@@ -795,28 +808,22 @@ mod tests {
             updated: "2026-11-14".into(),
             sha256: sha,
         };
-        let manifest = Manifest {
-            countries: vec![
-                region("monaco", "Monaco", sha256_hex(&built).unwrap()),
-                // Its file doesn't match its checksum.
-                region("andorra", "Andorra", "00".repeat(32)),
-            ],
-        };
+        let countries = vec![
+            region("monaco", "Monaco", sha256_hex(&built).unwrap()),
+            // Its file doesn't match its checksum.
+            region("andorra", "Andorra", "00".repeat(32)),
+        ];
         let files = HashMap::from([
-            ("/rel/manifest.json".to_owned(), serde_json::to_vec(&manifest).unwrap()),
             ("/rel/monaco.places".to_owned(), body.clone()),
             ("/rel/andorra.places".to_owned(), body.clone()),
         ]);
         let port = serve(files);
         let dir = tmp.join("installed");
-        let lib: &'static Library = Box::leak(Box::new(Library::new(dir.clone(), format!("http://127.0.0.1:{port}/rel/"))));
+        let mut list = countries;
+        list.sort_by_key(|r| r.name.to_lowercase());
+        let lib: &'static Library = Box::leak(Box::new(Library::new(dir.clone(), format!("http://127.0.0.1:{port}/rel/"), list)));
 
-        let mut catalog = None;
-        wait_for("the manifest", || {
-            catalog = lib.catalog().unwrap();
-            catalog.is_some()
-        });
-        let catalog = catalog.unwrap();
+        let catalog = lib.catalog().to_vec();
         let names: Vec<&str> = catalog.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["Andorra", "Monaco"]);
         assert!(!lib.has_regions());

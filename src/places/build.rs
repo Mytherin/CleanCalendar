@@ -4,8 +4,10 @@
 //! For each country in Geofabrik's catalog (or just those named), the
 //! OpenStreetMap extract is downloaded, read ([`super::osm`]), written as
 //! `<country>.places` in `<dir>`, and deleted again. `manifest.json` in
-//! `<dir>` lists the indexes built so far, with their sizes and checksums;
-//! the files are then attached to a GitHub release as they are.
+//! `<dir>` lists the indexes built so far, with their sizes and checksums.
+//! The `.places` files are then attached to the GitHub release, and the
+//! manifest is copied to `src/places/countries.json`, which the app has
+//! built in.
 //!
 //! Countries already in the manifest are skipped unless `--force` is given,
 //! so an interrupted build picks up where it left off.
@@ -18,7 +20,11 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 use super::index::{self, Meta};
-use super::{download, file_name, http, osm, sha256_hex, Manifest, Region, MANIFEST};
+use super::{download, file_name, http, osm, sha256_hex, Manifest, Region};
+
+/// Lists the indexes built, next to them; copied to `src/places/countries.json`
+/// to build the list into the app.
+pub const MANIFEST: &str = "manifest.json";
 
 /// Where Geofabrik lists its extracts. `CLEANCALENDAR_GEOFABRIK_URL`
 /// points elsewhere (e.g. a mirror).
