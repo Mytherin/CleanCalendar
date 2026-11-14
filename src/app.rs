@@ -806,6 +806,12 @@ impl eframe::App for App {
                 View::Year => views::year(self, ui, &p),
             }
         });
+        // Actions (e.g. finishing a drag-to-create) change what the views
+        // show, but they're applied after the views were drawn this frame.
+        // Draw again right away rather than waiting for the next input.
+        if !self.actions.is_empty() {
+            ctx.request_repaint();
+        }
         self.apply_actions();
         self.editor_popover(ctx, &p);
         self.google_window(ctx, &p);
