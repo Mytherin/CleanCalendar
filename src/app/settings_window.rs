@@ -623,11 +623,18 @@ impl App {
                                     self.status = Some((format!("{e:#}"), true));
                                 }
                             }
-                            // Updating needs the country's download address,
-                            // which comes from the catalog.
-                            let region = lib.catalog().ok().flatten().and_then(|c| c.into_iter().find(|r| r.id == inst.meta.id));
-                            if ui.add_enabled(region.is_some(), egui::Button::new("Update")).on_hover_text("Download the latest map data").clicked() {
-                                lib.add(region.unwrap());
+                            // Offered once a newer build is published.
+                            let newer = lib
+                                .catalog()
+                                .ok()
+                                .flatten()
+                                .and_then(|c| c.into_iter().find(|r| r.id == inst.meta.id && r.updated > inst.meta.updated));
+                            let hover = match &newer {
+                                Some(r) => format!("Download the map data of {}", r.updated),
+                                None => "This is the latest map data".to_owned(),
+                            };
+                            if ui.add_enabled(newer.is_some(), egui::Button::new("Update")).on_hover_text(hover).clicked() {
+                                lib.add(newer.unwrap());
                             }
                         });
                     });
@@ -652,12 +659,6 @@ impl App {
                                         None => format!("Downloading {}", fmt_bytes(*done)),
                                     },
                                 ),
-                                Phase::Indexing { done, total } => progress(
-                                    ui,
-                                    (*total > 0).then(|| *done as f32 / *total as f32),
-                                    "Indexing…".into(),
-                                ),
-                                Phase::Saving => progress(ui, None, "Saving…".into()),
                                 Phase::Failed(_) => {}
                             }
                         });
@@ -709,6 +710,7 @@ impl App {
                             let row = Vec2::new(ui.available_width(), 30.0);
                             ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
                                 ui.label(&r.name);
+                                ui.label(RichText::new(fmt_bytes(r.bytes)).color(p.secondary).size(11.5));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     let busy = jobs.iter().any(|j| j.region.id == r.id && !matches!(j.phase, Phase::Failed(_)));
                                     let have = installed.iter().any(|i| i.meta.id == r.id);
@@ -726,9 +728,9 @@ impl App {
         ui.add_space(4.0);
         ui.label(
             RichText::new(
-                "Map data © OpenStreetMap contributors (Open Database License), downloaded from Geofabrik, \
-                 which learns only which countries you pick. The download can be large (1.4 GB for the \
-                 Netherlands), but only a small index of it is kept (7 MB for the Netherlands).",
+                "Map data © OpenStreetMap contributors (Open Database License). Each country is a \
+                 small download from CleanCalendar's releases on GitHub, which learns only which \
+                 countries you pick.",
             )
             .color(p.secondary)
             .size(11.0),

@@ -9,31 +9,37 @@
 //! The editor also offers to open a location in Google Maps, which is just a
 //! link the user chooses to follow.
 
+#[cfg(feature = "build-places")]
+pub mod build;
 pub mod index;
+#[cfg(feature = "build-places")]
 pub mod osm;
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use index::{Index, Meta, Query};
 
-/// Where Geofabrik lists its extracts. `CLEANCALENDAR_GEOFABRIK_URL`
-/// points elsewhere (e.g. a mirror).
-const CATALOG: &str = "https://download.geofabrik.de/index-v1-nogeom.json";
-const CATALOG_ENV: &str = "CLEANCALENDAR_GEOFABRIK_URL";
+/// Where the prebuilt country indexes are published: the files of a GitHub
+/// release, with `manifest.json` listing them. `CLEANCALENDAR_PLACES_URL`
+/// points elsewhere (e.g. a test server).
+const PLACES_URL: &str = "https://github.com/Mytherin/CleanCalendar/releases/download/v0.1/";
+const PLACES_ENV: &str = "CLEANCALENDAR_PLACES_URL";
+pub const MANIFEST: &str = "manifest.json";
 /// No personal details, just the app.
 const USER_AGENT: &str = concat!("CleanCalendar/", env!("CARGO_PKG_VERSION"));
-const EXT: &str = "places";
+pub const EXT: &str = "places";
 pub const MAX_SUGGESTIONS: usize = 6;
 
 // ---------------------------------------------------------------------------
@@ -118,62 +124,59 @@ pub fn google_maps_url(location: &str) -> String {
 // ---------------------------------------------------------------------------
 // Regions on offer
 
-/// A country Geofabrik has an extract of.
-#[derive(Clone, Debug, PartialEq)]
+/// A country whose prebuilt index is published, as `manifest.json` lists it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Region {
-    /// "netherlands", "us", …
+    /// Geofabrik's id: "netherlands", "us", …
     pub id: String,
     pub name: String,
-    /// Added to towns' suggestions ("Utrecht, Netherlands"); empty for a
-    /// file covering several countries ("Haiti and Dominican Republic").
-    pub country: String,
-    pub number_first: bool,
-    pub pbf: String,
+    /// The index's file name next to the manifest.
+    pub file: String,
+    pub bytes: u64,
+    pub entries: u64,
+    /// When the map data was downloaded (YYYY-MM-DD).
+    pub updated: String,
+    /// Of the file, hex; checked after downloading.
+    pub sha256: String,
 }
 
-/// Countries that write the house number before the street.
-const NUMBER_FIRST: &[&str] = &["US", "CA", "GB", "IE", "AU", "NZ", "FR", "LU", "MC", "IN", "PH", "ZA", "SG", "MY", "HK", "TH", "IL"];
-
-/// The countries in Geofabrik's catalog, sorted by name. Only whole
-/// countries are offered (the entries with a country code), not continents
-/// or a country's states and provinces.
-pub fn parse_catalog(json: &Value) -> Vec<Region> {
-    let mut out: Vec<Region> = json["features"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|f| {
-            let p = &f["properties"];
-            let id = p["id"].as_str()?;
-            let codes: Vec<&str> = p["iso3166-1:alpha2"].as_array()?.iter().filter_map(Value::as_str).collect();
-            let pbf = p["urls"]["pbf"].as_str()?;
-            let name = p["name"].as_str().unwrap_or(id);
-            (!codes.is_empty()).then(|| Region {
-                id: id.to_owned(),
-                name: name.to_owned(),
-                country: if codes.len() == 1 { name.to_owned() } else { String::new() },
-                number_first: codes.iter().any(|c| NUMBER_FIRST.contains(c)),
-                pbf: pbf.to_owned(),
-            })
-        })
-        .collect();
-    out.sort_by_key(|r| r.name.to_lowercase());
-    out
+/// The list of published countries.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub countries: Vec<Region>,
 }
 
 fn http() -> Result<reqwest::blocking::Client> {
-    // No overall timeout: a country can take a while to download.
+    // No overall timeout: a big country can take a while to download.
     Ok(reqwest::blocking::Client::builder().user_agent(USER_AGENT).connect_timeout(Duration::from_secs(20)).build()?)
 }
 
-fn fetch_catalog() -> Result<Vec<Region>> {
-    let url = std::env::var(CATALOG_ENV).ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| CATALOG.into());
-    let json: Value = http()?.get(url).timeout(Duration::from_secs(60)).send()?.error_for_status()?.json()?;
-    let regions = parse_catalog(&json);
-    if regions.is_empty() {
-        bail!("the list of regions is empty");
+/// `base` with a trailing slash, so file names join onto it.
+fn base_url() -> String {
+    let base = std::env::var(PLACES_ENV).ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| PLACES_URL.into());
+    if base.ends_with('/') {
+        base
+    } else {
+        format!("{base}/")
     }
-    Ok(regions)
+}
+
+fn fetch_catalog(base: &str) -> Result<Vec<Region>> {
+    let url = format!("{base}{MANIFEST}");
+    let manifest: Manifest = http()?.get(url).timeout(Duration::from_secs(60)).send()?.error_for_status()?.json()?;
+    let mut list = manifest.countries;
+    if list.is_empty() {
+        bail!("no countries are published yet");
+    }
+    list.sort_by_key(|r| r.name.to_lowercase());
+    Ok(list)
+}
+
+pub fn sha256_hex(path: &Path) -> Result<String> {
+    let mut f = File::open(path)?;
+    let mut h = Sha256::new();
+    std::io::copy(&mut f, &mut h)?;
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +194,7 @@ pub fn dir() -> PathBuf {
     }
 }
 
-fn file_name(id: &str) -> String {
+pub fn file_name(id: &str) -> String {
     format!("{}.{EXT}", id.replace(['/', '\\'], "_"))
 }
 
@@ -207,8 +210,6 @@ pub struct Installed {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Phase {
     Downloading { done: u64, total: Option<u64> },
-    Indexing { done: usize, total: usize },
-    Saving,
     Failed(String),
 }
 
@@ -217,10 +218,6 @@ struct Job {
     cancel: AtomicBool,
     downloaded: AtomicU64,
     size: AtomicU64,
-    blocks_done: AtomicUsize,
-    blocks_total: AtomicUsize,
-    /// 0 downloading, 1 indexing, 2 saving.
-    stage: AtomicUsize,
     failed: Mutex<Option<String>>,
 }
 
@@ -229,17 +226,8 @@ impl Job {
         if let Some(e) = self.failed.lock().unwrap().clone() {
             return Phase::Failed(e);
         }
-        match self.stage.load(Ordering::Relaxed) {
-            0 => {
-                let size = self.size.load(Ordering::Relaxed);
-                Phase::Downloading { done: self.downloaded.load(Ordering::Relaxed), total: (size > 0).then_some(size) }
-            }
-            1 => Phase::Indexing {
-                done: self.blocks_done.load(Ordering::Relaxed),
-                total: self.blocks_total.load(Ordering::Relaxed),
-            },
-            _ => Phase::Saving,
-        }
+        let size = self.size.load(Ordering::Relaxed);
+        Phase::Downloading { done: self.downloaded.load(Ordering::Relaxed), total: (size > 0).then_some(size) }
     }
 }
 
@@ -262,6 +250,8 @@ enum Catalog {
 /// The regions on disk, those being downloaded, and the loaded indexes.
 pub struct Library {
     dir: PathBuf,
+    /// Where the manifest and indexes are published (ends in '/').
+    base: String,
     installed: Mutex<Option<Vec<Installed>>>,
     loaded: Mutex<HashMap<PathBuf, Arc<Index>>>,
     loading: AtomicBool,
@@ -274,13 +264,14 @@ pub struct Library {
 /// The app's one library.
 pub fn library() -> &'static Library {
     static LIB: OnceLock<Library> = OnceLock::new();
-    LIB.get_or_init(|| Library::new(dir()))
+    LIB.get_or_init(|| Library::new(dir(), base_url()))
 }
 
 impl Library {
-    pub fn new(dir: PathBuf) -> Library {
+    pub fn new(dir: PathBuf, base: String) -> Library {
         Library {
             dir,
+            base,
             installed: Mutex::new(None),
             loaded: Mutex::new(HashMap::new()),
             loading: AtomicBool::new(false),
@@ -412,10 +403,10 @@ impl Library {
             Catalog::NotAsked => {
                 *c = Catalog::Loading;
                 std::thread::spawn(move || {
-                    let got = fetch_catalog();
+                    let got = fetch_catalog(&self.base);
                     *self.catalog.lock().unwrap() = match got {
                         Ok(list) => Catalog::Ready(list),
-                        Err(e) => Catalog::Failed(format!("Could not get the list of regions: {e:#}")),
+                        Err(e) => Catalog::Failed(format!("Could not get the list of countries: {e:#}")),
                     };
                     self.repaint();
                 });
@@ -435,7 +426,7 @@ impl Library {
         self.jobs.lock().unwrap().iter().map(|j| JobStatus { region: j.region.clone(), phase: j.phase() }).collect()
     }
 
-    /// Downloads and indexes `region` (again, if it's already installed).
+    /// Downloads and installs `region` (again, if it's already installed).
     pub fn add(&'static self, region: Region) {
         let mut jobs = self.jobs.lock().unwrap();
         if jobs.iter().any(|j| j.region.id == region.id && j.failed.lock().unwrap().is_none()) {
@@ -447,9 +438,6 @@ impl Library {
             cancel: AtomicBool::new(false),
             downloaded: AtomicU64::new(0),
             size: AtomicU64::new(0),
-            blocks_done: AtomicUsize::new(0),
-            blocks_total: AtomicUsize::new(0),
-            stage: AtomicUsize::new(0),
             failed: Mutex::new(None),
         });
         jobs.push(job.clone());
@@ -492,36 +480,35 @@ impl Library {
     fn run(&self, job: &Job) -> Result<()> {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
         let target = self.dir.join(file_name(&job.region.id));
-        let pbf = target.with_extension("osm.pbf.part");
-        let result = self.download_and_index(job, &pbf, &target);
-        let _ = std::fs::remove_file(&pbf);
+        let part = target.with_extension("part");
+        let result = self.download_and_install(job, &part, &target);
+        let _ = std::fs::remove_file(&part);
         result
     }
 
-    fn download_and_index(&self, job: &Job, pbf: &Path, target: &Path) -> Result<()> {
-        download(&job.region.pbf, pbf, &job.downloaded, &job.size, &job.cancel)?;
-        job.stage.store(1, Ordering::Relaxed);
-        let progress = osm::Progress { done: &job.blocks_done, total: &job.blocks_total, cancel: &job.cancel };
-        let records = osm::read(pbf, &progress).context("reading the map data")?;
-        if job.cancel.load(Ordering::Relaxed) {
-            bail!("cancelled");
+    fn download_and_install(&self, job: &Job, part: &Path, target: &Path) -> Result<()> {
+        let r = &job.region;
+        // The manifest only names files next to it.
+        if r.file.contains(['/', '\\']) || r.file.starts_with('.') {
+            bail!("bad file name in the manifest: {}", r.file);
         }
-        job.stage.store(2, Ordering::Relaxed);
-        let meta = Meta {
-            id: job.region.id.clone(),
-            name: job.region.name.clone(),
-            country: job.region.country.clone(),
-            number_first: job.region.number_first,
-            updated: chrono::Local::now().date_naive().to_string(),
-            entries: 0,
-        };
-        // Replacing an installed region: let go of the loaded copy first.
+        download(&format!("{}{}", self.base, r.file), part, &job.downloaded, &job.size, &job.cancel)?;
+        if !sha256_hex(part)?.eq_ignore_ascii_case(&r.sha256) {
+            bail!("the download of {} was damaged; please try again", r.name);
+        }
+        let meta = index::read_meta(part).context("reading the downloaded index")?;
+        if meta.id != r.id {
+            bail!("the download of {} holds {} instead", r.name, meta.name);
+        }
+        // Replacing an installed country: let go of the loaded copy first.
         self.loaded.lock().unwrap().remove(target);
-        index::write(target, meta, records).context("saving the index")
+        std::fs::rename(part, target).with_context(|| format!("saving {}", target.display()))
     }
 }
 
-fn download(url: &str, to: &Path, done: &AtomicU64, size: &AtomicU64, cancel: &AtomicBool) -> Result<()> {
+/// Downloads `url` to `to`, counting bytes into `done` (of `size`, once
+/// known); stops with an error when `cancel` is set.
+pub fn download(url: &str, to: &Path, done: &AtomicU64, size: &AtomicU64, cancel: &AtomicBool) -> Result<()> {
     let mut resp = http()?.get(url).send()?.error_for_status().with_context(|| format!("downloading {url}"))?;
     size.store(resp.content_length().unwrap_or(0), Ordering::Relaxed);
     let mut out = std::io::BufWriter::new(File::create(to).with_context(|| format!("creating {}", to.display()))?);
@@ -530,11 +517,11 @@ fn download(url: &str, to: &Path, done: &AtomicU64, size: &AtomicU64, cancel: &A
         if cancel.load(Ordering::Relaxed) {
             bail!("cancelled");
         }
-        let n = resp.read(&mut buf).context("downloading the map data")?;
+        let n = resp.read(&mut buf).context("downloading")?;
         if n == 0 {
             break;
         }
-        out.write_all(&buf[..n]).context("saving the map data (is the disk full?)")?;
+        out.write_all(&buf[..n]).context("saving the download (is the disk full?)")?;
         done.fetch_add(n as u64, Ordering::Relaxed);
     }
     out.flush()?;
@@ -627,7 +614,6 @@ impl Lookup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn words_are_folded() {
@@ -644,36 +630,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_lists_only_countries() {
-        let f = |id: &str, name: &str, iso: &[&str]| {
-            let mut p = json!({"id": id, "name": name, "urls": {"pbf": format!("https://x/{id}.osm.pbf")}});
-            if !iso.is_empty() {
-                p["iso3166-1:alpha2"] = json!(iso);
-            }
-            json!({"properties": p})
-        };
-        let json = json!({"features": [
-            f("europe", "Europe", &[]),
-            f("netherlands", "Netherlands", &["NL"]),
-            f("us", "United States of America", &["US"]),
-            f("us/california", "California", &[]),
-            f("bayern", "Bayern", &[]),
-            f("haiti-and-domrep", "Haiti and Dominican Republic", &["HT", "DO"]),
-        ]});
-        let got = parse_catalog(&json);
-        let rows: Vec<(&str, &str, bool)> = got.iter().map(|r| (r.name.as_str(), r.country.as_str(), r.number_first)).collect();
-        assert_eq!(
-            rows,
-            [
-                // Two countries in one file: towns don't get a country name.
-                ("Haiti and Dominican Republic", "", false),
-                ("Netherlands", "Netherlands", false),
-                ("United States of America", "United States of America", true),
-            ]
-        );
-    }
-
-    #[test]
     fn lookup_waits_for_enough_text() {
         let mut l = Lookup::default();
         l.typed("a");
@@ -682,88 +638,122 @@ mod tests {
         assert_eq!(l.pending.as_ref().map(|(t, _)| t.as_str()), Some("am"));
     }
 
-    /// The whole path against the real Geofabrik: the catalog, then a
-    /// download of Monaco (under 1 MB), indexing, and a search.
-    /// `cargo test geofabrik_download -- --ignored`
-    #[test]
-    #[ignore]
-    fn geofabrik_download() {
-        let dir = std::env::temp_dir().join(format!("cc-places-{}", uuid::Uuid::new_v4()));
-        let lib: &'static Library = Box::leak(Box::new(Library::new(dir.clone())));
-        let catalog = loop {
-            match lib.catalog() {
-                Ok(Some(c)) => break c,
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => panic!("{e}"),
+    /// Serves `files` (path -> body) over HTTP on a local port, until the
+    /// test ends; answers 404 for anything else.
+    fn serve(files: HashMap<String, Vec<u8>>) -> u16 {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                // Skip the headers.
+                let mut header = String::new();
+                while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                    header.clear();
+                }
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let mut stream = stream;
+                match files.get(&path) {
+                    Some(body) => {
+                        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(body);
+                    }
+                    None => {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                }
             }
-        };
-        assert!((150..300).contains(&catalog.len()), "{} countries", catalog.len());
-        // Countries (and territories with their own code, like Puerto Rico),
-        // not states or provinces.
-        assert!(catalog.iter().any(|r| r.id == "us"));
-        assert!(!catalog.iter().any(|r| r.id == "us/california" || r.id == "bayern"));
-        let monaco = catalog.iter().find(|r| r.id == "monaco").unwrap().clone();
-        assert_eq!((monaco.name.as_str(), monaco.country.as_str(), monaco.number_first), ("Monaco", "Monaco", true));
-        assert!(!lib.has_regions());
-        lib.add(monaco);
+        });
+        port
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
         let start = Instant::now();
-        while lib.is_downloading() {
-            assert!(start.elapsed() < Duration::from_secs(120), "{:?}", lib.jobs());
-            std::thread::sleep(Duration::from_millis(100));
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(30), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(lib.jobs().is_empty(), "{:?}", lib.jobs());
-        // The job's thread rescans just after it leaves the list.
-        while !lib.has_regions() {
-            assert!(start.elapsed() < Duration::from_secs(120));
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    }
+
+    /// The app's whole path against a stand-in for the GitHub release: the
+    /// manifest, a download that is checked and installed, a damaged one
+    /// that is refused, a search, and removing a country.
+    #[test]
+    fn installs_published_countries() {
+        use index::{Kind, Meta, Record};
+        let tmp = std::env::temp_dir().join(format!("cc-places-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let built = tmp.join("monaco.places");
+        let meta = Meta { id: "monaco".into(), name: "Monaco".into(), country: "Monaco".into(), number_first: true, ..Default::default() };
+        let casino = Record {
+            kind: Kind::Poi,
+            name: "Casino de Monte-Carlo".into(),
+            street: "Place du Casino".into(),
+            number: "2".into(),
+            city: "Monaco".into(),
+        };
+        index::write(&built, meta, vec![casino]).unwrap();
+        let body = std::fs::read(&built).unwrap();
+        let region = |id: &str, name: &str, sha: String| Region {
+            id: id.into(),
+            name: name.into(),
+            file: format!("{id}.places"),
+            bytes: body.len() as u64,
+            entries: 1,
+            updated: "2026-11-14".into(),
+            sha256: sha,
+        };
+        let manifest = Manifest {
+            countries: vec![
+                region("monaco", "Monaco", sha256_hex(&built).unwrap()),
+                // Its file doesn't match its checksum.
+                region("andorra", "Andorra", "00".repeat(32)),
+            ],
+        };
+        let files = HashMap::from([
+            ("/rel/manifest.json".to_owned(), serde_json::to_vec(&manifest).unwrap()),
+            ("/rel/monaco.places".to_owned(), body.clone()),
+            ("/rel/andorra.places".to_owned(), body.clone()),
+        ]);
+        let port = serve(files);
+        let dir = tmp.join("installed");
+        let lib: &'static Library = Box::leak(Box::new(Library::new(dir.clone(), format!("http://127.0.0.1:{port}/rel/"))));
+
+        let mut catalog = None;
+        wait_for("the manifest", || {
+            catalog = lib.catalog().unwrap();
+            catalog.is_some()
+        });
+        let catalog = catalog.unwrap();
+        let names: Vec<&str> = catalog.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Andorra", "Monaco"]);
+        assert!(!lib.has_regions());
+
+        lib.add(catalog[1].clone());
+        wait_for("Monaco to install", || lib.has_regions() && !lib.is_downloading());
         let inst = lib.installed();
-        assert_eq!(inst[0].meta.name, "Monaco");
-        assert!(inst[0].meta.entries > 500 && inst[0].bytes < 200_000, "{inst:?}");
-        let found = lib.search("casino");
-        assert!(found.iter().any(|s| s.title.contains("Casino")), "{found:?}");
-        // Nothing else is left behind.
+        assert_eq!((inst[0].meta.name.as_str(), inst[0].meta.entries), ("Monaco", 1));
+        let found: Vec<String> = lib.search("casino").iter().map(Suggestion::label).collect();
+        assert_eq!(found, ["Casino de Monte-Carlo, 2 Place du Casino, Monaco"]);
+
+        lib.add(catalog[0].clone());
+        wait_for("Andorra to fail", || matches!(lib.jobs().first().map(|j| j.phase.clone()), Some(Phase::Failed(_))));
+        let Phase::Failed(e) = lib.jobs()[0].phase.clone() else { unreachable!() };
+        assert!(e.contains("damaged"), "{e}");
+        lib.cancel("andorra");
+        assert!(lib.jobs().is_empty());
+
+        // Only the installed index is left: no partial downloads.
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(files, ["monaco.places"]);
         lib.remove(&inst[0]).unwrap();
         assert!(!lib.has_regions());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Builds an index from a real extract and times a few searches:
-    /// `CLEANCALENDAR_TEST_PBF=monaco-latest.osm.pbf cargo test real_extract -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn real_extract() {
-        let pbf = PathBuf::from(std::env::var("CLEANCALENDAR_TEST_PBF").expect("set CLEANCALENDAR_TEST_PBF"));
-        let (done, total, cancel) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicBool::new(false));
-        let t = Instant::now();
-        let records = osm::read(&pbf, &osm::Progress { done: &done, total: &total, cancel: &cancel }).unwrap();
-        let read = t.elapsed();
-        let mut kinds: HashMap<index::Kind, usize> = HashMap::new();
-        for r in &records {
-            *kinds.entry(r.kind).or_default() += 1;
-        }
-        let out = std::env::temp_dir().join(format!("cc-test-{}.places", uuid::Uuid::new_v4()));
-        let t = Instant::now();
-        let n = records.len();
-        index::write(&out, Meta { id: "test".into(), name: "Test".into(), country: "Test".into(), ..Default::default() }, records).unwrap();
-        let wrote = t.elapsed();
-        let size = std::fs::metadata(&out).unwrap().len();
-        let t = Instant::now();
-        let idx = Index::load(&out).unwrap();
-        let loaded = t.elapsed();
-        println!("records: {n} {kinds:?}");
-        println!("read {read:?}, wrote {wrote:?}, loaded {loaded:?}");
-        println!("pbf {} bytes -> index {size} bytes", std::fs::metadata(&pbf).unwrap().len());
-        for q in std::env::var("CLEANCALENDAR_TEST_QUERIES").unwrap_or("monte carlo,casino,boulevard,ams,rijksmuseum,damrak 70,utrecht cen".into()).split(',') {
-            let t = Instant::now();
-            let hits = idx.search(&Query::parse(q), MAX_SUGGESTIONS);
-            println!("{q:?} ({:?}):", t.elapsed());
-            for h in hits {
-                println!("    {}", h.suggestion.label());
-            }
-        }
-        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
