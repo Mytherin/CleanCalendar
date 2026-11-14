@@ -492,7 +492,24 @@ pub fn download(
     size: &AtomicU64,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let mut resp = http()?.get(url).send()?.error_for_status().with_context(|| format!("downloading {url}"))?;
+    // Short messages for the Settings window; the URL isn't one the user
+    // can do anything with.
+    let mut resp = http()?.get(url).send().map_err(|e| {
+        anyhow!(if e.is_timeout() {
+            "Could not download: the connection timed out."
+        } else if e.is_connect() {
+            "Could not download: no connection to the server. Are you online?"
+        } else {
+            "Could not download: the connection failed."
+        })
+    })?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        bail!("Could not download: this country's location data isn't published yet.");
+    }
+    if !status.is_success() {
+        bail!("Could not download: the server answered {status}.");
+    }
     size.store(resp.content_length().unwrap_or(0), Ordering::Relaxed);
     let mut out = std::io::BufWriter::new(File::create(to).with_context(|| format!("creating {}", to.display()))?);
     let mut buf = vec![0u8; 1 << 16];
@@ -812,6 +829,8 @@ mod tests {
             region("monaco", "Monaco", sha256_hex(&built).unwrap()),
             // Its file doesn't match its checksum.
             region("andorra", "Andorra", "00".repeat(32)),
+            // Not on the server at all.
+            region("liechtenstein", "Liechtenstein", "00".repeat(32)),
         ];
         let files = HashMap::from([
             ("/rel/monaco.places".to_owned(), body.clone()),
@@ -825,10 +844,10 @@ mod tests {
 
         let catalog = lib.catalog().to_vec();
         let names: Vec<&str> = catalog.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["Andorra", "Monaco"]);
+        assert_eq!(names, ["Andorra", "Liechtenstein", "Monaco"]);
         assert!(!lib.has_regions());
 
-        lib.add(catalog[1].clone());
+        lib.add(catalog[2].clone());
         wait_for("Monaco to install", || lib.has_regions() && !lib.is_downloading());
         let inst = lib.installed();
         assert_eq!((inst[0].meta.name.as_str(), inst[0].meta.entries), ("Monaco", 1));
@@ -841,6 +860,13 @@ mod tests {
         assert!(e.contains("damaged"), "{e}");
         lib.cancel("andorra");
         assert!(lib.jobs().is_empty());
+
+        // A short message, without the URL, for the Settings window.
+        lib.add(catalog[1].clone());
+        wait_for("Liechtenstein to fail", || matches!(lib.jobs().first().map(|j| j.phase.clone()), Some(Phase::Failed(_))));
+        let Phase::Failed(e) = lib.jobs()[0].phase.clone() else { unreachable!() };
+        assert_eq!(e, "Could not download: this country's location data isn't published yet.");
+        lib.cancel("liechtenstein");
 
         // Only the installed index is left: no partial downloads.
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
