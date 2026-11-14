@@ -879,6 +879,39 @@ mod tests {
         assert_eq!(rows(&dir.paths().cache, "events"), ["b"]);
     }
 
+    /// Imports a real `store.json` (a copy is made; the original is not
+    /// touched) and checks that reopening gives back exactly what it held:
+    /// `CLEANCALENDAR_IMPORT_CHECK=/path/to/store.json cargo test import_check -- --ignored`
+    #[test]
+    #[ignore]
+    fn import_check() {
+        let src = std::env::var_os("CLEANCALENDAR_IMPORT_CHECK").expect("set CLEANCALENDAR_IMPORT_CHECK");
+        let expected: Store = serde_json::from_str(&std::fs::read_to_string(&src).unwrap()).unwrap();
+        let dir = TempDir::new();
+        std::fs::copy(&src, dir.paths().legacy_json).unwrap();
+        drop(open(&dir.paths()));
+        let got = open(&dir.paths());
+
+        assert_eq!(got.calendars, expected.calendars);
+        assert_eq!(sorted(&got.events), sorted(&expected.events));
+        assert_eq!(got.google, expected.google);
+        assert_eq!(got.pending_deletes, expected.pending_deletes);
+        assert_eq!(got.sync_state, expected.sync_state);
+        let p = dir.paths();
+        let (local, outbox, cache) = (rows(&p.data, "events"), rows(&p.data, "outbox"), rows(&p.cache, "events"));
+        println!(
+            "{} calendars, {} events: {} local, {} unsynced, {} cached; {} pending deletes, {} sync tokens",
+            got.calendars.len(),
+            got.events.len(),
+            local.len(),
+            outbox.len(),
+            cache.len(),
+            got.pending_deletes.len(),
+            got.sync_state.len(),
+        );
+        assert_eq!(local.len() + outbox.len() + cache.len(), got.events.len());
+    }
+
     #[test]
     fn a_failed_save_is_retried_by_the_next_one() {
         let dir = TempDir::new();
