@@ -18,7 +18,7 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Settings** (⚙ in the toolbar, or Ctrl+,), laid out like macOS Calendar's:
   - *General:* 5 or 7 days per week, the first day of the week (or the Windows region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar, and whether to show Google's birthdays and holidays calendars.
   - *Accounts:* add (+) or remove (−) the Google account, switch it off, give it a name, and choose how often it refreshes (every minute to hourly, or manually).
-  - *Advanced:* shade busy days in the year view, and show week numbers in the week and month views.
+  - *Advanced:* shade busy days in the year view, show week numbers in the week and month views, and how much of the past to keep from synced calendars (all of it by default, or the last 5 years, 2 years, 1 year or 6 months).
 - **Invitees:** on Google calendars, type addresses into "Add Invitees" (Enter, comma or semicolon adds one). Google emails the invitations, updates and cancellations, and each guest's reply (accepted, maybe, declined, no response) is shown next to their name.
 - **iCloud and CalDAV** (the **Accounts** button in the toolbar): sign in with your Apple ID and an app-specific password (or any CalDAV server: Fastmail, Nextcloud, Radicale, …). All your calendars are imported, Reminders lists are skipped, and creates, edits, moves and deletes go back to the server. Repeating events from other apps show every occurrence, whatever their rule.
 - **Several accounts at once:** iCloud, other CalDAV servers and Google side by side, each in its own group in the sidebar.
@@ -82,7 +82,7 @@ Every account, whatever the service, goes through the same sync engine (`src/syn
 - **Changes from elsewhere** (phone, web, other people) are pulled on launch, every 5 minutes (change it under Settings → Accounts → Refresh Calendars), and when you press ⟳.
   After the first full download, each calendar syncs incrementally (Google's sync tokens; CalDAV's `sync-collection` report, RFC 6578), so only changed events are fetched.
   A full re-download runs weekly, when the server expires a token, or after it rejects a change.
-  The full download covers 6 months back to 12 months ahead.
+  The full download covers all past events (or as far back as **Settings → Advanced → Keep past events** says) up to the end of the 13th month ahead; repeating events are kept as their occurrences, so they need an end. Changing that setting downloads everything again.
 - **Conflicts:** every upload says which version of the event it was based on (its `etag`, sent as `If-Match`), so an edit can never silently overwrite a newer change made elsewhere. Instead:
   - **Both sides edited the event:** the edits are merged field by field (title, location, notes, time). If both changed the same field, your edit wins and the app tells you.
   - **An edit always beats a delete.** If you edit an event that was deleted elsewhere, your version is recreated. If you delete an event that was edited elsewhere, it isn't deleted and comes back with their change.

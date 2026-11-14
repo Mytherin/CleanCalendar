@@ -389,6 +389,9 @@ pub struct SyncState {
     pub token: Option<String>,
     /// When the last full sync happened.
     pub full_sync_on: Option<NaiveDate>,
+    /// The first day the last full sync fetched (see [`crate::sync::window`]).
+    #[serde(default)]
+    pub window_from: Option<NaiveDate>,
 }
 
 /// Everything the app shows and syncs. `Deserialize` is only for importing
