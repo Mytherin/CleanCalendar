@@ -246,9 +246,17 @@ pub fn parse_bytes(data: &[u8]) -> Result<Component> {
 }
 
 pub fn parse(text: &str) -> Result<Component> {
+    // Some servers indent the whole block inside their XML replies. Real
+    // content lines never start with whitespace, so an indent shared by
+    // every line (BEGIN:VCALENDAR's included) is layout: take it off first.
+    let first = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).find(|l| !l.trim().is_empty());
+    let indent: &str = first.map_or("", |l| &l[..l.len() - l.trim_start().len()]);
+    let uniform = !indent.is_empty()
+        && text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).all(|l| l.trim().is_empty() || l.starts_with(indent));
     let mut lines: Vec<String> = Vec::new();
     for raw in text.split('\n') {
         let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        let raw = if uniform { raw.strip_prefix(indent).unwrap_or(raw) } else { raw };
         if let Some(cont) = raw.strip_prefix([' ', '\t']) {
             if let Some(last) = lines.last_mut() {
                 last.push_str(cont);
