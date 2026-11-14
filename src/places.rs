@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn one_suggestion_search_runs_at_a_time_and_the_latest_text_goes_next() {
         let dir = std::env::temp_dir().join(format!("cc-lookup-{}", uuid::Uuid::new_v4()));
-        let lib: &'static Library = Box::leak(Box::new(Library::new(dir, "http://127.0.0.1:1/".into())));
+        let lib: &'static Library = Box::leak(Box::new(Library::new(dir, "http://127.0.0.1:1/".into(), builtin_countries())));
         let ctx = eframe::egui::Context::default();
         let mut l = Lookup::default();
         // Hold the answers back, to control when a search "finishes".
