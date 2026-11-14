@@ -2,10 +2,8 @@
 //! PKCE), the Calendar v3 REST API, and a background worker thread so the UI
 //! never blocks on the network.
 
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration as StdDuration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -19,6 +17,17 @@ use url::Url;
 
 use crate::model::Event;
 use crate::recurrence;
+#[cfg(test)]
+use crate::remote::{classify, run, sync_all, Cmd, Connections, Failure, Login, Msg, GOOGLE};
+#[cfg(test)]
+use std::collections::HashMap;
+
+/// A worker's connections for tests, against these endpoints.
+#[cfg(test)]
+pub fn test_conns(endpoints: &Endpoints) -> Connections {
+    Connections::new(endpoints.clone(), Box::new(|_: &str| panic!("tests never open a browser")))
+}
+use crate::remote::{http_status, CalRef, CalendarChanges, HttpError, Query, Remote, RemoteCalendar, TokenExpired};
 
 /// Where sign-in, token, and Calendar API requests go.
 #[derive(Clone, Debug, PartialEq)]
@@ -62,259 +71,42 @@ impl Endpoints {
 const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 const LOGIN_TIMEOUT: StdDuration = StdDuration::from_secs(300);
 
-#[derive(Clone, Debug)]
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Creds {
     pub client_id: String,
     pub client_secret: String,
     pub refresh_token: String,
 }
 
-#[derive(Clone, Debug)]
-pub struct RemoteCalendar {
-    pub id: String,
-    pub name: String,
-    pub color: [u8; 3],
-    pub read_only: bool,
-    pub primary: bool,
+fn google_error(status: u16, message: String) -> anyhow::Error {
+    HttpError { service: "Google", status, message }.into()
 }
 
-/// Commands sent from the UI to the worker.
-pub enum Cmd {
-    Connect {
-        client_id: String,
-        client_secret: String,
-    },
-    /// Fetch the calendar list, then changes for each calendar: incremental
-    /// when `tokens` has a sync token for it, otherwise everything in
-    /// [`from`, `to`).
-    Sync {
-        creds: Creds,
-        from: NaiveDate,
-        to: NaiveDate,
-        tokens: HashMap<String, String>,
-    },
-    Save {
-        creds: Creds,
-        google_calendar_id: String,
-        event: Event,
-    },
-    Delete {
-        creds: Creds,
-        google_calendar_id: String,
-        remote_id: String,
-        /// Only delete this version; `None` deletes unconditionally.
-        etag: Option<String>,
-    },
-}
-
-/// What one calendar's sync returned.
-pub struct CalendarChanges {
-    pub calendar_id: String,
-    /// `true`: `events` is the complete set for the sync window.
-    /// `false`: `events` and `cancelled` are only what changed.
-    pub full: bool,
-    pub events: Vec<Event>,
-    /// Remote ids of deleted events (or deleted recurring series).
-    pub cancelled: Vec<String>,
-    pub next_token: Option<String>,
-}
-
-/// How an upload failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Failure {
-    /// Offline, rate-limited, or a server error: try again later.
-    Retry,
-    /// The event no longer exists on Google.
-    Gone,
-    /// Google refused the change; retrying won't help.
-    Rejected,
-}
-
-/// Results sent from the worker back to the UI.
-pub enum Msg {
-    Connected { refresh_token: String },
-    ConnectFailed(String),
-    Synced { calendars: Vec<RemoteCalendar>, changes: Vec<CalendarChanges> },
-    SyncFailed(String),
-    Saved { local_id: String, google_calendar_id: String, rev: u64, remote_id: String, etag: Option<String> },
-    SaveFailed { local_id: String, google_calendar_id: String, error: String, kind: Failure },
-    /// The event changed on Google since we last saw it (or was deleted
-    /// there: `server` is `None`). Carries Google's current copy.
-    SaveConflict { local_id: String, server: Option<Event> },
-    Deleted { remote_id: String },
-    DeleteFailed { remote_id: String, google_calendar_id: String, error: String, kind: Failure },
-    /// Someone changed the event after we decided to delete it; nothing
-    /// was deleted. Carries Google's current copy (`None` if it's gone).
-    DeleteConflict { remote_id: String, google_calendar_id: String, server: Option<Event> },
-}
-
-/// A non-success HTTP response from Google.
-#[derive(Debug)]
-struct HttpError {
-    status: u16,
-    message: String,
-}
-
-impl std::fmt::Display for HttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Google returned {}: {}", self.status, self.message)
-    }
-}
-
-impl std::error::Error for HttpError {}
-
-fn http_status(e: &anyhow::Error) -> Option<u16> {
-    e.downcast_ref::<HttpError>().map(|h| h.status)
-}
-
-fn classify(e: &anyhow::Error) -> Failure {
-    match e.downcast_ref::<HttpError>() {
-        // Network errors, timeouts, token refresh problems: transient.
-        None => Failure::Retry,
-        Some(h) => match h.status {
-            404 | 410 => Failure::Gone,
-            401 | 408 | 429 | 500..=599 => Failure::Retry,
-            403 if h.message.to_lowercase().contains("rate limit") => Failure::Retry,
-            _ => Failure::Rejected,
-        },
-    }
-}
-
-pub struct Worker {
-    tx: Sender<Cmd>,
-    pub rx: Receiver<Msg>,
-    pub busy: usize,
-}
-
-impl Worker {
-    pub fn spawn(ctx: eframe::egui::Context, endpoints: Endpoints) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-        let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
-        std::thread::Builder::new()
-            .name("google-sync".into())
-            .spawn(move || {
-                let mut client: Option<Client> = None;
-                let open_browser = |url: &str| open::that(url).context("opening the browser");
-                for cmd in cmd_rx {
-                    let msg = run(&mut client, &endpoints, &open_browser, cmd);
-                    if msg_tx.send(msg).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
-                }
-            })
-            .expect("spawn sync thread");
-        Worker { tx: cmd_tx, rx: msg_rx, busy: 0 }
+impl Remote for Client {
+    fn calendars(&mut self) -> Result<Vec<RemoteCalendar>> {
+        self.list_calendars()
     }
 
-    pub fn send(&mut self, cmd: Cmd) {
-        if self.tx.send(cmd).is_ok() {
-            self.busy += 1;
+    fn events(&mut self, cal: &CalRef, query: Query, _window: (NaiveDate, NaiveDate)) -> Result<CalendarChanges> {
+        match self.list_events(&cal.id, query) {
+            // Google wants a full sync.
+            Err(e) if matches!(query, Query::Changes(_)) && http_status(&e) == Some(410) => Err(TokenExpired.into()),
+            r => r,
         }
     }
-}
 
-fn client_for<'a>(client: &'a mut Option<Client>, endpoints: &Endpoints, creds: Creds) -> &'a mut Client {
-    let stale = client.as_ref().map_or(true, |c| c.creds.refresh_token != creds.refresh_token);
-    if stale {
-        *client = Some(Client::new(creds, endpoints));
+    fn save(&mut self, cal: &CalRef, ev: &Event) -> Result<(String, Option<String>)> {
+        self.save_event(&cal.id, ev)
     }
-    client.as_mut().unwrap()
-}
 
-/// Executes one command; what the worker thread does for each message.
-fn run(
-    client: &mut Option<Client>,
-    endpoints: &Endpoints,
-    open_browser: &dyn Fn(&str) -> Result<()>,
-    cmd: Cmd,
-) -> Msg {
-    let text = |e: anyhow::Error| format!("{e:#}");
-    match cmd {
-        Cmd::Connect { client_id, client_secret } => {
-            match authorize(endpoints, &client_id, &client_secret, open_browser) {
-                Ok(refresh_token) => Msg::Connected { refresh_token },
-                Err(e) => Msg::ConnectFailed(text(e)),
-            }
-        }
-        Cmd::Sync { creds, from, to, tokens } => {
-            match sync_all(client_for(client, endpoints, creds), from, to, &tokens) {
-                Ok((calendars, changes)) => Msg::Synced { calendars, changes },
-                Err(e) => Msg::SyncFailed(text(e)),
-            }
-        }
-        Cmd::Save { creds, google_calendar_id, event } => {
-            let c = client_for(client, endpoints, creds);
-            let failed = |e: anyhow::Error, local_id: String, google_calendar_id: String| Msg::SaveFailed {
-                local_id,
-                google_calendar_id,
-                kind: classify(&e),
-                error: text(e),
-            };
-            match c.save_event(&google_calendar_id, &event) {
-                Ok((remote_id, etag)) => {
-                    Msg::Saved { local_id: event.id, google_calendar_id, rev: event.rev, remote_id, etag }
-                }
-                // Changed on Google since we last saw it: fetch their copy.
-                Err(e) if http_status(&e) == Some(412) => {
-                    let rid = event.remote_id.clone().unwrap_or_default();
-                    match c.get_event(&google_calendar_id, &rid) {
-                        Ok(server) => Msg::SaveConflict { local_id: event.id, server },
-                        Err(e) => failed(e, event.id, google_calendar_id),
-                    }
-                }
-                // Updating an event that was deleted on Google.
-                Err(e) if classify(&e) == Failure::Gone && event.remote_id.is_some() => {
-                    Msg::SaveConflict { local_id: event.id, server: None }
-                }
-                Err(e) => failed(e, event.id, google_calendar_id),
-            }
-        }
-        Cmd::Delete { creds, google_calendar_id, remote_id, etag } => {
-            let c = client_for(client, endpoints, creds);
-            match c.delete_event(&google_calendar_id, &remote_id, etag.as_deref()) {
-                Ok(()) => Msg::Deleted { remote_id },
-                // Changed on Google after we decided to delete it.
-                Err(e) if http_status(&e) == Some(412) => match c.get_event(&google_calendar_id, &remote_id) {
-                    Ok(server) => Msg::DeleteConflict { remote_id, google_calendar_id, server },
-                    Err(e) => Msg::DeleteFailed { remote_id, google_calendar_id, kind: classify(&e), error: text(e) },
-                },
-                Err(e) => Msg::DeleteFailed { remote_id, google_calendar_id, kind: classify(&e), error: text(e) },
-            }
-        }
+    fn fetch(&mut self, cal: &CalRef, remote_id: &str) -> Result<Option<Event>> {
+        self.get_event(&cal.id, remote_id)
     }
-}
 
-fn sync_all(
-    c: &mut Client,
-    from: NaiveDate,
-    to: NaiveDate,
-    tokens: &HashMap<String, String>,
-) -> Result<(Vec<RemoteCalendar>, Vec<CalendarChanges>)> {
-    let calendars = c.list_calendars()?;
-    let mut out = Vec::new();
-    for cal in &calendars {
-        let incremental = match tokens.get(&cal.id) {
-            Some(token) => match c.list_events(&cal.id, Query::Changes(token)) {
-                Ok(changes) => Some(changes),
-                // The token expired: Google wants a full sync.
-                Err(e) if http_status(&e) == Some(410) => None,
-                Err(e) => return Err(e),
-            },
-            None => None,
-        };
-        let changes = match incremental {
-            Some(changes) => changes,
-            None => c.list_events(&cal.id, Query::Window(from, to))?,
-        };
-        out.push(changes);
+    fn delete(&mut self, cal: &CalRef, remote_id: &str, etag: Option<&str>) -> Result<()> {
+        self.delete_event(&cal.id, remote_id, etag)
     }
-    Ok((calendars, out))
-}
-
-enum Query<'a> {
-    Window(NaiveDate, NaiveDate),
-    Changes(&'a str),
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +114,7 @@ enum Query<'a> {
 
 /// Runs the browser sign-in flow and returns a refresh token.
 /// `open_browser` shows the sign-in page (tests drive it over HTTP instead).
-fn authorize(
+pub fn authorize(
     endpoints: &Endpoints,
     client_id: &str,
     client_secret: &str,
@@ -428,7 +220,7 @@ fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
 // ---------------------------------------------------------------------------
 // REST client
 
-struct Client {
+pub struct Client {
     http: reqwest::blocking::Client,
     creds: Creds,
     access: Option<(String, Instant)>,
@@ -438,7 +230,7 @@ struct Client {
 }
 
 impl Client {
-    fn new(creds: Creds, endpoints: &Endpoints) -> Self {
+    pub fn new(creds: Creds, endpoints: &Endpoints) -> Self {
         Client {
             http: reqwest::blocking::Client::builder()
                 .timeout(StdDuration::from_secs(30))
@@ -494,7 +286,7 @@ impl Client {
             .ok()
             .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
             .unwrap_or(body);
-        Err(HttpError { status, message }.into())
+        Err(google_error(status, message))
     }
 
     fn list_calendars(&mut self) -> Result<Vec<RemoteCalendar>> {
@@ -669,11 +461,11 @@ impl Client {
 
 /// Local event id for a Google event, unique per calendar.
 pub fn local_event_id(google_calendar_id: &str, remote_id: &str) -> String {
-    format!("google:{google_calendar_id}:{remote_id}")
+    CalRef::google(google_calendar_id).event_id(remote_id)
 }
 
 pub fn local_calendar_id(google_calendar_id: &str) -> String {
-    format!("google:{google_calendar_id}")
+    CalRef::google(google_calendar_id).local_id()
 }
 
 /// The Google id to request for a new event, derived from its local id
@@ -857,22 +649,6 @@ mod live_tests;
 #[cfg(test)]
 mod failure_tests {
     use super::*;
-
-    fn http(status: u16, message: &str) -> anyhow::Error {
-        HttpError { status, message: message.into() }.into()
-    }
-
-    #[test]
-    fn classifies_failures() {
-        assert_eq!(classify(&anyhow!("connection refused")), Failure::Retry);
-        assert_eq!(classify(&http(503, "Backend Error")), Failure::Retry);
-        assert_eq!(classify(&http(429, "Too Many Requests")), Failure::Retry);
-        assert_eq!(classify(&http(403, "Rate Limit Exceeded")), Failure::Retry);
-        assert_eq!(classify(&http(404, "Not Found")), Failure::Gone);
-        assert_eq!(classify(&http(410, "Deleted")), Failure::Gone);
-        assert_eq!(classify(&http(400, "Bad Request")), Failure::Rejected);
-        assert_eq!(classify(&http(403, "Forbidden")), Failure::Rejected);
-    }
 
     #[test]
     fn parses_cancelled_items() {

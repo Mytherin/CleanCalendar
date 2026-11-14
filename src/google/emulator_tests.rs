@@ -83,7 +83,7 @@ struct App {
     server: Endpoints,
     store: Store,
     engine: SyncEngine,
-    client: Option<Client>,
+    conns: Connections,
     today: NaiveDate,
     /// Unique marker for this test's events.
     tag: String,
@@ -102,10 +102,10 @@ impl App {
         };
         App {
             server: endpoints.clone(),
+            conns: test_conns(&endpoints),
             endpoints,
             store,
             engine: SyncEngine::default(),
-            client: None,
             today: Local::now().date_naive(),
             tag: uuid::Uuid::new_v4().simple().to_string()[..8].to_owned(),
         }
@@ -119,7 +119,7 @@ impl App {
                 break;
             }
             for cmd in cmds {
-                let msg = run(&mut self.client, &self.endpoints, &no_browser, cmd);
+                let msg = run(&mut self.conns, cmd);
                 self.engine.handle(&mut self.store, msg, None, self.today);
             }
         }
@@ -194,10 +194,10 @@ fn sign_in_and_first_sync_import_the_calendars() {
     let mut app = App::signed_in();
     app.sync();
 
-    let mut google: Vec<(&str, bool)> =
-        app.store.calendars.iter().filter_map(|c| Some((c.google_id()?, c.read_only))).collect();
+    let mut google: Vec<(String, bool)> =
+        app.store.calendars.iter().filter_map(|c| Some((c.remote()?.id, c.read_only))).collect();
     google.sort();
-    assert_eq!(google, [(USER, false), (WORK, false)]);
+    assert_eq!(google, [(USER.to_owned(), false), (WORK.to_owned(), false)]);
     assert_eq!(app.store.google.account_email.as_deref(), Some(USER));
     // The emulator doesn't implement sync tokens, so each sync stays a full one.
     assert_eq!(app.store.sync_state[USER].token, None);
@@ -297,16 +297,16 @@ fn changes_made_offline_upload_when_back_online() {
 
     // Offline: point the app at a port nothing listens on.
     app.endpoints = Endpoints::at("http://127.0.0.1:9");
-    app.client = None;
+    app.conns = test_conns(&app.endpoints);
     app.create(USER, "Written on a plane", 9);
     app.pump();
     assert!(app.local("Written on a plane")[0].pending);
     assert!(app.remote(USER).is_empty(), "nothing reached Google");
-    app.engine.handle(&mut app.store, Msg::SyncFailed("offline".into()), None, app.today);
+    app.engine.handle(&mut app.store, Msg::SyncFailed { account: GOOGLE.into(), error: "offline".into() }, None, app.today);
 
     // Back online: the next sync uploads it first.
     app.endpoints = app.server.clone();
-    app.client = None;
+    app.conns = test_conns(&app.endpoints);
     app.sync();
     let local = app.local("Written on a plane");
     assert_eq!(local.len(), 1);

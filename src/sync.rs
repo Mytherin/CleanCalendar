@@ -1,10 +1,11 @@
-//! Google sync bookkeeping, independent of the UI and the network.
+//! Sync bookkeeping, independent of the UI, the network, and of which
+//! service (Google or CalDAV) an account is on.
 //!
 //! [`SyncEngine`] decides what to upload, when to retry, and how to merge
-//! what Google sends back. It never does I/O itself: it queues [`Cmd`]s in
+//! what a service sends back. It never does I/O itself: it queues [`Cmd`]s in
 //! `outbox` for the worker thread, consumes the [`Msg`]s the worker returns,
 //! and reports UI-visible effects as [`Notice`]s. That keeps every step
-//! testable without a window, a thread, or Google.
+//! testable without a window, a thread, or a server.
 //!
 //! The engine changes the [`Store`] in memory; the caller saves it.
 
@@ -13,14 +14,17 @@ use std::collections::{HashMap, HashSet};
 use chrono::{Duration, NaiveDate};
 
 use crate::dates::{add_months, first_of_month};
-use crate::google::{self, CalendarChanges, Cmd, Creds, Failure, Msg, RemoteCalendar};
-use crate::model::{Calendar, Event, EventFields, PendingDelete, Source, Store};
+use crate::model::{CalDavAccount, Calendar, Event, EventFields, PendingDelete, Source, Store};
+use crate::remote::{CalRef, CalendarChanges, Cmd, Failure, Msg, RemoteCalendar, GOOGLE};
 
 /// Incremental syncs only report changes, so recurring-event occurrences
 /// that slide into the sync window are picked up by a periodic full sync.
 pub const FULL_SYNC_DAYS: i64 = 7;
 
-const OFFLINE: &str = "Offline — changes will sync when Google is reachable";
+/// The status shown while a service can't be reached.
+pub fn offline(name: &str) -> String {
+    format!("Offline — changes will sync when {name} is reachable")
+}
 
 /// Something the UI should react to.
 #[derive(Debug, PartialEq)]
@@ -38,29 +42,22 @@ pub struct SyncEngine {
     /// Uploads handed out and not answered yet ("save:<event id>",
     /// "del:<remote id>"), so retries don't queue duplicates.
     in_flight: HashSet<String>,
-    /// A sync is with the worker.
-    running: bool,
-    /// Another sync was asked for while one was running.
-    again: bool,
-}
-
-fn creds(store: &Store) -> Option<Creds> {
-    let g = &store.google;
-    Some(Creds {
-        client_id: g.client_id.clone(),
-        client_secret: g.client_secret.clone(),
-        refresh_token: g.refresh_token.clone()?,
-    })
+    /// Accounts with a sync out with the worker.
+    running: HashSet<String>,
+    /// Accounts asked to sync again while one was running.
+    again: HashSet<String>,
+    /// CalDAV accounts being added, until the server accepts the login.
+    connecting: HashMap<String, CalDavAccount>,
 }
 
 impl SyncEngine {
-    /// One-time fix-up for data written by older versions: events on Google
+    /// One-time fix-up for data written by older versions: events on synced
     /// calendars that were never uploaded become pending.
     pub fn prepare(store: &mut Store) {
-        let google_cals: HashSet<String> =
-            store.calendars.iter().filter(|c| c.google_id().is_some()).map(|c| c.id.clone()).collect();
+        let remote_cals: HashSet<String> =
+            store.calendars.iter().filter(|c| c.is_remote()).map(|c| c.id.clone()).collect();
         for ev in &mut store.events {
-            if google_cals.contains(&ev.calendar_id) && ev.remote_id.is_none() {
+            if remote_cals.contains(&ev.calendar_id) && ev.remote_id.is_none() {
                 ev.pending = true;
             }
         }
@@ -70,113 +67,123 @@ impl SyncEngine {
         self.notices.push(Notice::Status { text: text.into(), error });
     }
 
-    /// Uploads waiting changes, then pulls remote changes. Returns whether a
-    /// sync was queued (not when signed out or when one is already running).
+    /// Uploads waiting changes, then pulls remote changes, for every
+    /// signed-in account. Returns whether any sync was queued.
     pub fn sync(&mut self, store: &Store, today: NaiveDate) -> bool {
-        let Some(creds) = creds(store) else { return false };
-        if self.running {
-            self.again = true;
+        let mut any = false;
+        for account in store.accounts() {
+            any |= self.sync_account(store, &account, today);
+        }
+        any
+    }
+
+    /// Syncs one account (not when it's signed out or already syncing).
+    pub fn sync_account(&mut self, store: &Store, account: &str, today: NaiveDate) -> bool {
+        let Some(login) = store.login(account) else { return false };
+        if self.running.contains(account) {
+            self.again.insert(account.to_owned());
             return false;
         }
         // Uploads first: the worker runs commands in order, so the pull that
         // follows already sees them.
-        self.retry_pending(store);
+        self.retry_pending(store, account);
 
         let stale_before = today - Duration::days(FULL_SYNC_DAYS);
         let tokens: HashMap<String, String> = store
-            .sync_state
+            .calendars
             .iter()
-            .filter(|(_, s)| s.full_sync_on.is_some_and(|d| d > stale_before))
-            .filter_map(|(id, s)| Some((id.clone(), s.token.clone()?)))
+            .filter_map(|c| c.remote().filter(|r| r.account == account))
+            .filter_map(|r| {
+                let s = store.sync_state.get(&r.local_id())?;
+                let fresh = s.full_sync_on.is_some_and(|d| d > stale_before);
+                Some((r.id, s.token.clone().filter(|_| fresh)?))
+            })
             .collect();
         let from = add_months(first_of_month(today), -6);
         let to = add_months(first_of_month(today), 13);
-        self.running = true;
-        self.outbox.push(Cmd::Sync { creds, from, to, tokens });
+        self.running.insert(account.to_owned());
+        self.outbox.push(Cmd::Sync { account: account.to_owned(), login, from, to, tokens });
         true
     }
 
-    /// Re-sends every local change Google hasn't confirmed yet.
-    fn retry_pending(&mut self, store: &Store) {
-        let ids: Vec<String> = store.events.iter().filter(|e| e.pending).map(|e| e.id.clone()).collect();
+    /// Re-sends every local change on this account not confirmed yet.
+    fn retry_pending(&mut self, store: &Store, account: &str) {
+        let on_account = |cal: Option<CalRef>| cal.is_some_and(|c| c.account == account);
+        let ids: Vec<String> =
+            store.events.iter().filter(|e| e.pending && on_account(store.remote_of(e))).map(|e| e.id.clone()).collect();
         for id in ids {
             self.push(store, &id);
         }
         for d in store.pending_deletes.clone() {
-            self.send_delete(store, d);
+            if d.calendar.account == account {
+                self.send_delete(store, d);
+            }
         }
     }
 
     /// Call after the user changed an event (already updated in `store`):
-    /// bumps its revision and uploads it if it lives on Google.
+    /// bumps its revision and uploads it if it lives on a service.
     pub fn event_changed(&mut self, store: &mut Store, id: &str) {
         let Some(ev) = store.event(id) else { return };
-        let on_google = store.google_calendar_of(ev).is_some();
+        let remote = store.remote_of(ev).is_some();
         if let Some(ev) = store.event_mut(id) {
             ev.rev += 1;
-            ev.pending = on_google;
+            ev.pending = remote;
         }
         self.push(store, id);
     }
 
-    /// Call *before* changing an event: remembers the version Google
+    /// Call *before* changing an event: remembers the version the service
     /// confirmed, so a later conflict can be merged field by field.
     pub fn before_change(&mut self, store: &mut Store, id: &str) {
         let Some(ev) = store.event(id) else { return };
-        if ev.base.is_none() && ev.remote_id.is_some() && store.google_calendar_of(ev).is_some() {
+        if ev.base.is_none() && ev.remote_id.is_some() && store.remote_of(ev).is_some() {
             let fields = ev.fields();
             store.event_mut(id).unwrap().base = Some(fields);
         }
     }
 
-    /// Call when an event leaves a Google calendar, with the event as it was
+    /// Call when an event leaves a synced calendar, with the event as it was
     /// before. `user_deleted`: the user deleted it, so the remote delete only
     /// applies if nobody changed it meanwhile (their change wins). Otherwise
     /// (moved to another calendar) the old copy is removed unconditionally.
     pub fn event_deleted(&mut self, store: &mut Store, ev: &Event, user_deleted: bool) {
-        if let (Some(gcal), Some(rid)) = (store.google_calendar_of(ev), ev.remote_id.clone()) {
+        if let (Some(calendar), Some(remote_id)) = (store.remote_of(ev), ev.remote_id.clone()) {
             let etag = if user_deleted { ev.etag.clone() } else { None };
-            self.queue_delete(store, PendingDelete { google_calendar_id: gcal, remote_id: rid, etag });
+            self.queue_delete(store, PendingDelete { calendar, remote_id, etag });
         }
         // Never uploaded: if an upload is in flight, `on_saved` notices the
         // event is gone and deletes the copy it created.
     }
 
-    /// Call when the user deleted a whole repeating series that Google sent
-    /// as separate occurrences: deletes the series on Google.
-    pub fn series_deleted(&mut self, store: &mut Store, google_calendar_id: &str, series_remote_id: &str) {
-        let d = PendingDelete {
-            google_calendar_id: google_calendar_id.to_owned(),
-            remote_id: series_remote_id.to_owned(),
-            etag: None,
-        };
-        self.queue_delete(store, d);
+    /// Call when the user deleted a whole repeating series that the service
+    /// sent as separate occurrences: deletes the series there.
+    pub fn series_deleted(&mut self, store: &mut Store, calendar: CalRef, series_remote_id: &str) {
+        self.queue_delete(store, PendingDelete { calendar, remote_id: series_remote_id.to_owned(), etag: None });
     }
 
     /// Uploads a pending event, unless an upload for it is already out
     /// (its reply triggers another upload if the event changed meanwhile).
     fn push(&mut self, store: &Store, id: &str) {
         let Some(ev) = store.event(id).filter(|e| e.pending).cloned() else { return };
-        let Some(gcal) = store.google_calendar_of(&ev) else { return };
-        let Some(creds) = creds(store) else { return };
+        let Some(calendar) = store.remote_of(&ev) else { return };
+        let Some(login) = store.login(&calendar.account) else { return };
         if self.in_flight.insert(format!("save:{id}")) {
-            self.outbox.push(Cmd::Save { creds, google_calendar_id: gcal, event: ev });
+            self.outbox.push(Cmd::Save { login, calendar, event: ev });
         }
     }
 
     fn send_delete(&mut self, store: &Store, d: PendingDelete) {
-        let Some(creds) = creds(store) else { return };
+        let Some(login) = store.login(&d.calendar.account) else { return };
         if self.in_flight.insert(format!("del:{}", d.remote_id)) {
-            self.outbox.push(Cmd::Delete {
-                creds,
-                google_calendar_id: d.google_calendar_id,
-                remote_id: d.remote_id,
-                etag: d.etag,
-            });
+            self.outbox.push(Cmd::Delete { login, calendar: d.calendar, remote_id: d.remote_id, etag: d.etag });
         }
     }
 
     fn queue_delete(&mut self, store: &mut Store, d: PendingDelete) {
+        if store.login(&d.calendar.account).is_none() {
+            return;
+        }
         if !store.pending_deletes.iter().any(|p| p.remote_id == d.remote_id) {
             store.pending_deletes.push(d.clone());
         }
@@ -184,65 +191,101 @@ impl SyncEngine {
     }
 
     /// Forgets a calendar's sync token so the next sync re-downloads it,
-    /// replacing local copies with what Google actually has.
-    fn force_full_sync(&mut self, store: &mut Store, google_calendar_id: &str, today: NaiveDate) {
-        store.sync_state.remove(google_calendar_id);
-        self.sync(store, today);
+    /// replacing local copies with what the service actually has.
+    fn force_full_sync(&mut self, store: &mut Store, calendar: &CalRef, today: NaiveDate) {
+        store.sync_state.remove(&calendar.local_id());
+        self.sync_account(store, &calendar.account, today);
     }
 
-    /// Signs out: drops all Google calendars, events, and sync state.
-    pub fn disconnect(&mut self, store: &mut Store) {
-        store.google.refresh_token = None;
-        store.google.account_email = None;
-        store.pending_deletes.clear();
-        store.sync_state.clear();
-        self.in_flight.clear();
+    /// Starts adding a CalDAV account; it is kept once the server accepts
+    /// the login (see [`Msg::Connected`]).
+    pub fn connect_caldav(&mut self, account: CalDavAccount) {
+        let Some(login) = account.login() else { return };
+        self.outbox.push(Cmd::ConnectCalDav { account: account.id.clone(), login });
+        self.connecting.insert(account.id.clone(), account);
+    }
+
+    /// Whether a CalDAV account is waiting for the server's answer.
+    pub fn is_connecting(&self) -> bool {
+        !self.connecting.is_empty()
+    }
+
+    /// Signs out of an account: drops its calendars, events, and sync state.
+    pub fn disconnect(&mut self, store: &mut Store, account: &str) {
+        let name = store.account_name(account);
+        if account == GOOGLE {
+            store.google.refresh_token = None;
+            store.google.account_email = None;
+        } else {
+            store.caldav.retain(|a| a.id != account);
+        }
+        self.running.remove(account);
+        self.again.remove(account);
+        store.pending_deletes.retain(|d| d.calendar.account != account);
         let gone: HashSet<String> =
-            store.calendars.iter().filter(|c| c.google_id().is_some()).map(|c| c.id.clone()).collect();
+            store.calendars.iter().filter(|c| c.account() == Some(account)).map(|c| c.id.clone()).collect();
         store.calendars.retain(|c| !gone.contains(&c.id));
         store.events.retain(|e| !gone.contains(&e.calendar_id));
-        self.status("Disconnected from Google", false);
+        store.sync_state.retain(|id, _| !gone.contains(id));
+        self.status(format!("Disconnected from {name}"), false);
     }
 
     /// Processes one reply from the worker. `dragging` is the id of an event
     /// the user is dragging right now; a sync won't overwrite it.
     pub fn handle(&mut self, store: &mut Store, msg: Msg, dragging: Option<&str>, today: NaiveDate) {
         match msg {
-            Msg::Connected { refresh_token } => {
-                store.google.refresh_token = Some(refresh_token);
-                self.status("Connected to Google", false);
-                self.sync(store, today);
+            Msg::Connected { account, refresh_token } => {
+                if account == GOOGLE {
+                    store.google.refresh_token = refresh_token;
+                } else if let Some(acct) = self.connecting.remove(&account) {
+                    store.caldav.retain(|a| a.id != acct.id);
+                    store.caldav.push(acct);
+                } else {
+                    return;
+                }
+                self.status(format!("Connected to {}", store.account_name(&account)), false);
+                self.sync_account(store, &account, today);
             }
-            Msg::ConnectFailed(e) => self.status(e, true),
-            Msg::Synced { calendars, changes } => {
-                merge_calendars(store, &calendars);
-                apply_changes(store, changes, dragging, today);
+            Msg::ConnectFailed { account, error } => {
+                self.connecting.remove(&account);
+                self.status(error, true);
+            }
+            Msg::Synced { account, calendars, changes } => {
+                self.running.remove(&account);
+                // Signed out while the sync was out: nothing to apply it to.
+                if store.login(&account).is_none() {
+                    return;
+                }
+                merge_calendars(store, &account, &calendars);
+                apply_changes(store, &account, changes, dragging, today);
                 if store.unsynced_count() == 0 {
                     self.status("Up to date", false);
                 }
-                self.sync_finished(store, today);
+                self.sync_finished(store, &account, today);
             }
-            Msg::SyncFailed(e) => {
-                self.status(format!("Couldn't sync with Google: {e}"), true);
-                self.sync_finished(store, today);
+            Msg::SyncFailed { account, error } => {
+                self.running.remove(&account);
+                if store.login(&account).is_some() {
+                    self.status(format!("Couldn't sync with {}: {error}", store.account_name(&account)), true);
+                }
+                self.sync_finished(store, &account, today);
             }
-            Msg::Saved { local_id, google_calendar_id, rev, remote_id, etag } => {
-                self.on_saved(store, local_id, google_calendar_id, rev, remote_id, etag, today)
+            Msg::Saved { local_id, calendar, rev, remote_id, etag } => {
+                self.on_saved(store, local_id, calendar, rev, remote_id, etag, today)
             }
-            Msg::SaveFailed { local_id, google_calendar_id, error, kind } => {
-                self.on_save_failed(store, local_id, google_calendar_id, error, kind, today)
+            Msg::SaveFailed { local_id, calendar, error, kind } => {
+                self.on_save_failed(store, local_id, calendar, error, kind, today)
             }
             Msg::SaveConflict { local_id, server } => {
                 self.in_flight.remove(&format!("save:{local_id}"));
                 self.resolve_save_conflict(store, &local_id, server);
             }
-            Msg::DeleteConflict { remote_id, google_calendar_id, server } => {
+            Msg::DeleteConflict { remote_id, calendar, server } => {
                 self.in_flight.remove(&format!("del:{remote_id}"));
                 store.pending_deletes.retain(|d| d.remote_id != remote_id);
                 // Their change beats our delete: bring the event back.
                 if let Some(ev) = server {
-                    let id = google::local_event_id(&google_calendar_id, &remote_id);
-                    if store.event(&id).is_none() {
+                    if store.event(&ev.id).is_none() && store.calendar(&calendar.local_id()).is_some() {
                         self.status(format!("“{}” was changed on another device, so it wasn't deleted", ev.title), true);
                         store.events.push(ev);
                     }
@@ -252,48 +295,48 @@ impl SyncEngine {
                 self.in_flight.remove(&format!("del:{remote_id}"));
                 store.pending_deletes.retain(|d| d.remote_id != remote_id);
             }
-            Msg::DeleteFailed { remote_id, google_calendar_id, error, kind } => {
+            Msg::DeleteFailed { remote_id, calendar, error, kind } => {
                 self.in_flight.remove(&format!("del:{remote_id}"));
+                let name = store.account_name(&calendar.account);
                 if kind == Failure::Retry {
-                    self.status(OFFLINE, true);
+                    self.status(offline(&name), true);
                 } else {
-                    // Google won't delete it: drop the request and show what
-                    // Google has.
+                    // The service won't delete it: drop the request and show
+                    // what it has.
                     store.pending_deletes.retain(|d| d.remote_id != remote_id);
-                    self.status(format!("Google refused a delete: {error}"), true);
-                    self.force_full_sync(store, &google_calendar_id, today);
+                    self.status(format!("{name} refused a delete: {error}"), true);
+                    self.force_full_sync(store, &calendar, today);
                 }
             }
         }
     }
 
-    fn sync_finished(&mut self, store: &Store, today: NaiveDate) {
-        self.running = false;
-        if std::mem::take(&mut self.again) {
-            self.sync(store, today);
+    fn sync_finished(&mut self, store: &Store, account: &str, today: NaiveDate) {
+        if self.again.remove(account) {
+            self.sync_account(store, account, today);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_saved(
         &mut self,
         store: &mut Store,
         local_id: String,
-        gcal: String,
+        calendar: CalRef,
         rev: u64,
         remote_id: String,
         etag: Option<String>,
         today: NaiveDate,
     ) {
         self.in_flight.remove(&format!("save:{local_id}"));
-        let still_there =
-            store.event(&local_id).is_some_and(|ev| store.google_calendar_of(ev).as_deref() == Some(gcal.as_str()));
+        let still_there = store.event(&local_id).is_some_and(|ev| store.remote_of(ev).as_ref() == Some(&calendar));
         if !still_there {
             // Deleted (or moved to another calendar) while the upload was in
-            // flight: remove the copy that just landed on Google.
-            self.queue_delete(store, PendingDelete { google_calendar_id: gcal, remote_id, etag: None });
+            // flight: remove the copy that just landed there.
+            self.queue_delete(store, PendingDelete { calendar, remote_id, etag: None });
             return;
         }
-        let new_id = google::local_event_id(&gcal, &remote_id);
+        let new_id = calendar.event_id(&remote_id);
         let ev = store.event_mut(&local_id).unwrap();
         ev.remote_id = Some(remote_id);
         ev.id = new_id.clone();
@@ -302,12 +345,12 @@ impl SyncEngine {
             ev.pending = false;
             ev.base = None;
         } else {
-            // Edited again meanwhile: what Google has now is what we sent.
-            // (`base` stays the older snapshot; merging against it only
+            // Edited again meanwhile: what the service has now is what we
+            // sent. (`base` stays the older snapshot; merging against it only
             // makes our side win more often, never loses their changes.)
         }
-        // A new series: Google expands it into occurrences, which replace
-        // our copy (see `apply_changes`). Fetch them now.
+        // A new series: the service sends it back as occurrences, which
+        // replace our copy (see `apply_changes`). Fetch them now.
         let new_series = ev.recurrence.is_some() && !ev.pending;
         let changed_again = ev.pending;
         if new_id != local_id {
@@ -317,7 +360,7 @@ impl SyncEngine {
             self.push(store, &new_id);
         }
         if new_series {
-            self.sync(store, today);
+            self.sync_account(store, &calendar.account, today);
         }
     }
 
@@ -325,33 +368,34 @@ impl SyncEngine {
         &mut self,
         store: &mut Store,
         local_id: String,
-        gcal: String,
+        calendar: CalRef,
         error: String,
         kind: Failure,
         today: NaiveDate,
     ) {
         self.in_flight.remove(&format!("save:{local_id}"));
         let title = store.event(&local_id).map(|e| e.title.clone()).unwrap_or_default();
+        let name = store.account_name(&calendar.account);
         match kind {
             // Stays pending; the next sync retries it.
-            Failure::Retry => self.status(OFFLINE, true),
+            Failure::Retry => self.status(offline(&name), true),
             // Creating failed because the calendar itself is gone (updates of
-            // deleted events arrive as conflicts instead), or Google refused.
+            // deleted events arrive as conflicts instead), or it was refused.
             Failure::Gone | Failure::Rejected => {
                 if let Some(ev) = store.event_mut(&local_id) {
                     ev.pending = false;
                     ev.base = None;
                 }
-                self.status(format!("Google rejected changes to “{title}”: {error}"), true);
-                self.force_full_sync(store, &gcal, today);
+                self.status(format!("{name} rejected changes to “{title}”: {error}"), true);
+                self.force_full_sync(store, &calendar, today);
             }
         }
     }
 
-    /// Our upload was refused because the event changed on Google first.
-    /// Edits are never silently dropped: fields changed on only one side
-    /// are combined, and if both sides changed the same field, ours wins.
-    /// If the event was deleted there, our edited version is recreated.
+    /// Our upload was refused because the event changed on the service
+    /// first. Edits are never silently dropped: fields changed on only one
+    /// side are combined, and if both sides changed the same field, ours
+    /// wins. If the event was deleted there, our edited version is recreated.
     fn resolve_save_conflict(&mut self, store: &mut Store, local_id: &str, server: Option<Event>) {
         let Some(ev) = store.event_mut(local_id) else {
             // Deleted here meanwhile; that delete is queued separately.
@@ -430,16 +474,28 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
     (merged, clashes)
 }
 
-/// Brings the calendar list in line with Google's.
-fn merge_calendars(store: &mut Store, remote: &[RemoteCalendar]) {
-    store.google.account_email = remote.iter().find(|c| c.primary).map(|c| c.id.clone());
+/// Where a calendar goes in the sidebar: local ones, then each account's in
+/// account order.
+fn account_rank(store: &Store, c: &Calendar) -> usize {
+    match c.account() {
+        None => 0,
+        Some(GOOGLE) => 1,
+        Some(a) => 2 + store.caldav.iter().position(|x| x.id == a).unwrap_or(usize::MAX - 3),
+    }
+}
 
-    let keep: HashSet<String> = remote.iter().map(|c| google::local_calendar_id(&c.id)).collect();
-    store.calendars.retain(|c| matches!(c.source, Source::Local) || keep.contains(&c.id));
-    for rc in remote {
-        let id = google::local_calendar_id(&rc.id);
+/// Brings one account's calendar list in line with the service's.
+fn merge_calendars(store: &mut Store, account: &str, remote: &[RemoteCalendar]) {
+    if account == GOOGLE {
+        store.google.account_email = remote.iter().find(|c| c.primary).map(|c| c.id.clone());
+    }
+    let refs: Vec<CalRef> = remote.iter().map(|c| CalRef::new(account, &c.id)).collect();
+    let keep: HashSet<String> = refs.iter().map(CalRef::local_id).collect();
+    store.calendars.retain(|c| c.account() != Some(account) || keep.contains(&c.id));
+    for (rc, r) in remote.iter().zip(&refs) {
+        let id = r.local_id();
         match store.calendars.iter_mut().find(|c| c.id == id) {
-            // Name and permissions follow Google; color and visibility are the user's.
+            // Name and permissions follow the service; color and visibility are the user's.
             Some(c) => {
                 c.name = rc.name.clone();
                 c.read_only = rc.read_only;
@@ -449,34 +505,49 @@ fn merge_calendars(store: &mut Store, remote: &[RemoteCalendar]) {
                 name: rc.name.clone(),
                 color: rc.color,
                 visible: true,
-                source: Source::Google { calendar_id: rc.id.clone() },
+                source: if account == GOOGLE {
+                    Source::Google { calendar_id: rc.id.clone() }
+                } else {
+                    Source::CalDav { account: account.to_owned(), url: rc.id.clone() }
+                },
                 read_only: rc.read_only,
             }),
         }
     }
-    // Local calendars first, then Google's in the server's order.
-    store.calendars.sort_by_key(|c| match &c.source {
-        Source::Local => (0, 0),
-        Source::Google { calendar_id } => (1, remote.iter().position(|r| &r.id == calendar_id).unwrap_or(0)),
-    });
+    // Local calendars first, then each account's; this account's in the
+    // server's order, the others' as they were.
+    let mut order: Vec<(usize, usize, usize)> = store
+        .calendars
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let pos = match c.remote() {
+                Some(r) if r.account == account => refs.iter().position(|x| *x == r).unwrap_or(i),
+                _ => i,
+            };
+            (account_rank(store, c), pos, i)
+        })
+        .collect();
+    order.sort();
+    let mut old: Vec<Option<Calendar>> = std::mem::take(&mut store.calendars).into_iter().map(Some).collect();
+    store.calendars = order.into_iter().map(|(_, _, i)| old[i].take().unwrap()).collect();
 
     // Drop everything belonging to calendars that disappeared.
-    let remote_ids: HashSet<&str> = remote.iter().map(|c| c.id.as_str()).collect();
     let cal_ids: HashSet<String> = store.calendars.iter().map(|c| c.id.clone()).collect();
     store.events.retain(|e| cal_ids.contains(&e.calendar_id));
-    store.sync_state.retain(|id, _| remote_ids.contains(id.as_str()));
-    store.pending_deletes.retain(|d| remote_ids.contains(d.google_calendar_id.as_str()));
+    store.sync_state.retain(|id, _| cal_ids.contains(id));
+    store.pending_deletes.retain(|d| d.calendar.account != account || keep.contains(&d.calendar.local_id()));
 }
 
 /// Applies what a sync returned to the store. Events with unconfirmed local
 /// edits (and the one being dragged) are left alone, and events waiting to be
-/// deleted on Google are not brought back.
-fn apply_changes(store: &mut Store, changes: Vec<CalendarChanges>, dragging: Option<&str>, today: NaiveDate) {
+/// deleted remotely are not brought back.
+fn apply_changes(store: &mut Store, account: &str, changes: Vec<CalendarChanges>, dragging: Option<&str>, today: NaiveDate) {
     let deleting: HashSet<String> = store.pending_deletes.iter().map(|d| d.remote_id.clone()).collect();
     let protected = |e: &Event| e.pending || Some(e.id.as_str()) == dragging;
 
     for ch in changes {
-        let cal_id = google::local_calendar_id(&ch.calendar_id);
+        let cal_id = CalRef::new(account, &ch.calendar_id).local_id();
         if ch.full {
             store.events.retain(|e| e.calendar_id != cal_id || protected(e));
         } else if !ch.cancelled.is_empty() {
@@ -505,9 +576,9 @@ fn apply_changes(store: &mut Store, changes: Vec<CalendarChanges>, dragging: Opt
                 }
             }
         }
-        // A series we uploaded comes back expanded into occurrences (syncs
-        // ask for single events); once those are here, our own copy of the
-        // series would show everything twice.
+        // A series we uploaded comes back expanded into occurrences; once
+        // those are here, our own copy of the series would show everything
+        // twice.
         let expanded: HashSet<String> = store
             .events
             .iter()
@@ -520,18 +591,18 @@ fn apply_changes(store: &mut Store, changes: Vec<CalendarChanges>, dragging: Opt
                 && e.remote_id.as_ref().is_some_and(|r| expanded.contains(r));
             !superseded || protected(e)
         });
-        let state = store.sync_state.entry(ch.calendar_id).or_default();
+        let state = store.sync_state.entry(cal_id).or_default();
         state.token = ch.next_token;
         if ch.full {
             state.full_sync_on = Some(today);
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dates::midnight;
+    use crate::google;
     use crate::model::SyncState;
 
     const CAL: &str = "me@example.com";
@@ -575,7 +646,7 @@ mod tests {
     fn store_with(events: Vec<Event>) -> Store {
         let mut store = Store::default();
         store.google.refresh_token = Some("refresh".into());
-        merge_calendars(&mut store, &[remote_cal()]);
+        merge_calendars(&mut store, GOOGLE, &[remote_cal()]);
         store.events = events;
         store
     }
@@ -616,7 +687,7 @@ mod tests {
                     cals.sort();
                     Sent::Sync(cals)
                 }
-                Cmd::Connect { .. } => panic!("unexpected connect"),
+                c => panic!("unexpected {c:?}"),
             })
             .collect()
     }
@@ -628,7 +699,7 @@ mod tests {
     fn saved(local_id: &str, rev: u64, remote_id: &str) -> Msg {
         Msg::Saved {
             local_id: local_id.into(),
-            google_calendar_id: CAL.into(),
+            calendar: CalRef::google(CAL),
             rev,
             remote_id: remote_id.into(),
             etag: Some(format!("etag-{rev}")),
@@ -636,11 +707,11 @@ mod tests {
     }
 
     fn save_failed(local_id: &str, kind: Failure) -> Msg {
-        Msg::SaveFailed { local_id: local_id.into(), google_calendar_id: CAL.into(), error: "nope".into(), kind }
+        Msg::SaveFailed { local_id: local_id.into(), calendar: CalRef::google(CAL), error: "nope".into(), kind }
     }
 
     fn synced(ch: Vec<CalendarChanges>) -> Msg {
-        Msg::Synced { calendars: vec![remote_cal()], changes: ch }
+        Msg::Synced { account: GOOGLE.into(), calendars: vec![remote_cal()], changes: ch }
     }
 
     fn edit(store: &mut Store, engine: &mut SyncEngine, id: &str, title: &str) {
@@ -676,7 +747,7 @@ mod tests {
         sent(&mut engine);
         engine.handle(&mut store, save_failed(&id, Failure::Retry), None, today());
         assert!(store.event(&id).unwrap().pending);
-        assert!(engine.notices.contains(&Notice::Status { text: OFFLINE.into(), error: true }));
+        assert!(engine.notices.contains(&Notice::Status { text: offline("Google"), error: true }));
 
         // The next sync re-sends the edit before pulling.
         assert!(engine.sync(&store, today()));
@@ -766,7 +837,7 @@ mod tests {
 
         let failed = Msg::DeleteFailed {
             remote_id: "a".into(),
-            google_calendar_id: CAL.into(),
+            calendar: CalRef::google(CAL),
             error: "timeout".into(),
             kind: Failure::Retry,
         };
@@ -805,14 +876,14 @@ mod tests {
     fn refused_delete_restores_googles_version() {
         let ev = gev("a", "x");
         let mut store = store_with(vec![]);
-        store.sync_state.insert(CAL.into(), SyncState { token: Some("t".into()), full_sync_on: Some(today()) });
+        store.sync_state.insert(google::local_calendar_id(CAL), SyncState { token: Some("t".into()), full_sync_on: Some(today()) });
         let mut engine = SyncEngine::default();
         engine.event_deleted(&mut store, &ev, true);
         sent(&mut engine);
 
         let refused = Msg::DeleteFailed {
             remote_id: "a".into(),
-            google_calendar_id: CAL.into(),
+            calendar: CalRef::google(CAL),
             error: "forbidden".into(),
             kind: Failure::Rejected,
         };
@@ -959,7 +1030,7 @@ mod tests {
 
         let msg = Msg::DeleteConflict {
             remote_id: "a".into(),
-            google_calendar_id: CAL.into(),
+            calendar: CalRef::google(CAL),
             server: Some(theirs(|e| e.title = "Standup, moved".into())),
         };
         engine.handle(&mut store, msg, None, today());
@@ -1020,7 +1091,7 @@ mod tests {
     fn rejected_edit_falls_back_to_googles_version() {
         let id = google::local_event_id(CAL, "a");
         let mut store = store_with(vec![gev("a", "x")]);
-        store.sync_state.insert(CAL.into(), SyncState { token: Some("t".into()), full_sync_on: Some(today()) });
+        store.sync_state.insert(google::local_calendar_id(CAL), SyncState { token: Some("t".into()), full_sync_on: Some(today()) });
         let mut engine = SyncEngine::default();
 
         edit(&mut store, &mut engine, &id, "y");
@@ -1047,7 +1118,7 @@ mod tests {
         engine.handle(&mut store, synced(changes(true, vec![], &[], Some("t1"))), None, today());
         // The second request runs now, incrementally.
         assert_eq!(sent(&mut engine), [Sent::Sync(vec![CAL.into()])]);
-        engine.handle(&mut store, Msg::SyncFailed("offline".into()), None, today());
+        engine.handle(&mut store, Msg::SyncFailed { account: GOOGLE.into(), error: "offline".into() }, None, today());
         assert!(engine.sync(&store, today()), "a failed sync doesn't block the next one");
     }
 
@@ -1057,12 +1128,12 @@ mod tests {
         let mut engine = SyncEngine::default();
         let state = |days_ago| SyncState { token: Some("t".into()), full_sync_on: Some(today() - Duration::days(days_ago)) };
 
-        store.sync_state.insert(CAL.into(), state(FULL_SYNC_DAYS - 1));
+        store.sync_state.insert(google::local_calendar_id(CAL), state(FULL_SYNC_DAYS - 1));
         engine.sync(&store, today());
         assert_eq!(sent(&mut engine), [Sent::Sync(vec![CAL.into()])]);
-        engine.handle(&mut store, Msg::SyncFailed("x".into()), None, today());
+        engine.handle(&mut store, Msg::SyncFailed { account: GOOGLE.into(), error: "x".into() }, None, today());
 
-        store.sync_state.insert(CAL.into(), state(FULL_SYNC_DAYS));
+        store.sync_state.insert(google::local_calendar_id(CAL), state(FULL_SYNC_DAYS));
         engine.sync(&store, today());
         assert_eq!(sent(&mut engine), [Sent::Sync(vec![])]);
     }
@@ -1077,12 +1148,13 @@ mod tests {
 
         apply_changes(
             &mut store,
+            GOOGLE,
             changes(true, vec![gev("a", "server"), gev("c", "new remote")], &[], Some("t1")),
             None,
             today(),
         );
         assert_eq!(titles(&store), ["my edit", "new remote", "not uploaded"]);
-        let st = &store.sync_state[CAL];
+        let st = &store.sync_state[&google::local_calendar_id(CAL)];
         assert_eq!(st.token.as_deref(), Some("t1"));
         assert_eq!(st.full_sync_on, Some(today()));
     }
@@ -1095,13 +1167,14 @@ mod tests {
 
         apply_changes(
             &mut store,
+            GOOGLE,
             changes(false, vec![gev("a", "new title"), gev("d", "added")], &["c", "series"], Some("t2")),
             None,
             today(),
         );
         assert_eq!(titles(&store), ["added", "new title", "untouched"]);
         // Incremental syncs don't reset the full-sync clock.
-        assert_eq!(store.sync_state[CAL].full_sync_on, None);
+        assert_eq!(store.sync_state[&google::local_calendar_id(CAL)].full_sync_on, None);
     }
 
     #[test]
@@ -1109,24 +1182,25 @@ mod tests {
         let mut store = store_with(vec![gev("drag", "being dragged")]);
         apply_changes(
             &mut store,
+            GOOGLE,
             changes(true, vec![gev("drag", "server copy")], &[], None),
             Some(&google::local_event_id(CAL, "drag")),
             today(),
         );
         assert_eq!(titles(&store), ["being dragged"]);
         // No token means the next sync is a full one again.
-        assert_eq!(store.sync_state[CAL].token, None);
+        assert_eq!(store.sync_state[&google::local_calendar_id(CAL)].token, None);
     }
 
     #[test]
     fn removed_calendars_take_their_events_along() {
         let mut store = store_with(vec![gev("a", "x")]);
-        store.sync_state.insert(CAL.into(), SyncState::default());
+        store.sync_state.insert(google::local_calendar_id(CAL), SyncState::default());
         let mut engine = SyncEngine::default();
         engine.sync(&store, today());
 
-        engine.handle(&mut store, Msg::Synced { calendars: vec![], changes: vec![] }, None, today());
-        assert!(store.calendars.iter().all(|c| c.google_id().is_none()));
+        engine.handle(&mut store, Msg::Synced { account: GOOGLE.into(), calendars: vec![], changes: vec![] }, None, today());
+        assert!(store.calendars.iter().all(|c| !c.is_remote()));
         assert!(store.events.is_empty());
         assert!(store.sync_state.is_empty());
     }
@@ -1134,13 +1208,13 @@ mod tests {
     #[test]
     fn calendar_color_and_visibility_are_kept() {
         let mut store = store_with(vec![]);
-        let cal = store.calendars.iter_mut().find(|c| c.google_id() == Some(CAL)).unwrap();
+        let cal = store.calendars.iter_mut().find(|c| c.remote() == Some(CalRef::google(CAL))).unwrap();
         cal.color = [1, 2, 3];
         cal.visible = false;
         let mut renamed = remote_cal();
         renamed.name = "Renamed".into();
-        merge_calendars(&mut store, &[renamed]);
-        let cal = store.calendars.iter().find(|c| c.google_id() == Some(CAL)).unwrap();
+        merge_calendars(&mut store, GOOGLE, &[renamed]);
+        let cal = store.calendars.iter().find(|c| c.remote() == Some(CalRef::google(CAL))).unwrap();
         assert_eq!((cal.name.as_str(), cal.color, cal.visible), ("Renamed", [1, 2, 3], false));
     }
 
@@ -1186,7 +1260,7 @@ mod tests {
         let mut occ = gev("s_1", "standup");
         occ.recurring_id = Some("s".into());
         let mut store = store_with(vec![series]);
-        apply_changes(&mut store, changes(false, vec![occ], &[], None), None, today());
+        apply_changes(&mut store, GOOGLE, changes(false, vec![occ], &[], None), None, today());
         assert_eq!(titles(&store), ["standup", "standup v2"]);
     }
 
@@ -1194,14 +1268,14 @@ mod tests {
     fn deleting_a_google_series_deletes_it_once_and_keeps_it_gone() {
         let mut store = store_with(vec![]);
         let mut engine = SyncEngine::default();
-        engine.series_deleted(&mut store, CAL, "s");
+        engine.series_deleted(&mut store, CalRef::google(CAL), "s");
         assert_eq!(sent(&mut engine), [Sent::Delete("s".into())]);
         assert_eq!(store.unsynced_count(), 1);
 
         // Its occurrences in a sync that crossed the delete stay away.
         let mut occ = gev("s_1", "standup");
         occ.recurring_id = Some("s".into());
-        apply_changes(&mut store, changes(false, vec![occ], &[], None), None, today());
+        apply_changes(&mut store, GOOGLE, changes(false, vec![occ], &[], None), None, today());
         assert!(store.events.is_empty());
 
         engine.handle(&mut store, Msg::Deleted { remote_id: "s".into() }, None, today());
