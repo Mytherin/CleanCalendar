@@ -356,6 +356,22 @@ impl SyncEngine {
                 for id in full {
                     store.sync_state.entry(id).or_default().window_from = from;
                 }
+                // "Keep past events" changed while this sync was out: what it
+                // fetched (and its tokens) are for the old range. Drop the
+                // tokens so the next sync downloads the new range in full.
+                if from.is_some_and(|f| f != window(store, today).0) {
+                    let ours: Vec<String> = store
+                        .calendars
+                        .iter()
+                        .filter_map(|c| c.remote().filter(|r| r.account == account))
+                        .map(|r| r.local_id())
+                        .collect();
+                    for id in ours {
+                        if let Some(st) = store.sync_state.get_mut(&id) {
+                            st.token = None;
+                        }
+                    }
+                }
                 if !skipped.is_empty() {
                     let name = store.account_name(&account);
                     self.status(format!("{name} wouldn't send {}", skipped.join("; ")), true);
@@ -605,7 +621,12 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
     let take_when = take_ours("time", when(base), when(ours), when(theirs));
     // Who is invited is compared by address; replies are only ever made on
     // the server, so they don't count as our change.
-    let emails = |f: &EventFields| f.attendees.iter().map(|a| a.email.to_lowercase()).collect::<Vec<_>>();
+    // Compared as sets: the same guests in another order is no change.
+    let emails = |f: &EventFields| {
+        let mut v = f.attendees.iter().map(|a| a.email.to_lowercase()).collect::<Vec<_>>();
+        v.sort();
+        v
+    };
     let take_invitees = take_ours("invitees", emails(base).join(","), emails(ours).join(","), emails(theirs).join(","));
 
     let from = |take_ours: bool| if take_ours { ours } else { theirs };
@@ -1433,6 +1454,21 @@ mod tests {
     }
 
     #[test]
+    fn the_same_guests_in_another_order_are_not_a_change() {
+        use crate::model::Attendee;
+        let mut base = gev("a", "T").fields();
+        base.attendees = vec![Attendee::new("ann@example.com"), Attendee::new("bob@example.com")];
+        // We added Cy; the service lists the same two guests the other way round.
+        let mut ours = base.clone();
+        ours.attendees.push(Attendee::new("cy@example.com"));
+        let mut theirs = base.clone();
+        theirs.attendees.reverse();
+        let (m, clashes) = merge_fields(&base, &ours, &theirs);
+        assert!(clashes.is_empty(), "no invitee clash: {clashes:?}");
+        assert_eq!(m.attendees.len(), 3, "our new guest is kept");
+    }
+
+    #[test]
     fn rejected_edit_falls_back_to_googles_version() {
         let id = google::local_event_id(CAL, "a");
         let mut store = store_with(vec![gev("a", "x")]);
@@ -1490,6 +1526,29 @@ mod tests {
         assert_eq!(window(&store, today()), (earliest(), date(2027, 12, 1)));
         store.settings.history_months = 6;
         assert_eq!(window(&store, today()), (date(2026, 5, 1), date(2027, 12, 1)));
+    }
+
+    #[test]
+    fn keeping_less_history_during_a_sync_still_downloads_the_new_range() {
+        let mut store = store_with(vec![]);
+        let mut engine = SyncEngine::default();
+        let synced = |ch| Msg::Synced { account: GOOGLE.into(), calendars: vec![remote_cal()], changes: ch };
+
+        // A full sync of everything is out when the user picks "6 months"
+        // (the Settings window clears the tokens and asks for a sync).
+        engine.sync(&store, today());
+        sent(&mut engine);
+        store.settings.history_months = 6;
+        for st in store.sync_state.values_mut() {
+            st.token = None;
+        }
+        engine.sync(&store, today());
+        engine.handle(&mut store, synced(changes(true, vec![], &[], Some("t1"))), None, today());
+
+        // The follow-up sync must be a full one for the new range, not
+        // changes since a token from the old one.
+        let next = sent(&mut engine);
+        assert_eq!(next, [Sent::Sync(vec![])], "{next:?}");
     }
 
     #[test]
