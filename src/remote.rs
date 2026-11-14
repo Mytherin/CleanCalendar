@@ -84,6 +84,9 @@ pub struct CalendarChanges {
     /// replaced by what `events` has.)
     pub cancelled: Vec<String>,
     pub next_token: Option<String>,
+    /// The service refused to list this calendar (why). It keeps the events
+    /// it had and starts over with a full sync next time.
+    pub skipped: Option<String>,
 }
 
 /// What to list.
@@ -439,10 +442,10 @@ pub fn sync_all(
             Some(token) => match c.events(&r, Query::Changes(token), (from, to)) {
                 Ok(changes) => Some(changes),
                 Err(e) if e.is::<TokenExpired>() => None,
-                Err(e) if refused(&e) => {
-                    eprintln!("Skipping calendar {}: {e:#}", cal.name);
-                    continue;
-                }
+                // Refused for this token: try a full sync before giving up on
+                // the calendar (keeping a token that never works would mean
+                // it never syncs again).
+                Err(e) if refused(&e) => None,
                 Err(e) => return Err(e),
             },
             None => None,
@@ -452,10 +455,18 @@ pub fn sync_all(
             None => match c.events(&r, Query::Window(from, to), (from, to)) {
                 Ok(changes) => changes,
                 // One calendar the server won't list (e.g. a broken shared
-                // one) shouldn't stop the others; it keeps what it had.
+                // one) shouldn't stop the others; it keeps what it had, and
+                // the user is told.
                 Err(e) if refused(&e) => {
                     eprintln!("Skipping calendar {}: {e:#}", cal.name);
-                    continue;
+                    CalendarChanges {
+                        calendar_id: cal.id.clone(),
+                        full: false,
+                        events: Vec::new(),
+                        cancelled: Vec::new(),
+                        next_token: None,
+                        skipped: Some(format!("{}: {e:#}", cal.name)),
+                    }
                 }
                 Err(e) => return Err(e),
             },
@@ -507,6 +518,9 @@ mod tests {
     #[derive(Default)]
     struct Script {
         token_expired: bool,
+        /// Calendars whose incremental / full listing fails with this status.
+        changes_refused: Option<(&'static str, u16)>,
+        window_refused: Option<(&'static str, u16)>,
         save_status: Option<u16>,
         delete_status: Option<u16>,
         server_copy: Option<Event>,
@@ -532,14 +546,20 @@ mod tests {
                     if self.token_expired {
                         return Err(TokenExpired.into());
                     }
+                    if let Some((_, s)) = self.changes_refused.filter(|(id, _)| *id == cal.id) {
+                        return Err(fail(s));
+                    }
                     false
                 }
                 Query::Window(..) => {
                     self.calls.push(format!("window {}", cal.id));
+                    if let Some((_, s)) = self.window_refused.filter(|(id, _)| *id == cal.id) {
+                        return Err(fail(s));
+                    }
                     true
                 }
             };
-            Ok(CalendarChanges { calendar_id: cal.id.clone(), full, events: vec![], cancelled: vec![], next_token: Some("t2".into()) })
+            Ok(CalendarChanges { calendar_id: cal.id.clone(), full, events: vec![], cancelled: vec![], next_token: Some("t2".into()), skipped: None })
         }
         fn save(&mut self, _: &CalRef, _: &Event) -> Result<(String, Option<String>)> {
             match self.save_status {
@@ -580,6 +600,26 @@ mod tests {
         let (_, changes) = sync_all(&mut s, "acct", day(1), day(30), &tokens).unwrap();
         assert_eq!(s.calls, ["calendars", "changes a old", "window a", "window b"]);
         assert!(changes[0].full);
+    }
+
+    #[test]
+    fn a_token_the_service_refuses_falls_back_to_a_full_sync() {
+        // A 400 on a token used to skip the calendar for good, silently.
+        let mut s = Script { changes_refused: Some(("a", 400)), ..Default::default() };
+        let tokens = HashMap::from([("a".to_string(), "bad".to_string())]);
+        let (_, changes) = sync_all(&mut s, "acct", day(1), day(30), &tokens).unwrap();
+        assert_eq!(s.calls, ["calendars", "changes a bad", "window a", "window b"]);
+        assert!(changes[0].full && changes[0].skipped.is_none());
+    }
+
+    #[test]
+    fn a_calendar_that_cannot_be_listed_is_reported_and_starts_over() {
+        let mut s = Script { window_refused: Some(("a", 403)), ..Default::default() };
+        let (_, changes) = sync_all(&mut s, "acct", day(1), day(30), &HashMap::new()).unwrap();
+        assert_eq!(changes.len(), 2, "the other calendar still syncs");
+        let a = changes.iter().find(|c| c.calendar_id == "a").unwrap();
+        assert!(a.skipped.as_deref().is_some_and(|s| s.starts_with("A:")), "{:?}", a.skipped);
+        assert!(!a.full && a.events.is_empty() && a.next_token.is_none(), "keeps its events; no token");
     }
 
     fn connections_with(script: Script) -> Connections {
