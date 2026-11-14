@@ -275,7 +275,7 @@ impl App {
                 }
                 match ed.result() {
                     Ok(ev) if is_occurrence(&self.store, &ev.id) => self.commit_occurrence(ev, ed.scope),
-                    Ok(ev) => self.commit_event(ev, ed.is_new),
+                    Ok(ev) => self.commit_event(recurrence::aligned(ev), ed.is_new),
                     // Keep it open so the problem can be fixed.
                     Err(_) => self.editor = Some(ed),
                 }
@@ -299,6 +299,15 @@ impl App {
         }
 
         let (s, shown) = recurrence::edit_series(&series, stamp, &ev);
+        // If the series' first day isn't one of its weekdays any more, it
+        // moves to its first occurrence, and so does the selection on it.
+        let unaligned_first = recurrence::occurrence_id(&s.id, recurrence::series_start(&s));
+        let s = recurrence::aligned(s);
+        let shown = if shown == unaligned_first {
+            recurrence::occurrence_id(&s.id, recurrence::series_start(&s))
+        } else {
+            shown
+        };
         self.commit_event(s, false);
         self.selected = Some(shown);
     }
