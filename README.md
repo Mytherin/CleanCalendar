@@ -13,11 +13,13 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Month view:** multi-day banners span across days, timed events show a colored dot and their time, and overflow collapses to "N more".
 - **Search** (Ctrl+F, or the magnifier at the right of the toolbar), like Apple Calendar's: matches every word of the query against titles, locations, notes and invitees on the shown calendars, and lists the results (every occurrence of a repeating event) beside the calendar, scrolled to what's coming up. Click a result to go to it, double-click to open it, Enter goes to the next upcoming one, Esc clears the search.
 - **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar, invitees and notes.
+- **Location suggestions, offline:** add the countries you want under Settings → Locations, and typing a location suggests towns, streets and named places (shops, museums, stations, …). A typed house number goes with the street ("Damrak 70"); arrow keys and Enter pick a suggestion. The map pin next to the location opens it in Google Maps. Searches never leave your computer: each country is a small prebuilt index of OpenStreetMap data (7 MB for the Netherlands), downloaded once from this project's GitHub release. With no countries installed, the location field offers to download some.
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
 - **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
 - **Settings** (⚙ in the toolbar, or Ctrl+,), laid out like macOS Calendar's:
   - *General:* 5 or 7 days per week, the first day of the week (or the Windows region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar, and whether to show Google's birthdays and holidays calendars.
   - *Accounts:* add (+) or remove (−) the Google account, switch it off, give it a name, and choose how often it refreshes (every minute to hourly, or manually).
+  - *Locations:* the countries whose location data is installed (update or remove each), downloads in progress, and a search for countries to add.
   - *Advanced:* shade busy days in the year view, show week numbers in the week and month views, and how much of the past to keep from synced calendars (all of it by default, or the last 5 years, 2 years, 1 year or 6 months).
 - **Invitees:** on Google calendars, type addresses into "Add Invitees" (Enter, comma or semicolon adds one). Google emails the invitations, updates and cancellations, and each guest's reply (accepted, maybe, declined, no response) is shown next to their name.
 - **iCloud and CalDAV** (the **Accounts** button in the toolbar): sign in with your Apple ID and an app-specific password (or any CalDAV server: Fastmail, Nextcloud, Radicale, …). All your calendars are imported, Reminders lists are skipped, and creates, edits, moves and deletes go back to the server. Repeating events from other apps show every occurrence, whatever their rule.
@@ -108,15 +110,43 @@ Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (t
 Set `CLEANCALENDAR_START=month:2026-11-14` (or just `day`, `week`, `month`, `year`) to open on a given view and date, which is handy together with `CLEANCALENDAR_DATA` for screenshots and testing by hand.
 Set `CLEANCALENDAR_SEARCH=dentist` to open with that search already typed in.
 
+Installed location data (one `<country>.places` file per country) lives in a `places` folder next to `cache.db` (or in `CLEANCALENDAR_DATA`), and can be deleted at any time.
+
+## Location data
+
+The countries offered under Settings → Locations are prebuilt indexes attached to a GitHub release (`v0.1`, listed by its `manifest.json`); the app downloads only the index of each country it adds, checks it against the checksum in the manifest, and searches it locally. `CLEANCALENDAR_PLACES_URL=<url>` points the app at another set (e.g. a local test server).
+
+An index is built from Geofabrik's OpenStreetMap extract of the country: towns and villages, streets, and named places (shops, museums, stations, offices, …), each placed in its nearest town. It is stored by column (kind, name, street, house number, town), each dictionary-encoded and zstd-compressed, with an [fst](https://docs.rs/fst) map from every search word to its entries. The Netherlands' 1.4 GB extract becomes a 7 MB index of 546,000 entries; a search takes well under a millisecond.
+
+To build or refresh the indexes (the OpenStreetMap reader is only compiled with the `build-places` feature, so it isn't in the app):
+
+```sh
+cargo run --release --features build-places -- --build-places places-out             # every country
+cargo run --release --features build-places -- --build-places places-out netherlands # some
+cargo run --release --features build-places -- --build-places --list                 # country ids
+```
+
+Each country's extract is downloaded, indexed and deleted again, and `places-out/manifest.json` is updated after each one; countries already built are skipped unless `--force` is given, so an interrupted run carries on where it stopped. Then attach everything in `places-out` to the release, replacing the old files:
+
+```sh
+gh release upload v0.1 places-out/* --clobber
+```
+
+Map data © OpenStreetMap contributors, under the [Open Database License](https://opendatacommons.org/licenses/odbl/); the app shows this credit under its suggestions.
+
 ## Code layout
 
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Window setup |
 | `src/app.rs` | App state, toolbar, sidebar, event editor, Accounts window, sync glue |
-| `src/app/settings_window.rs` | The Settings window (General, Accounts with the add-account sheet, Advanced) |
+| `src/app/settings_window.rs` | The Settings window (General, Accounts with the add-account sheet, Locations, Advanced) |
 | `src/app/search_ui.rs` | The toolbar's search field and the results list |
 | `src/search.rs` | Searching events (no UI) |
+| `src/editor.rs` | The event editor, including the location field's suggestions and Google Maps pin |
+| `src/places.rs` | Location data: installed countries, downloads from the release, searching, the editor's lookup |
+| `src/places/index.rs` | The compressed per-country index: writing, loading, prefix search and ranking |
+| `src/places/osm.rs`, `src/places/build.rs` | `--build-places` only: reading OpenStreetMap extracts and building the published indexes |
 | `src/settings.rs` | The user's preferences and their defaults |
 | `src/views.rs` | Painting: month grid, day/week time grid, year view, mini-month |
 | `src/layout.rs` | Pure geometry: where events and cells go, and what each screen area means to the pointer |

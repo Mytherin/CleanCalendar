@@ -22,6 +22,10 @@ mod theme;
 mod views;
 
 fn main() -> eframe::Result {
+    #[cfg(feature = "build-places")]
+    if let Some(code) = places::build::main_if_asked() {
+        std::process::exit(code);
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Calendar")
