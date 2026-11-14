@@ -13,8 +13,8 @@ use crate::editor::Outcome;
 use crate::model::{Event, Store};
 use crate::remote::{Cmd, GOOGLE};
 use crate::settings::{
-    self, duration_label, refresh_label, weekday_from_monday, weekday_name, Settings, WeekScroll, DURATION_CHOICES,
-    REFRESH_CHOICES,
+    self, duration_label, history_label, refresh_label, weekday_from_monday, weekday_name, Settings, WeekScroll,
+    DURATION_CHOICES, HISTORY_CHOICES, REFRESH_CHOICES,
 };
 use crate::theme::{self, Palette, ACCENT, RED};
 
@@ -144,8 +144,15 @@ impl App {
                 self.finish_editor(Outcome::Done);
             }
         }
+        // Download again for the new range: more history, or less kept.
+        let history_changed = s.history_months != before.history_months;
+        if history_changed {
+            for st in self.store.sync_state.values_mut() {
+                st.token = None;
+            }
+        }
         self.store.save();
-        if s.google_enabled && !before.google_enabled {
+        if (s.google_enabled && !before.google_enabled) || history_changed {
             self.sync();
         }
     }
@@ -536,6 +543,14 @@ fn advanced_tab(ui: &mut Ui, s: &mut Settings) {
         .on_hover_text("Shade each day in the year view by how busy it is");
     ui.checkbox(&mut s.week_numbers, "Show week numbers")
         .on_hover_text("Show the week number in the week and month views");
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Keep past events:");
+        let options: Vec<(u32, String)> = HISTORY_CHOICES.iter().map(|&m| (m, history_label(m))).collect();
+        combo(ui, "history", &mut s.history_months, &options, 120.0);
+    })
+    .response
+    .on_hover_text("How much of the past to download from iCloud, CalDAV and Google calendars (and to search)");
     ui.add_space(2.0);
 }
 
