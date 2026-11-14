@@ -46,8 +46,19 @@ Google requires every app to have its own OAuth client:
 3. Go to **Credentials → Create credentials → OAuth client ID**, application type **Desktop app**.
 4. In CleanCalendar click **Connect Google**, paste the client ID and secret, and click **Sign in with Google**.
 
-After sign-in the app syncs on launch and every 5 minutes, and you can press ⟳ to sync immediately.
-The sync window is 6 months back to 12 months ahead.
+### How sync works
+
+- **Your changes** (create, edit, move, resize, delete, change calendar) are uploaded right away and marked *pending* until Google confirms them.
+  If Google can't be reached, they stay pending and are retried every minute. The toolbar shows "N changes not yet on Google".
+  Pending changes survive restarts, and a sync never overwrites an event that has unsent edits.
+- **Changes from elsewhere** (phone, web, other people) are pulled on launch, every 5 minutes, and when you press ⟳.
+  After the first full download, each calendar syncs incrementally using Google's sync tokens, so only changed events are fetched.
+  A full re-download runs weekly, when Google expires a token, or after Google rejects a change.
+  The full download covers 6 months back to 12 months ahead.
+- **Conflicts:**
+  - If you edit an event that someone else deleted on Google, their delete wins.
+  - If Google rejects an edit (for example, no permission), the app goes back to Google's version.
+  - Recurring events are edited one occurrence at a time.
 
 ## Data
 
@@ -63,14 +74,25 @@ Set `CLEANCALENDAR_DATA=<dir>` to use a different folder.
 | `src/main.rs` | Window setup |
 | `src/app.rs` | App state, toolbar, sidebar, event editor, Google dialog, sync merge |
 | `src/views.rs` | Month grid, day/week time grid (incl. drag interactions), year view, mini-month |
-| `src/google.rs` | OAuth flow, Calendar v3 REST client, background sync worker thread |
+| `src/sync.rs` | Sync bookkeeping (no UI, no I/O): what to upload, retries, merging Google's changes |
+| `src/google.rs` | OAuth flow, Calendar v3 REST client, background worker thread |
 | `src/model.rs` | `Calendar`, `Event`, and the JSON `Store` |
 | `src/theme.rs` | Apple-like palette for light and dark mode, fonts |
 | `src/dates.rs` | Date helpers |
+
+## Tests
+
+`cargo test` runs everything offline:
+
+- **`src/sync.rs`** replays sync scenarios step by step against the `SyncEngine`: offline edits retried until confirmed, editing during an upload, deleting before the first upload finishes, events deleted on Google, rejected edits, weekly full syncs, overlapping sync requests.
+- **`src/google/http_tests.rs`** runs the real HTTP client against a scripted local fake server. It covers access-token caching, paging, full vs. incremental (sync-token) requests, falling back to a full sync on `410 Gone`, percent-encoded calendar ids, POST vs. PATCH bodies, all-day dates, and how errors are classified.
+- Unit tests for dates, the week-view layout, and parsing Google's JSON.
+
+Nothing here talks to Google. Sign-in and live sync still need a manual or live check against a real account.
 
 ## Ideas for next steps
 
 - Recurring events created locally (Google recurring events already show, expanded into instances)
 - Search, event alerts/notifications, and an inspector-style popover next to the event
-- Incremental sync with Google `syncToken`s instead of re-fetching the window
+- Editing a whole recurring series ("this and all future events")
 - Keychain storage for tokens; additional providers (iCloud via CalDAV, Outlook)

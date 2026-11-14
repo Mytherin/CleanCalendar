@@ -2,6 +2,7 @@
 //! PKCE), the Calendar v3 REST API, and a background worker thread so the UI
 //! never blocks on the network.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -42,19 +43,96 @@ pub struct RemoteCalendar {
 
 /// Commands sent from the UI to the worker.
 pub enum Cmd {
-    Connect { client_id: String, client_secret: String },
-    Sync { creds: Creds, from: NaiveDate, to: NaiveDate },
-    Save { creds: Creds, google_calendar_id: String, event: Event },
-    Delete { creds: Creds, google_calendar_id: String, remote_id: String },
+    Connect {
+        client_id: String,
+        client_secret: String,
+    },
+    /// Fetch the calendar list, then changes for each calendar: incremental
+    /// when `tokens` has a sync token for it, otherwise everything in
+    /// [`from`, `to`).
+    Sync {
+        creds: Creds,
+        from: NaiveDate,
+        to: NaiveDate,
+        tokens: HashMap<String, String>,
+    },
+    Save {
+        creds: Creds,
+        google_calendar_id: String,
+        event: Event,
+    },
+    Delete {
+        creds: Creds,
+        google_calendar_id: String,
+        remote_id: String,
+    },
+}
+
+/// What one calendar's sync returned.
+pub struct CalendarChanges {
+    pub calendar_id: String,
+    /// `true`: `events` is the complete set for the sync window.
+    /// `false`: `events` and `cancelled` are only what changed.
+    pub full: bool,
+    pub events: Vec<Event>,
+    /// Remote ids of deleted events (or deleted recurring series).
+    pub cancelled: Vec<String>,
+    pub next_token: Option<String>,
+}
+
+/// How an upload failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// Offline, rate-limited, or a server error: try again later.
+    Retry,
+    /// The event no longer exists on Google.
+    Gone,
+    /// Google refused the change; retrying won't help.
+    Rejected,
 }
 
 /// Results sent from the worker back to the UI.
 pub enum Msg {
     Connected { refresh_token: String },
-    Synced { calendars: Vec<RemoteCalendar>, events: Vec<(String, Vec<Event>)> },
-    Saved { local_id: String, remote_id: String },
-    Deleted,
-    Error(String),
+    ConnectFailed(String),
+    Synced { calendars: Vec<RemoteCalendar>, changes: Vec<CalendarChanges> },
+    SyncFailed(String),
+    Saved { local_id: String, google_calendar_id: String, rev: u64, remote_id: String },
+    SaveFailed { local_id: String, google_calendar_id: String, error: String, kind: Failure },
+    Deleted { remote_id: String },
+    DeleteFailed { remote_id: String, google_calendar_id: String, error: String, kind: Failure },
+}
+
+/// A non-success HTTP response from Google.
+#[derive(Debug)]
+struct HttpError {
+    status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Google returned {}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+fn http_status(e: &anyhow::Error) -> Option<u16> {
+    e.downcast_ref::<HttpError>().map(|h| h.status)
+}
+
+fn classify(e: &anyhow::Error) -> Failure {
+    match e.downcast_ref::<HttpError>() {
+        // Network errors, timeouts, token refresh problems: transient.
+        None => Failure::Retry,
+        Some(h) => match h.status {
+            404 | 410 => Failure::Gone,
+            401 | 408 | 429 | 500..=599 => Failure::Retry,
+            403 if h.message.to_lowercase().contains("rate limit") => Failure::Retry,
+            _ => Failure::Rejected,
+        },
+    }
 }
 
 pub struct Worker {
@@ -72,7 +150,7 @@ impl Worker {
             .spawn(move || {
                 let mut client: Option<Client> = None;
                 for cmd in cmd_rx {
-                    let msg = run(&mut client, cmd).unwrap_or_else(|e| Msg::Error(format!("{e:#}")));
+                    let msg = run(&mut client, cmd);
                     if msg_tx.send(msg).is_err() {
                         break;
                     }
@@ -98,30 +176,62 @@ fn client_for(client: &mut Option<Client>, creds: Creds) -> &mut Client {
     client.as_mut().unwrap()
 }
 
-fn run(client: &mut Option<Client>, cmd: Cmd) -> Result<Msg> {
+fn run(client: &mut Option<Client>, cmd: Cmd) -> Msg {
+    let text = |e: anyhow::Error| format!("{e:#}");
     match cmd {
-        Cmd::Connect { client_id, client_secret } => {
-            let refresh_token = authorize(&client_id, &client_secret)?;
-            Ok(Msg::Connected { refresh_token })
-        }
-        Cmd::Sync { creds, from, to } => {
-            let c = client_for(client, creds);
-            let calendars = c.list_calendars()?;
-            let mut events = Vec::new();
-            for cal in &calendars {
-                events.push((cal.id.clone(), c.list_events(&cal.id, from, to)?));
-            }
-            Ok(Msg::Synced { calendars, events })
-        }
+        Cmd::Connect { client_id, client_secret } => match authorize(&client_id, &client_secret) {
+            Ok(refresh_token) => Msg::Connected { refresh_token },
+            Err(e) => Msg::ConnectFailed(text(e)),
+        },
+        Cmd::Sync { creds, from, to, tokens } => match sync_all(client_for(client, creds), from, to, &tokens) {
+            Ok((calendars, changes)) => Msg::Synced { calendars, changes },
+            Err(e) => Msg::SyncFailed(text(e)),
+        },
         Cmd::Save { creds, google_calendar_id, event } => {
-            let remote_id = client_for(client, creds).save_event(&google_calendar_id, &event)?;
-            Ok(Msg::Saved { local_id: event.id, remote_id })
+            match client_for(client, creds).save_event(&google_calendar_id, &event) {
+                Ok(remote_id) => Msg::Saved { local_id: event.id, google_calendar_id, rev: event.rev, remote_id },
+                Err(e) => Msg::SaveFailed { local_id: event.id, google_calendar_id, kind: classify(&e), error: text(e) },
+            }
         }
         Cmd::Delete { creds, google_calendar_id, remote_id } => {
-            client_for(client, creds).delete_event(&google_calendar_id, &remote_id)?;
-            Ok(Msg::Deleted)
+            match client_for(client, creds).delete_event(&google_calendar_id, &remote_id) {
+                Ok(()) => Msg::Deleted { remote_id },
+                Err(e) => Msg::DeleteFailed { remote_id, google_calendar_id, kind: classify(&e), error: text(e) },
+            }
         }
     }
+}
+
+fn sync_all(
+    c: &mut Client,
+    from: NaiveDate,
+    to: NaiveDate,
+    tokens: &HashMap<String, String>,
+) -> Result<(Vec<RemoteCalendar>, Vec<CalendarChanges>)> {
+    let calendars = c.list_calendars()?;
+    let mut out = Vec::new();
+    for cal in &calendars {
+        let incremental = match tokens.get(&cal.id) {
+            Some(token) => match c.list_events(&cal.id, Query::Changes(token)) {
+                Ok(changes) => Some(changes),
+                // The token expired: Google wants a full sync.
+                Err(e) if http_status(&e) == Some(410) => None,
+                Err(e) => return Err(e),
+            },
+            None => None,
+        };
+        let changes = match incremental {
+            Some(changes) => changes,
+            None => c.list_events(&cal.id, Query::Window(from, to))?,
+        };
+        out.push(changes);
+    }
+    Ok((calendars, out))
+}
+
+enum Query<'a> {
+    Window(NaiveDate, NaiveDate),
+    Changes(&'a str),
 }
 
 // ---------------------------------------------------------------------------
@@ -233,10 +343,17 @@ struct Client {
     http: reqwest::blocking::Client,
     creds: Creds,
     access: Option<(String, Instant)>,
+    /// Base URL of the Calendar API (overridable for tests).
+    api: String,
+    token_url: String,
 }
 
 impl Client {
     fn new(creds: Creds) -> Self {
+        Self::with_endpoints(creds, API, TOKEN_URL)
+    }
+
+    fn with_endpoints(creds: Creds, api: &str, token_url: &str) -> Self {
         Client {
             http: reqwest::blocking::Client::builder()
                 .timeout(StdDuration::from_secs(30))
@@ -244,6 +361,8 @@ impl Client {
                 .expect("http client"),
             creds,
             access: None,
+            api: api.to_owned(),
+            token_url: token_url.to_owned(),
         }
     }
 
@@ -255,7 +374,7 @@ impl Client {
         }
         let resp: Value = self
             .http
-            .post(TOKEN_URL)
+            .post(&self.token_url)
             .form(&[
                 ("client_id", self.creds.client_id.trim()),
                 ("client_secret", self.creds.client_secret.trim()),
@@ -273,20 +392,24 @@ impl Client {
         Ok(tok)
     }
 
-    fn url(segments: &[&str]) -> Url {
-        let mut url = Url::parse(API).unwrap();
-        url.path_segments_mut().unwrap().extend(segments);
+    fn url(&self, segments: &[&str]) -> Url {
+        let mut url = Url::parse(&self.api).expect("valid API base URL");
+        url.path_segments_mut().expect("API base URL has a path").pop_if_empty().extend(segments);
         url
     }
 
     fn check(resp: reqwest::blocking::Response) -> Result<reqwest::blocking::Response> {
         if resp.status().is_success() {
-            Ok(resp)
-        } else {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            bail!("Google API error {status}: {body}")
+            return Ok(resp);
         }
+        let status = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+        // Google errors look like {"error": {"code": 404, "message": "Not Found", ...}}
+        let message = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+            .unwrap_or(body);
+        Err(HttpError { status, message }.into())
     }
 
     fn list_calendars(&mut self) -> Result<Vec<RemoteCalendar>> {
@@ -312,7 +435,7 @@ impl Client {
         let mut out = Vec::new();
         let mut page_token: Option<String> = None;
         loop {
-            let mut url = Self::url(&["users", "me", "calendarList"]);
+            let mut url = self.url(&["users", "me", "calendarList"]);
             if let Some(t) = &page_token {
                 url.query_pairs_mut().append_pair("pageToken", t);
             }
@@ -339,29 +462,48 @@ impl Client {
         Ok(out)
     }
 
-    fn list_events(&mut self, cal_id: &str, from: NaiveDate, to: NaiveDate) -> Result<Vec<Event>> {
-        let time_min = to_rfc3339(from.and_hms_opt(0, 0, 0).unwrap());
-        let time_max = to_rfc3339(to.and_hms_opt(0, 0, 0).unwrap());
-        let mut out = Vec::new();
+    /// Lists a calendar's events: everything in a date window (full sync),
+    /// or what changed since a sync token (incremental sync). Recurring
+    /// events are expanded into individual occurrences either way.
+    fn list_events(&mut self, cal_id: &str, query: Query) -> Result<CalendarChanges> {
+        let mut out = CalendarChanges {
+            calendar_id: cal_id.to_owned(),
+            full: matches!(query, Query::Window(..)),
+            events: Vec::new(),
+            cancelled: Vec::new(),
+            next_token: None,
+        };
         let mut page_token: Option<String> = None;
         loop {
-            let mut url = Self::url(&["calendars", cal_id, "events"]);
+            let mut url = self.url(&["calendars", cal_id, "events"]);
             {
                 let mut q = url.query_pairs_mut();
-                q.append_pair("singleEvents", "true")
-                    .append_pair("maxResults", "2500")
-                    .append_pair("timeMin", &time_min)
-                    .append_pair("timeMax", &time_max);
+                q.append_pair("singleEvents", "true").append_pair("maxResults", "2500");
+                match &query {
+                    Query::Window(from, to) => {
+                        q.append_pair("timeMin", &to_rfc3339(from.and_hms_opt(0, 0, 0).unwrap()))
+                            .append_pair("timeMax", &to_rfc3339(to.and_hms_opt(0, 0, 0).unwrap()));
+                    }
+                    Query::Changes(token) => {
+                        q.append_pair("syncToken", token);
+                    }
+                }
                 if let Some(t) = &page_token {
                     q.append_pair("pageToken", t);
                 }
             }
             let page: Value = Self::check(self.http.get(url).bearer_auth(self.token()?).send()?)?.json()?;
-            if let Some(items) = page["items"].as_array() {
-                out.extend(items.iter().filter_map(|item| event_from_json(cal_id, item)));
+            for item in page["items"].as_array().into_iter().flatten() {
+                match parse_item(cal_id, item) {
+                    Some(Item::Event(ev)) => out.events.push(ev),
+                    Some(Item::Cancelled(id)) => out.cancelled.push(id),
+                    None => {}
+                }
             }
             page_token = page["nextPageToken"].as_str().map(str::to_owned);
             if page_token.is_none() {
+                // Only the last page carries the token for the next sync.
+                out.next_token = page["nextSyncToken"].as_str().map(str::to_owned);
                 break;
             }
         }
@@ -373,8 +515,8 @@ impl Client {
         let body = event_to_json(ev);
         let token = self.token()?;
         let req = match &ev.remote_id {
-            Some(rid) => self.http.patch(Self::url(&["calendars", cal_id, "events", rid])),
-            None => self.http.post(Self::url(&["calendars", cal_id, "events"])),
+            Some(rid) => self.http.patch(self.url(&["calendars", cal_id, "events", rid])),
+            None => self.http.post(self.url(&["calendars", cal_id, "events"])),
         };
         let resp: Value = Self::check(req.bearer_auth(token).json(&body).send()?)?.json()?;
         resp["id"].as_str().map(str::to_owned).ok_or_else(|| anyhow!("Google returned no event id"))
@@ -383,7 +525,7 @@ impl Client {
     fn delete_event(&mut self, cal_id: &str, remote_id: &str) -> Result<()> {
         let resp = self
             .http
-            .delete(Self::url(&["calendars", cal_id, "events", remote_id]))
+            .delete(self.url(&["calendars", cal_id, "events", remote_id]))
             .bearer_auth(self.token()?)
             .send()?;
         // Already gone is fine.
@@ -407,6 +549,18 @@ pub fn local_calendar_id(google_calendar_id: &str) -> String {
     format!("google:{google_calendar_id}")
 }
 
+enum Item {
+    Event(Event),
+    Cancelled(String),
+}
+
+fn parse_item(cal_id: &str, v: &Value) -> Option<Item> {
+    if v["status"].as_str() == Some("cancelled") {
+        return Some(Item::Cancelled(v["id"].as_str()?.to_owned()));
+    }
+    event_from_json(cal_id, v).map(Item::Event)
+}
+
 fn event_from_json(cal_id: &str, v: &Value) -> Option<Event> {
     if v["status"].as_str() == Some("cancelled") {
         return None;
@@ -424,6 +578,9 @@ fn event_from_json(cal_id: &str, v: &Value) -> Option<Event> {
         location: v["location"].as_str().unwrap_or_default().to_owned(),
         notes: v["description"].as_str().unwrap_or_default().to_owned(),
         remote_id: Some(remote_id),
+        recurring_id: v["recurringEventId"].as_str().map(str::to_owned),
+        pending: false,
+        rev: 0,
     })
 }
 
@@ -498,5 +655,41 @@ mod tests {
     fn hex_colors() {
         assert_eq!(parse_hex("#9fe1e7"), Some([0x9f, 0xe1, 0xe7]));
         assert_eq!(parse_hex("nope"), None);
+    }
+}
+
+#[cfg(test)]
+mod http_tests;
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    fn http(status: u16, message: &str) -> anyhow::Error {
+        HttpError { status, message: message.into() }.into()
+    }
+
+    #[test]
+    fn classifies_failures() {
+        assert_eq!(classify(&anyhow!("connection refused")), Failure::Retry);
+        assert_eq!(classify(&http(503, "Backend Error")), Failure::Retry);
+        assert_eq!(classify(&http(429, "Too Many Requests")), Failure::Retry);
+        assert_eq!(classify(&http(403, "Rate Limit Exceeded")), Failure::Retry);
+        assert_eq!(classify(&http(404, "Not Found")), Failure::Gone);
+        assert_eq!(classify(&http(410, "Deleted")), Failure::Gone);
+        assert_eq!(classify(&http(400, "Bad Request")), Failure::Rejected);
+        assert_eq!(classify(&http(403, "Forbidden")), Failure::Rejected);
+    }
+
+    #[test]
+    fn parses_cancelled_items() {
+        let v = json!({"id": "abc", "status": "cancelled"});
+        assert!(matches!(parse_item("c", &v), Some(Item::Cancelled(id)) if id == "abc"));
+        let v = json!({"id": "i1", "recurringEventId": "series",
+            "start": {"date": "2026-11-11"}, "end": {"date": "2026-11-12"}});
+        match parse_item("c", &v) {
+            Some(Item::Event(ev)) => assert_eq!(ev.recurring_id.as_deref(), Some("series")),
+            _ => panic!("expected an event"),
+        }
     }
 }

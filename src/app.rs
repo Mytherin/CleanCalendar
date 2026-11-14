@@ -6,12 +6,16 @@ use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, Stroke, Vec2};
 
 use crate::dates::*;
-use crate::google::{self, Cmd, Creds, Msg, Worker};
+use crate::google::{Cmd, Worker};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
+use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, ACCENT, RED};
 use crate::views;
 
+/// How often to pull changes from Google.
 const AUTO_SYNC: StdDuration = StdDuration::from_secs(5 * 60);
+/// How often to retry while local changes are waiting to upload.
+const RETRY_SYNC: StdDuration = StdDuration::from_secs(60);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -87,6 +91,7 @@ pub struct App {
     sidebar_open: bool,
     mini_month: NaiveDate,
     worker: Worker,
+    engine: SyncEngine,
     last_sync: Option<Instant>,
     status: Option<(String, bool)>,
     show_google: bool,
@@ -109,127 +114,85 @@ impl App {
             sidebar_open: true,
             mini_month: first_of_month(today),
             worker: Worker::spawn(cc.egui_ctx.clone()),
+            engine: SyncEngine::default(),
             last_sync: None,
             status: None,
             show_google: false,
         };
+        SyncEngine::prepare(&mut app.store);
         app.sync();
         app
     }
 
-    // ---- Google glue ------------------------------------------------------
-
-    fn creds(&self) -> Option<Creds> {
-        let g = &self.store.google;
-        Some(Creds {
-            client_id: g.client_id.clone(),
-            client_secret: g.client_secret.clone(),
-            refresh_token: g.refresh_token.clone()?,
-        })
-    }
+    // ---- Google glue (the logic lives in sync.rs) -------------------------
 
     fn sync(&mut self) {
-        if let Some(creds) = self.creds() {
+        if self.engine.sync(&self.store, self.today) {
             self.last_sync = Some(Instant::now());
-            let from = add_months(first_of_month(self.today), -6);
-            let to = add_months(first_of_month(self.today), 13);
-            self.worker.send(Cmd::Sync { creds, from, to });
         }
+        self.flush();
     }
 
-    fn push(&mut self, id: &str) {
-        let Some(ev) = self.store.event(id).cloned() else { return };
-        let Some(gid) = self.store.calendar(&ev.calendar_id).and_then(|c| c.google_id()).map(str::to_owned) else {
-            return;
-        };
-        if let Some(creds) = self.creds() {
-            self.worker.send(Cmd::Save { creds, google_calendar_id: gid, event: ev });
+    fn dragging_id(&self) -> Option<String> {
+        match &self.drag {
+            Some(Drag::Move { id, .. } | Drag::Resize { id }) => Some(id.clone()),
+            _ => None,
         }
     }
 
     fn handle_messages(&mut self) {
+        let mut any = false;
         while let Ok(msg) = self.worker.rx.try_recv() {
             self.worker.busy = self.worker.busy.saturating_sub(1);
-            match msg {
-                Msg::Connected { refresh_token } => {
-                    self.store.google.refresh_token = Some(refresh_token);
-                    self.store.save();
-                    self.status = Some(("Connected to Google".into(), false));
-                    self.sync();
+            let dragging = self.dragging_id();
+            self.engine.handle(&mut self.store, msg, dragging.as_deref(), self.today);
+            self.apply_notices();
+            any = true;
+        }
+        if any {
+            self.flush();
+        }
+    }
+
+    /// Reacts to what the sync engine reported.
+    fn apply_notices(&mut self) {
+        for notice in std::mem::take(&mut self.engine.notices) {
+            match notice {
+                Notice::Status { text, error } => {
+                    if error {
+                        eprintln!("Google: {text}");
+                    }
+                    self.status = Some((text, error));
                 }
-                Msg::Synced { calendars, events } => self.merge_sync(calendars, events),
-                Msg::Saved { local_id, remote_id } => {
-                    if let Some(ev) = self.store.event_mut(&local_id) {
-                        let gid = ev.calendar_id.trim_start_matches("google:").to_owned();
-                        ev.remote_id = Some(remote_id.clone());
-                        ev.id = google::local_event_id(&gid, &remote_id);
-                        if self.selected.as_deref() == Some(local_id.as_str()) {
-                            self.selected = Some(ev.id.clone());
+                Notice::Renamed { from, to } => {
+                    if self.selected.as_deref() == Some(from.as_str()) {
+                        self.selected = Some(to.clone());
+                    }
+                    if let Some(ed) = self.editor.as_mut().filter(|ed| ed.draft.id == from) {
+                        ed.draft.id = to.clone();
+                    }
+                    if let Some(Drag::Move { id, .. } | Drag::Resize { id }) = &mut self.drag {
+                        if *id == from {
+                            *id = to.clone();
                         }
-                        self.store.save();
                     }
                 }
-                Msg::Deleted => {}
-                Msg::Error(e) => {
-                    eprintln!("Google: {e}");
-                    self.status = Some((e, true));
+                Notice::Removed(id) => {
+                    if self.selected.as_deref() == Some(id.as_str()) {
+                        self.selected = None;
+                    }
                 }
             }
         }
     }
 
-    fn merge_sync(&mut self, remote: Vec<google::RemoteCalendar>, events: Vec<(String, Vec<Event>)>) {
-        let primary_email = remote.iter().find(|c| c.primary).map(|c| c.id.clone());
-        self.store.google.account_email = primary_email;
-
-        let keep: Vec<String> = remote.iter().map(|c| google::local_calendar_id(&c.id)).collect();
-        self.store
-            .calendars
-            .retain(|c| matches!(c.source, Source::Local) || keep.contains(&c.id));
-        for rc in &remote {
-            let id = google::local_calendar_id(&rc.id);
-            match self.store.calendars.iter_mut().find(|c| c.id == id) {
-                Some(c) => {
-                    c.name = rc.name.clone();
-                    c.read_only = rc.read_only;
-                }
-                None => self.store.calendars.push(Calendar {
-                    id,
-                    name: rc.name.clone(),
-                    color: rc.color,
-                    visible: true,
-                    source: Source::Google { calendar_id: rc.id.clone() },
-                    read_only: rc.read_only,
-                }),
-            }
+    /// Hands queued commands to the worker, applies notices, and saves.
+    fn flush(&mut self) {
+        for cmd in self.engine.outbox.drain(..) {
+            self.worker.send(cmd);
         }
-        // Order: local first, then Google in the server's order.
-        self.store.calendars.sort_by_key(|c| match &c.source {
-            Source::Local => usize::MAX - 1_000_000,
-            Source::Google { calendar_id } => remote.iter().position(|r| &r.id == calendar_id).unwrap_or(0),
-        });
-        self.store.calendars.sort_by_key(|c| !matches!(c.source, Source::Local));
-
-        let google_cals: Vec<String> =
-            self.store.calendars.iter().filter(|c| c.google_id().is_some()).map(|c| c.id.clone()).collect();
-        let dragging = match &self.drag {
-            Some(Drag::Move { id, .. } | Drag::Resize { id }) => Some(id.clone()),
-            _ => None,
-        };
-        // Keep unsynced (not yet uploaded) events and the one being dragged.
-        self.store.events.retain(|e| {
-            !google_cals.contains(&e.calendar_id) || e.remote_id.is_none() || Some(&e.id) == dragging.as_ref()
-        });
-        for (_, evs) in events {
-            for ev in evs {
-                if Some(&ev.id) != dragging.as_ref() {
-                    self.store.events.push(ev);
-                }
-            }
-        }
+        self.apply_notices();
         self.store.save();
-        let n = self.store.calendars.iter().filter(|c| c.google_id().is_some()).count();
-        self.status = Some((format!("Synced {n} Google calendars"), false));
     }
 
     // ---- Event operations -------------------------------------------------
@@ -254,6 +217,9 @@ impl App {
             location: String::new(),
             notes: String::new(),
             remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
         };
         self.editor = Some(Editor::new(draft, true));
     }
@@ -273,25 +239,28 @@ impl App {
         if is_new {
             self.store.events.push(ev);
         } else if let Some(old) = self.store.event(&id).cloned() {
+            // Sync bookkeeping lives on the stored copy, not the editor's draft.
+            ev.rev = old.rev;
+            ev.pending = old.pending;
+            ev.remote_id = old.remote_id.clone();
+            ev.recurring_id = old.recurring_id.clone();
             // Moving to another calendar means delete + recreate remotely.
             if old.calendar_id != ev.calendar_id {
-                self.delete_remote(old);
+                self.engine.event_deleted(&mut self.store, &old);
                 ev.remote_id = None;
+                ev.recurring_id = None;
             }
             if let Some(slot) = self.store.event_mut(&id) {
                 *slot = ev;
             }
+        } else {
+            // Deleted (e.g. by a sync) while the editor was open.
+            self.status = Some(("That event was deleted while you were editing it".into(), true));
+            return;
         }
-        self.selected = Some(id.clone());
-        self.store.save();
-        self.push(&id);
-    }
-
-    fn delete_remote(&mut self, ev: Event) {
-        let gid = self.store.calendar(&ev.calendar_id).and_then(|c| c.google_id()).map(str::to_owned);
-        if let (Some(gid), Some(rid), Some(creds)) = (gid, ev.remote_id, self.creds()) {
-            self.worker.send(Cmd::Delete { creds, google_calendar_id: gid, remote_id: rid });
-        }
+        self.engine.event_changed(&mut self.store, &id);
+        self.selected = Some(id);
+        self.flush();
     }
 
     fn delete_event(&mut self, id: &str) {
@@ -299,12 +268,12 @@ impl App {
         if self.store.calendar(&ev.calendar_id).is_some_and(|c| c.read_only) {
             return;
         }
-        self.delete_remote(ev);
         self.store.events.retain(|e| e.id != id);
+        self.engine.event_deleted(&mut self.store, &ev);
         if self.selected.as_deref() == Some(id) {
             self.selected = None;
         }
-        self.store.save();
+        self.flush();
     }
 
     fn apply_actions(&mut self) {
@@ -315,8 +284,8 @@ impl App {
                 Action::New { start, end, all_day } => self.new_event(start, end, all_day),
                 Action::GoTo(d, v) => self.go_to(d, v),
                 Action::Committed(id) => {
-                    self.store.save();
-                    self.push(&id);
+                    self.engine.event_changed(&mut self.store, &id);
+                    self.flush();
                 }
             }
         }
@@ -431,6 +400,11 @@ impl App {
                         let google_label = if connected { "Google ✓" } else { "Connect Google" };
                         if ui.button(google_label).clicked() {
                             self.show_google = true;
+                        }
+                        let unsynced = self.store.unsynced_count();
+                        if connected && unsynced > 0 {
+                            let s = if unsynced == 1 { "" } else { "s" };
+                            ui.label(RichText::new(format!("{unsynced} change{s} not yet on Google")).color(p.secondary).small());
                         }
                         if let Some((msg, err)) = &self.status {
                             let color = if *err { RED } else { p.secondary };
@@ -763,7 +737,7 @@ impl App {
                         g.account_email.as_ref().map(|e| format!(" as {e}")).unwrap_or_default()
                     ));
                     ui.label(
-                        RichText::new("Events sync automatically every 5 minutes. Changes you make are sent to Google right away.")
+                        RichText::new("Changes from other devices appear within 5 minutes. Your changes are sent to Google right away; if Google can't be reached they're kept and retried every minute.")
                             .color(p.secondary),
                     );
                     ui.add_space(8.0);
@@ -812,14 +786,8 @@ impl App {
             self.worker.send(Cmd::Connect { client_id: g.client_id.clone(), client_secret: g.client_secret.clone() });
         }
         if disconnect {
-            self.store.google.refresh_token = None;
-            self.store.google.account_email = None;
-            let gone: Vec<String> =
-                self.store.calendars.iter().filter(|c| c.google_id().is_some()).map(|c| c.id.clone()).collect();
-            self.store.calendars.retain(|c| !gone.contains(&c.id));
-            self.store.events.retain(|e| !gone.contains(&e.calendar_id));
-            self.store.save();
-            self.status = Some(("Disconnected from Google".into(), false));
+            self.engine.disconnect(&mut self.store);
+            self.flush();
         }
     }
 }
@@ -831,7 +799,8 @@ impl eframe::App for App {
         self.today = Local::now().date_naive();
 
         self.handle_messages();
-        if self.last_sync.is_some_and(|t| t.elapsed() > AUTO_SYNC) {
+        let interval = if self.store.unsynced_count() > 0 { RETRY_SYNC } else { AUTO_SYNC };
+        if self.last_sync.is_some_and(|t| t.elapsed() > interval) {
             self.sync();
         }
         self.shortcuts(ctx);

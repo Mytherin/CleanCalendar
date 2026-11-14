@@ -548,6 +548,9 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
                     location: String::new(),
                     notes: String::new(),
                     remote_id: None,
+                    recurring_id: None,
+                    pending: false,
+                    rev: 0,
                 };
                 draw_timed(ui, &painter, r, &ghost, theme::ACCENT, false, p);
             }
@@ -774,6 +777,9 @@ mod tests {
             location: String::new(),
             notes: String::new(),
             remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
         }
     }
 

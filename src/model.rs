@@ -1,5 +1,6 @@
 //! Core data model: calendars, events, and the on-disk store.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::{Duration, NaiveDate, NaiveDateTime};
@@ -60,6 +61,16 @@ pub struct Event {
     /// The event's id on the remote service, if it lives on one.
     #[serde(default)]
     pub remote_id: Option<String>,
+    /// For one occurrence of a recurring remote event: the series id.
+    #[serde(default)]
+    pub recurring_id: Option<String>,
+    /// Local changes that the remote service hasn't confirmed yet.
+    #[serde(default)]
+    pub pending: bool,
+    /// Bumped on every local change, so a late confirmation of an older
+    /// upload doesn't clear `pending` for a newer edit.
+    #[serde(default)]
+    pub rev: u64,
 }
 
 impl Event {
@@ -96,12 +107,33 @@ impl GoogleSettings {
     }
 }
 
+/// A remote deletion that hasn't been confirmed yet.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PendingDelete {
+    pub google_calendar_id: String,
+    pub remote_id: String,
+}
+
+/// Per-calendar incremental sync bookmark.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SyncState {
+    /// Google's `nextSyncToken`; `None` forces a full sync.
+    pub token: Option<String>,
+    /// When the last full sync happened.
+    pub full_sync_on: Option<NaiveDate>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Store {
     pub calendars: Vec<Calendar>,
     pub events: Vec<Event>,
     #[serde(default)]
     pub google: GoogleSettings,
+    #[serde(default)]
+    pub pending_deletes: Vec<PendingDelete>,
+    /// Keyed by Google calendar id.
+    #[serde(default)]
+    pub sync_state: HashMap<String, SyncState>,
 }
 
 impl Store {
@@ -154,6 +186,8 @@ impl Store {
             ],
             events: Vec::new(),
             google: GoogleSettings::default(),
+            pending_deletes: Vec::new(),
+            sync_state: HashMap::new(),
         }
     }
 
@@ -183,6 +217,16 @@ impl Store {
 
     pub fn event_mut(&mut self, id: &str) -> Option<&mut Event> {
         self.events.iter_mut().find(|e| e.id == id)
+    }
+
+    /// The Google calendar id an event lives on, if any.
+    pub fn google_calendar_of(&self, ev: &Event) -> Option<String> {
+        self.calendar(&ev.calendar_id).and_then(|c| c.google_id()).map(str::to_owned)
+    }
+
+    /// Number of local changes not yet confirmed by Google.
+    pub fn unsynced_count(&self) -> usize {
+        self.events.iter().filter(|e| e.pending).count() + self.pending_deletes.len()
     }
 
     pub fn is_visible(&self, calendar_id: &str) -> bool {

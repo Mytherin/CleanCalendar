@@ -4,6 +4,7 @@ mod app;
 mod dates;
 mod google;
 mod model;
+mod sync;
 mod theme;
 mod views;
 
