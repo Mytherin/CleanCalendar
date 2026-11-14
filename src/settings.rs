@@ -241,7 +241,19 @@ fn read_system_week_start() -> Option<Weekday> {
         return None;
     }
     let out = std::process::Command::new("locale").args(["week-1stday", "first_weekday"]).output().ok()?;
-    parse_locale_week_start(&String::from_utf8_lossy(&out.stdout))
+    locale_answer(out.status.success(), &out.stdout, &out.stderr)
+}
+
+/// What `locale` said, if it can be trusted. When the configured locale
+/// isn't installed (common in containers and minimal systems) `locale`
+/// warns on stderr and answers for the C locale instead, whose
+/// `first_weekday` would make the week start on Saturday.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn locale_answer(ok: bool, stdout: &[u8], stderr: &[u8]) -> Option<Weekday> {
+    if !ok || !String::from_utf8_lossy(stderr).trim().is_empty() {
+        return None;
+    }
+    parse_locale_week_start(&String::from_utf8_lossy(stdout))
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -279,6 +291,16 @@ mod tests {
         assert_eq!(parse_locale_week_start("19971130\n0\n"), None);
         assert_eq!(parse_locale_week_start("locale: Cannot set LC_ALL\n"), None);
         assert_eq!(parse_locale_week_start(""), None);
+    }
+
+    #[test]
+    fn a_missing_locale_is_unknown_not_saturday() {
+        // LANG names a locale that isn't installed: `locale` warns and prints
+        // the C locale's answer, which reads as Saturday.
+        let warn = b"locale: Cannot set LC_ALL to default locale: No such file or directory\n";
+        assert_eq!(locale_answer(true, b"19971130\n7\n", warn), None);
+        assert_eq!(locale_answer(false, b"19971130\n2\n", b""), None);
+        assert_eq!(locale_answer(true, b"19971130\n2\n", b""), Some(Weekday::Mon));
     }
 
     #[test]

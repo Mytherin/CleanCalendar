@@ -483,10 +483,20 @@ impl MonthScroll {
 
     /// Scrolls by `rows` (positive is later).
     pub fn scroll(&mut self, rows: f32) {
+        // A four-week month at rest (a February starting on the first day
+        // of the week) would otherwise make every month scrolled to show in
+        // four tall rows; scrolling shows at least five, like the others.
+        self.rows = self.rows.max(5);
         self.offset += rows;
         let whole = self.offset.floor();
-        self.top += Duration::days(7 * whole as i64);
-        self.offset -= whole;
+        // Weeks out of chrono's range (scrolling for millennia) stop there.
+        match Duration::try_days(7 * whole as i64).and_then(|d| self.top.checked_add_signed(d)) {
+            Some(top) => {
+                self.top = top;
+                self.offset -= whole;
+            }
+            None => self.offset = 0.0,
+        }
     }
 
     /// The month shown (the one in the middle row), first day.
@@ -505,7 +515,9 @@ impl MonthScroll {
     pub fn settle(&mut self, t: f32) -> bool {
         let target = self.offset.round();
         if (target - self.offset).abs() < 0.002 {
-            self.top += Duration::days(7 * target as i64);
+            if let Some(top) = self.top.checked_add_signed(Duration::days(7 * target as i64)) {
+                self.top = top;
+            }
             self.offset = 0.0;
             return false;
         }
@@ -790,6 +802,23 @@ mod tests {
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn scrolling_away_from_a_four_week_month_shows_at_least_five_rows() {
+        // February 2027 starts on a Monday, February 2026 on a Sunday: one
+        // of them fills exactly four weeks whichever day weeks start on.
+        let four = [date(2026, 2, 10), date(2027, 2, 10)]
+            .into_iter()
+            .map(MonthScroll::at_rest)
+            .find(|p| p.rows == 4)
+            .expect("a four-week February");
+        let mut pos = four;
+        pos.scroll(3.5);
+        assert_eq!(pos.rows, 5);
+        pos.scroll(-3.5);
+        assert_eq!(pos.rows, 5, "kept while scrolling, so rows don't change height");
+        assert!(MonthScroll::at_rest(date(2026, 11, 10)).rows >= 5, "other months unchanged at rest");
     }
 
     #[test]

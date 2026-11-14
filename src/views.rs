@@ -392,7 +392,9 @@ fn month_scroll(app: &mut App, ui: &Ui, rect: Rect) -> layout::MonthScroll {
     if over && dy != 0.0 && !app.pointer.is_active() && app.menu.is_none() {
         st.pos.scroll(-dy / cell_h);
         st.last_input = time;
-    } else if st.pos.offset != 0.0 && time - st.last_input > SETTLE_AFTER_S {
+    } else if st.pos.offset != 0.0 && time - st.last_input > SETTLE_AFTER_S && !app.pointer.is_active() {
+        // (Not while dragging: the grid would slide under the dragged event,
+        // and it would land on another day than the one under the pointer.)
         st.pos.settle(1.0 - (-dt * SETTLE_RATE).exp());
     }
     if st.pos.offset != 0.0 {
@@ -403,6 +405,10 @@ fn month_scroll(app: &mut App, ui: &Ui, rect: Rect) -> layout::MonthScroll {
     if month != first_of_month(app.date) {
         app.month_scrolled_to(month);
         st.for_date = app.date;
+        // The title and sidebar were drawn before this, with the old month:
+        // draw once more so they catch up even if scrolling stopped exactly
+        // on a week boundary.
+        ctx.request_repaint();
     }
     app.month_scroll = Some(st);
     st.pos
