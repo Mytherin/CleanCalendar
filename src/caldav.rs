@@ -249,7 +249,7 @@ impl Client {
         }
         let resp = Self::check(resp)?;
         let etag = resp.headers().get("ETag").and_then(|v| v.to_str().ok()).map(str::to_owned);
-        let ics = ical::parse(&resp.text()?).map_err(|e| Unworkable(format!("the server's copy of {url} can't be read: {e:#}")))?;
+        let ics = ical::parse_bytes(&resp.bytes()?).map_err(|e| Unworkable(format!("the server's copy of {url} can't be read: {e:#}")))?;
         Ok(Some((ics, etag)))
     }
 
