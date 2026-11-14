@@ -22,7 +22,7 @@ Built on [egui/eframe](https://github.com/emilk/egui).
   - *Locations:* the countries whose location data is installed (update or remove each), downloads in progress, and a search for countries to add.
   - *Advanced:* shade busy days in the year view, show week numbers in the week and month views, and how much of the past to keep from synced calendars (all of it by default, or the last 5 years, 2 years, 1 year or 6 months).
 - **Invitees:** on Google calendars, type addresses into "Add Invitees" (Enter, comma or semicolon adds one). Google emails the invitations, updates and cancellations, and each guest's reply (accepted, maybe, declined, no response) is shown next to their name.
-- **iCloud and CalDAV** (the **Accounts** button in the toolbar): sign in with your Apple ID and an app-specific password (or any CalDAV server: Fastmail, Nextcloud, Radicale, …). All your calendars are imported, Reminders lists are skipped, and creates, edits, moves and deletes go back to the server. Repeating events from other apps show every occurrence, whatever their rule.
+- **iCloud and CalDAV** (Settings → Accounts → +): sign in with your Apple ID and an app-specific password (or any CalDAV server: Fastmail, Nextcloud, Radicale, …). All your calendars are imported, Reminders lists are skipped, and creates, edits, moves and deletes go back to the server. Repeating events from other apps show every occurrence, whatever their rule.
 - **Several accounts at once:** iCloud, other CalDAV servers and Google side by side, each in its own group in the sidebar.
 - **Google Calendar:** OAuth sign-in in your browser (loopback + PKCE), imports all your calendars, and sends creates, edits, moves and deletes back to Google. Read-only calendars (holidays, shared calendars) are shown but can't be edited.
 - Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows).
@@ -61,7 +61,7 @@ The executable is `target/release/CleanCalendar.exe`. On Windows, `build.rs` emb
 ## Connecting iCloud
 
 1. At [account.apple.com](https://account.apple.com/account/manage) go to **Sign-In and Security → App-Specific Passwords** and create one (e.g. "CleanCalendar"). Apple doesn't let other apps use your normal Apple ID password.
-2. In CleanCalendar click **Add Account** (or **Accounts**), choose **iCloud**, enter your Apple ID and the app-specific password, and click **Sign In**.
+2. In CleanCalendar open **Settings** (⚙) → **Accounts**, click **+**, choose **iCloud**, enter your Apple ID and the app-specific password, and click **Sign In**.
 
 For another CalDAV server choose **Other CalDAV server** and enter its address (e.g. `https://caldav.fastmail.com/`); the calendars are found from there (`/.well-known/caldav`, the user's principal, then the calendar home). The password is kept in the OS credential store.
 
@@ -72,7 +72,7 @@ Google requires every app to have its own OAuth client:
 1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and **enable the Google Calendar API**.
 2. Configure the **OAuth consent screen** (External is fine) and add your Google account as a **test user**.
 3. Go to **Credentials → Create credentials → OAuth client ID**, application type **Desktop app**.
-4. In CleanCalendar open **Settings → Accounts**, click **+**, choose Google, paste the client ID and secret, and click **Sign in with Google**. (**Accounts → Connect Google Calendar** in the toolbar does the same.)
+4. In CleanCalendar open **Settings → Accounts**, click **+**, choose Google, paste the client ID and secret, and click **Sign in with Google**.
 
 Google keeps using Google's own REST API rather than its CalDAV endpoint: it's richer (colours, sync tokens, structured JSON) and needs the same OAuth sign-in anyway.
 
