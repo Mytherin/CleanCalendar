@@ -325,6 +325,32 @@ pub fn occurrence(series: &Event, id: &str) -> Option<Event> {
         .find(|o| o.id == id)
 }
 
+/// A weekly series whose first day isn't one of its weekdays (created on a
+/// Wednesday, repeating Mondays and Thursdays) moved to its first actual
+/// occurrence. Google, like RFC 5545, always counts the start as an
+/// occurrence; this app doesn't, so without this the two would disagree
+/// (an extra Wednesday on Google, and one occurrence short with a count).
+pub fn aligned(mut ev: Event) -> Event {
+    let Some(rule) = ev.recurrence.as_ref().filter(|r| r.freq == Freq::Weekly && !r.weekdays.is_empty()) else {
+        return ev;
+    };
+    let zone = zone_of(&ev);
+    let first = to_zone(ev.start, zone);
+    if rule.weekdays.contains(&first.weekday()) {
+        return ev;
+    }
+    let mut candidates = Vec::new();
+    rule.period(first, 0, &mut candidates);
+    if candidates.is_empty() {
+        rule.period(first, 1, &mut candidates);
+    }
+    let Some(&start) = candidates.iter().min() else { return ev };
+    let len = to_zone(ev.end, zone) - first;
+    ev.start = from_zone(start, zone);
+    ev.end = from_zone(start + len, zone);
+    ev
+}
+
 /// When an event (or occurrence) starts in its series time.
 pub fn series_start(ev: &Event) -> NaiveDateTime {
     to_zone(ev.start, zone_of(ev))
@@ -591,6 +617,26 @@ mod tests {
         let ev = series(at(d(2024, 2, 29), 8, 0), 15, Recurrence::new(Freq::Yearly));
         let got: Vec<NaiveDate> = starts(&ev, d(2024, 1, 1), d(2033, 1, 1)).iter().map(|t| t.date()).collect();
         assert_eq!(got, [d(2024, 2, 29), d(2028, 2, 29), d(2032, 2, 29)]);
+    }
+
+    #[test]
+    fn a_weekly_series_starts_on_one_of_its_weekdays() {
+        // Wednesday 18 Nov 2026, repeating Mondays and Thursdays.
+        let mut rule = Recurrence::new(Freq::Weekly);
+        rule.weekdays = vec![Weekday::Mon, Weekday::Thu];
+        let ev = aligned(series(at(d(2026, 11, 18), 9, 0), 90, rule.clone()));
+        assert_eq!((ev.start, ev.end), (at(d(2026, 11, 19), 9, 0), at(d(2026, 11, 19), 10, 30)), "the Thursday after");
+
+        // Every other week, Mondays only, starting on a Friday: the Monday
+        // of the next period.
+        rule.weekdays = vec![Weekday::Mon];
+        rule.interval = 2;
+        let ev = aligned(series(at(d(2026, 11, 20), 9, 0), 60, rule.clone()));
+        assert_eq!(ev.start, at(d(2026, 11, 30), 9, 0));
+
+        // Already on one of its days: unchanged.
+        let ev = aligned(series(at(d(2026, 11, 16), 9, 0), 60, rule));
+        assert_eq!(ev.start, at(d(2026, 11, 16), 9, 0));
     }
 
     #[test]

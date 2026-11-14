@@ -352,8 +352,10 @@ fn all_day_events_are_sent_as_dates() {
     ev.end = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap().and_hms_opt(0, 0, 0).unwrap();
     server.client().save_event("primary", &ev).unwrap();
     let body = server.api_requests()[0].json();
-    assert_eq!(body["start"], json!({"date": "2026-11-11"}));
-    assert_eq!(body["end"], json!({"date": "2026-11-14"}));
+    // dateTime/timeZone are cleared, so a PATCH of a formerly timed event
+    // doesn't leave them next to the date.
+    assert_eq!(body["start"], json!({"date": "2026-11-11", "dateTime": null, "timeZone": null}));
+    assert_eq!(body["end"], json!({"date": "2026-11-14", "dateTime": null, "timeZone": null}));
 }
 
 #[test]
