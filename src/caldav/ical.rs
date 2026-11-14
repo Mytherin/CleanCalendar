@@ -40,11 +40,13 @@ pub struct Prop {
     pub params: Vec<(String, String)>,
     /// As written (TEXT values still escaped).
     pub value: String,
+    /// A line that couldn't be parsed, kept verbatim.
+    pub raw: Option<String>,
 }
 
 impl Prop {
     pub fn new(name: &str, value: impl Into<String>) -> Self {
-        Prop { name: name.to_owned(), params: Vec::new(), value: value.into() }
+        Prop { name: name.to_owned(), params: Vec::new(), value: value.into(), raw: None }
     }
 
     pub fn with(mut self, param: &str, value: &str) -> Self {
@@ -177,10 +179,12 @@ fn parse_line(line: &str) -> Option<Prop> {
         let pname = after[..eq].trim().to_ascii_uppercase();
         let mut v = &after[eq + 1..];
         let mut values = Vec::new();
+        let mut quoted = false;
         loop {
             if let Some(q) = v.strip_prefix('"') {
                 let close = q.find('"')?;
                 values.push(q[..close].to_owned());
+                quoted = true;
                 v = &q[close + 1..];
             } else {
                 let end = v.find([',', ';', ':']).unwrap_or(v.len());
@@ -192,11 +196,27 @@ fn parse_line(line: &str) -> Option<Prop> {
                 None => break,
             }
         }
-        params.push((pname, values.join(",")));
+        // Several quoted values ("a","b") are kept quoted one by one, so
+        // they're written back as they were.
+        let value = if values.len() > 1 && quoted {
+            values.iter().map(|x| format!("\"{x}\"")).collect::<Vec<_>>().join(",")
+        } else {
+            values.join(",")
+        };
+        params.push((pname, value));
         rest = v;
     }
     let value = rest.strip_prefix(':')?;
-    Some(Prop { name, params, value: value.to_owned() })
+    Some(Prop { name, params, value: value.to_owned(), raw: None })
+}
+
+/// A line that couldn't be read is kept as it was, to be written back
+/// unchanged.
+fn raw_line(line: &str) -> Option<Prop> {
+    let end = line.find([';', ':'])?;
+    let name = line[..end].trim().to_ascii_uppercase();
+    (!name.is_empty() && name != "BEGIN" && name != "END")
+        .then(|| Prop { name, params: Vec::new(), value: String::new(), raw: Some(line.to_owned()) })
 }
 
 /// Parses an iCalendar object (the outermost component, usually VCALENDAR).
@@ -216,7 +236,7 @@ pub fn parse(text: &str) -> Result<Component> {
     let mut stack: Vec<Component> = Vec::new();
     let mut done: Option<Component> = None;
     for line in &lines {
-        let Some(p) = parse_line(line) else { continue };
+        let Some(p) = parse_line(line).or_else(|| raw_line(line)) else { continue };
         match p.name.as_str() {
             "BEGIN" => stack.push(Component::new(&p.value.trim().to_ascii_uppercase())),
             "END" => {
@@ -255,7 +275,9 @@ fn fold(line: &str, out: &mut String) {
 }
 
 fn quote(v: &str) -> String {
-    if v.contains([':', ';', ',']) {
+    if v.starts_with('"') {
+        v.to_owned()
+    } else if v.contains([':', ';', ',']) {
         format!("\"{v}\"")
     } else {
         v.to_owned()
@@ -271,6 +293,10 @@ pub fn write(c: &Component) -> String {
 fn write_into(c: &Component, out: &mut String) {
     fold(&format!("BEGIN:{}", c.name), out);
     for p in &c.props {
+        if let Some(raw) = &p.raw {
+            fold(raw, out);
+            continue;
+        }
         let mut line = p.name.clone();
         for (k, v) in &p.params {
             line += &format!(";{k}={}", quote(v));
@@ -298,16 +324,82 @@ pub enum When {
     Zoned(NaiveDateTime, Tz),
 }
 
-/// A TZID: an IANA name, or one with a vendor prefix such as
-/// "/mozilla.org/20050126_1/America/New_York". Unknown zones give `None`.
+/// A TZID: an IANA name, one with a vendor prefix such as
+/// "/mozilla.org/20050126_1/America/New_York", or a Windows zone name (as
+/// Outlook and Exchange invitations use). Unknown zones give `None`.
 pub fn parse_tzid(s: &str) -> Option<Tz> {
     let s = s.trim().trim_matches('"');
     if let Some(tz) = recurrence::parse_zone(s) {
         return Some(tz);
     }
+    if let Some((_, iana)) = WINDOWS_ZONES.iter().find(|(w, _)| w.eq_ignore_ascii_case(s)) {
+        return recurrence::parse_zone(iana);
+    }
     let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
     (1..parts.len()).find_map(|i| recurrence::parse_zone(&parts[i..].join("/")))
 }
+
+/// Windows zone names → IANA (CLDR's "001" mappings), for the zones
+/// invitations most often carry.
+const WINDOWS_ZONES: &[(&str, &str)] = &[
+    ("Dateline Standard Time", "Etc/GMT+12"),
+    ("Hawaiian Standard Time", "Pacific/Honolulu"),
+    ("Alaskan Standard Time", "America/Anchorage"),
+    ("Pacific Standard Time", "America/Los_Angeles"),
+    ("Pacific Standard Time (Mexico)", "America/Tijuana"),
+    ("US Mountain Standard Time", "America/Phoenix"),
+    ("Mountain Standard Time", "America/Denver"),
+    ("Central America Standard Time", "America/Guatemala"),
+    ("Central Standard Time", "America/Chicago"),
+    ("Central Standard Time (Mexico)", "America/Mexico_City"),
+    ("Canada Central Standard Time", "America/Regina"),
+    ("SA Pacific Standard Time", "America/Bogota"),
+    ("Eastern Standard Time", "America/New_York"),
+    ("US Eastern Standard Time", "America/Indiana/Indianapolis"),
+    ("Atlantic Standard Time", "America/Halifax"),
+    ("Venezuela Standard Time", "America/Caracas"),
+    ("Pacific SA Standard Time", "America/Santiago"),
+    ("Newfoundland Standard Time", "America/St_Johns"),
+    ("E. South America Standard Time", "America/Sao_Paulo"),
+    ("Argentina Standard Time", "America/Buenos_Aires"),
+    ("UTC", "Etc/UTC"),
+    ("GMT Standard Time", "Europe/London"),
+    ("Greenwich Standard Time", "Atlantic/Reykjavik"),
+    ("W. Europe Standard Time", "Europe/Berlin"),
+    ("Central Europe Standard Time", "Europe/Budapest"),
+    ("Romance Standard Time", "Europe/Paris"),
+    ("Central European Standard Time", "Europe/Warsaw"),
+    ("W. Central Africa Standard Time", "Africa/Lagos"),
+    ("GTB Standard Time", "Europe/Bucharest"),
+    ("E. Europe Standard Time", "Europe/Chisinau"),
+    ("Egypt Standard Time", "Africa/Cairo"),
+    ("South Africa Standard Time", "Africa/Johannesburg"),
+    ("FLE Standard Time", "Europe/Kiev"),
+    ("Israel Standard Time", "Asia/Jerusalem"),
+    ("Turkey Standard Time", "Europe/Istanbul"),
+    ("Arab Standard Time", "Asia/Riyadh"),
+    ("Russian Standard Time", "Europe/Moscow"),
+    ("E. Africa Standard Time", "Africa/Nairobi"),
+    ("Iran Standard Time", "Asia/Tehran"),
+    ("Arabian Standard Time", "Asia/Dubai"),
+    ("Pakistan Standard Time", "Asia/Karachi"),
+    ("India Standard Time", "Asia/Calcutta"),
+    ("Nepal Standard Time", "Asia/Katmandu"),
+    ("Bangladesh Standard Time", "Asia/Dhaka"),
+    ("SE Asia Standard Time", "Asia/Bangkok"),
+    ("China Standard Time", "Asia/Shanghai"),
+    ("Singapore Standard Time", "Asia/Singapore"),
+    ("W. Australia Standard Time", "Australia/Perth"),
+    ("Taipei Standard Time", "Asia/Taipei"),
+    ("Tokyo Standard Time", "Asia/Tokyo"),
+    ("Korea Standard Time", "Asia/Seoul"),
+    ("Cen. Australia Standard Time", "Australia/Adelaide"),
+    ("AUS Central Standard Time", "Australia/Darwin"),
+    ("E. Australia Standard Time", "Australia/Brisbane"),
+    ("AUS Eastern Standard Time", "Australia/Sydney"),
+    ("Tasmania Standard Time", "Australia/Hobart"),
+    ("New Zealand Standard Time", "Pacific/Auckland"),
+];
 
 fn when_value(v: &str, date: bool, tz: Option<Tz>) -> Option<When> {
     let v = v.trim();
@@ -337,23 +429,27 @@ pub fn when(p: &Prop) -> Option<When> {
 
 /// How a resource's times are read: the zone of the master's DTSTART
 /// ("series time"). `None` for floating and all-day events (local wall time).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Series {
     zone: Option<Tz>,
     all_day: bool,
     /// The master's DTSTART form, to write RECURRENCE-ID/EXDATE like it.
     form: When,
+    /// Its TZID as written (it may be an alias or carry a vendor prefix),
+    /// so occurrence stamps name the zone exactly the way the file does.
+    tzid: Option<String>,
 }
 
 impl Series {
-    fn of(dtstart: When) -> Self {
-        let (zone, all_day) = match dtstart {
+    fn of(dtstart: &Prop) -> Option<Self> {
+        let form = when(dtstart)?;
+        let (zone, all_day) = match form {
             When::Date(_) => (None, true),
             When::Floating(_) => (None, false),
             When::Utc(_) => (Some(chrono_tz::UTC), false),
             When::Zoned(_, tz) => (Some(tz), false),
         };
-        Series { zone, all_day, form: dtstart }
+        Some(Series { zone, all_day, form, tzid: dtstart.param("TZID").map(str::to_owned) })
     }
 
     /// A value as series wall time.
@@ -380,7 +476,9 @@ impl Series {
             When::Date(_) => Prop::new(name, t.format(DATE).to_string()).with("VALUE", "DATE"),
             When::Floating(_) => Prop::new(name, t.format(STAMP).to_string()),
             When::Utc(_) => Prop::new(name, format!("{}Z", t.format(STAMP))),
-            When::Zoned(_, tz) => Prop::new(name, t.format(STAMP).to_string()).with("TZID", tz.name()),
+            When::Zoned(_, tz) => {
+                Prop::new(name, t.format(STAMP).to_string()).with("TZID", self.tzid.as_deref().unwrap_or(tz.name()))
+            }
         }
     }
 }
@@ -564,7 +662,7 @@ fn expand(master: &Component, s: &Series, from: NaiveDateTime, to: NaiveDateTime
 /// the app shows them.
 pub fn events(cal: &CalRef, href: &str, etag: Option<&str>, ics: &Component, from: NaiveDate, to: NaiveDate) -> Vec<Event> {
     let master_ev = master(ics);
-    let Some(series) = master_ev.or_else(|| ics.events().next()).and_then(|m| m.prop("DTSTART")).and_then(when).map(Series::of)
+    let Some(series) = master_ev.or_else(|| ics.events().next()).and_then(|m| m.prop("DTSTART")).and_then(Series::of)
     else {
         return Vec::new();
     };
@@ -607,7 +705,7 @@ pub fn events(cal: &CalRef, href: &str, etag: Option<&str>, ics: &Component, fro
 pub fn find(cal: &CalRef, rid: &str, etag: Option<&str>, ics: &Component) -> Option<Event> {
     let (href, key_part) = split_remote_id(rid);
     let master_ev = master(ics);
-    let s = master_ev.or_else(|| ics.events().next()).and_then(|m| m.prop("DTSTART")).and_then(when).map(Series::of)?;
+    let s = master_ev.or_else(|| ics.events().next()).and_then(|m| m.prop("DTSTART")).and_then(Series::of)?;
     let Some(k) = key_part else {
         let m = master_ev.filter(|m| !repeats(m))?;
         let (start, end) = span(m, &s)?;
@@ -632,6 +730,15 @@ pub fn find(cal: &CalRef, rid: &str, etag: Option<&str>, ics: &Component) -> Opt
     })
 }
 
+/// Whether the occurrence with this key has been changed on its own (has
+/// an override).
+pub fn has_override(cal: &Component, key: &str) -> bool {
+    let (Some(t), Some(s)) = (parse_key(key), master(cal).and_then(|m| m.prop("DTSTART")).and_then(Series::of)) else {
+        return false;
+    };
+    cal.events().any(|e| e.prop("RECURRENCE-ID").and_then(when).is_some_and(|w| s.wall(w) == t))
+}
+
 /// The resource's UID (of its first VEVENT).
 pub fn uid(ics: &Component) -> Option<String> {
     ics.events().find_map(|e| e.text("UID"))
@@ -652,9 +759,10 @@ fn time_prop(name: &str, t: NaiveDateTime, ev: &Event, zone: Option<Tz>) -> Prop
     match zone {
         Some(tz) => Prop::new(name, recurrence::to_zone(t, Some(tz)).format(STAMP).to_string()).with("TZID", tz.name()),
         None => {
-            let utc: DateTime<Utc> = Local
-                .from_local_datetime(&t)
-                .earliest()
+            // A time skipped by a daylight-saving change counts as the hour after.
+            let at = |t: NaiveDateTime| Local.from_local_datetime(&t).earliest();
+            let utc: DateTime<Utc> = at(t)
+                .or_else(|| at(t + Duration::hours(1)))
                 .map(|d| d.with_timezone(&Utc))
                 .unwrap_or_else(|| t.and_utc());
             Prop::new(name, format!("{}Z", utc.naive_utc().format(STAMP)))
@@ -674,6 +782,10 @@ fn fill(v: &mut Component, ev: &Event, master_series: bool) {
         _ => None,
     };
     v.set_text("SUMMARY", &ev.title);
+    // Apple's map pin for the location would still show the old place.
+    if v.text("LOCATION").unwrap_or_default() != ev.location {
+        v.remove("X-APPLE-STRUCTURED-LOCATION");
+    }
     v.set_text("LOCATION", &ev.location);
     v.set_text("DESCRIPTION", &ev.notes);
     v.set(time_prop("DTSTART", ev.start, ev, zone));
@@ -728,7 +840,7 @@ pub fn put(existing: Option<Component>, ev: &Event, uid: &str, key: Option<&str>
         Some(k) => {
             let t = parse_key(k).ok_or_else(|| anyhow!("bad occurrence key {k}"))?;
             let m = master(&cal).ok_or_else(|| anyhow!("the series is gone"))?.clone();
-            let s = Series::of(m.prop("DTSTART").and_then(when).ok_or_else(|| anyhow!("series without a start"))?);
+            let s = m.prop("DTSTART").and_then(Series::of).ok_or_else(|| anyhow!("series without a start"))?;
             let existing = cal.subs.iter().position(|c| {
                 c.name == "VEVENT" && c.prop("RECURRENCE-ID").and_then(when).is_some_and(|w| s.wall(w) == t)
             });
@@ -762,8 +874,7 @@ pub fn remove_occurrence(cal: &mut Component, key: &str) -> Result<bool> {
         .find(|e| e.prop("RECURRENCE-ID").is_none())
         .or_else(|| cal.events().next())
         .and_then(|m| m.prop("DTSTART"))
-        .and_then(when)
-        .map(Series::of)
+        .and_then(Series::of)
         .ok_or_else(|| anyhow!("no event in the resource"))?;
     cal.subs.retain(|c| !(c.name == "VEVENT" && c.prop("RECURRENCE-ID").and_then(when).is_some_and(|w| s.wall(w) == t)));
     if let Some(m) = cal.subs.iter_mut().find(|c| c.name == "VEVENT" && c.prop("RECURRENCE-ID").is_none()) {
@@ -772,6 +883,7 @@ pub fn remove_occurrence(cal: &mut Component, key: &str) -> Result<bool> {
         m.set(Prop::new("SEQUENCE", seq.map_or(0, |n| n + 1).to_string()));
         m.set(Prop::new("DTSTAMP", now_utc()));
     }
+    add_timezones(cal);
     Ok(cal.events().next().is_some())
 }
 

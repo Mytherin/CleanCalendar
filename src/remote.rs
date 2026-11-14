@@ -153,6 +153,20 @@ impl std::fmt::Display for TokenExpired {
 
 impl std::error::Error for TokenExpired {}
 
+/// A change that can never be made as it is, however often it's retried
+/// (e.g. the occurrence it edits is no longer part of its series, or the
+/// server's copy can't be read).
+#[derive(Debug)]
+pub struct Unworkable(pub String);
+
+impl std::fmt::Display for Unworkable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unworkable {}
+
 pub fn http_status(e: &anyhow::Error) -> Option<u16> {
     e.downcast_ref::<HttpError>().map(|h| h.status)
 }
@@ -169,6 +183,9 @@ pub enum Failure {
 }
 
 pub fn classify(e: &anyhow::Error) -> Failure {
+    if e.is::<Unworkable>() {
+        return Failure::Rejected;
+    }
     match e.downcast_ref::<HttpError>() {
         // Network errors, timeouts, token refresh problems: transient.
         None => Failure::Retry,
@@ -369,17 +386,35 @@ pub fn sync_all(
             Some(token) => match c.events(&r, Query::Changes(token), (from, to)) {
                 Ok(changes) => Some(changes),
                 Err(e) if e.is::<TokenExpired>() => None,
+                Err(e) if refused(&e) => {
+                    eprintln!("Skipping calendar {}: {e:#}", cal.name);
+                    continue;
+                }
                 Err(e) => return Err(e),
             },
             None => None,
         };
         let changes = match incremental {
             Some(changes) => changes,
-            None => c.events(&r, Query::Window(from, to), (from, to))?,
+            None => match c.events(&r, Query::Window(from, to), (from, to)) {
+                Ok(changes) => changes,
+                // One calendar the server won't list (e.g. a broken shared
+                // one) shouldn't stop the others; it keeps what it had.
+                Err(e) if refused(&e) => {
+                    eprintln!("Skipping calendar {}: {e:#}", cal.name);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
         };
         out.push(changes);
     }
     Ok((calendars, out))
+}
+
+/// The server refused this request for good (not offline, not signed out).
+fn refused(e: &anyhow::Error) -> bool {
+    e.is::<Unworkable>() || http_status(e).is_some_and(|s| (400..500).contains(&s) && !matches!(s, 401 | 408 | 429))
 }
 
 #[cfg(test)]
@@ -401,6 +436,7 @@ mod tests {
         assert_eq!(classify(&http(410, "Deleted")), Failure::Gone);
         assert_eq!(classify(&http(400, "Bad Request")), Failure::Rejected);
         assert_eq!(classify(&http(403, "Forbidden")), Failure::Rejected);
+        assert_eq!(classify(&Unworkable("series changed".into()).into()), Failure::Rejected);
         assert_eq!(http_status(&http(412, "x")), Some(412));
         assert_eq!(http_status(&anyhow::anyhow!("x")), None);
     }

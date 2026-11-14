@@ -40,7 +40,7 @@ use reqwest::Method;
 use url::Url;
 
 use crate::model::Event;
-use crate::remote::{http_status, CalRef, CalendarChanges, HttpError, Query, Remote, RemoteCalendar, TokenExpired};
+use crate::remote::{http_status, CalRef, CalendarChanges, HttpError, Query, Remote, RemoteCalendar, TokenExpired, Unworkable};
 use xml::{CALDAV, DAV, ICAL};
 
 /// Where iCloud's CalDAV service starts.
@@ -131,7 +131,12 @@ impl Client {
             let status = resp.status().as_u16();
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 if let Some(loc) = resp.headers().get("Location").and_then(|l| l.to_str().ok()) {
-                    url = url.join(loc)?;
+                    let next = url.join(loc)?;
+                    // Never send the password on in the clear.
+                    if url.scheme() == "https" && next.scheme() != "https" {
+                        return Err(anyhow!("{url} redirected to an insecure address ({next})"));
+                    }
+                    url = next;
                     continue;
                 }
             }
@@ -230,7 +235,7 @@ impl Client {
         }
         let resp = Self::check(resp)?;
         let etag = resp.headers().get("ETag").and_then(|v| v.to_str().ok()).map(str::to_owned);
-        let ics = ical::parse(&resp.text()?)?;
+        let ics = ical::parse(&resp.text()?).map_err(|e| Unworkable(format!("the server's copy of {url} can't be read: {e:#}")))?;
         Ok(Some((ics, etag)))
     }
 
@@ -418,17 +423,20 @@ impl Remote for Client {
         let Some((existing, server_etag)) = self.get(&url)? else {
             return Err(dav_error(404, "Not Found".into()));
         };
+        // The event isn't in the resource any more as we know it: the series
+        // was changed elsewhere so this occurrence no longer exists, or a
+        // plain event became a repeating one. Recreating it would duplicate
+        // it, so the server's version wins.
+        let Some(theirs) = ical::find(cal, rid, server_etag.as_deref(), &existing) else {
+            return Err(Unworkable("it was changed into a different repeating event on another device".into()).into());
+        };
         // Stale unless the server still has the version we started from, or
         // what changed in the resource isn't this event (another occurrence).
-        if ev.etag.is_some() && ev.etag != server_etag {
-            let theirs = ical::find(cal, rid, server_etag.as_deref(), &existing).map(|e| e.fields());
-            let unchanged = ev.base.as_ref().is_some_and(|b| theirs.as_ref() == Some(b));
-            if !unchanged {
-                return Err(dav_error(412, "Precondition Failed: changed on the server".into()));
-            }
+        if ev.etag.is_some() && ev.etag != server_etag && ev.base.as_ref() != Some(&theirs.fields()) {
+            return Err(dav_error(412, "Precondition Failed: changed on the server".into()));
         }
         let uid = ical::uid(&existing).unwrap_or_else(|| uid_for(&ev.id));
-        let ics = ical::put(Some(existing), ev, &uid, key)?;
+        let ics = ical::put(Some(existing), ev, &uid, key).map_err(|e| Unworkable(format!("{e:#}")))?;
         let etag = match &server_etag {
             Some(e) => self.put(&url, &ics, ("If-Match", e))?,
             None => self.put(&url, &ics, ("If-Match", "*"))?,
@@ -452,7 +460,12 @@ impl Remote for Client {
         if let Some(key) = key {
             // One occurrence: take it out of the series.
             let Some((mut ics, server_etag)) = self.get(&url)? else { return Ok(()) };
-            if !ical::remove_occurrence(&mut ics, key)? {
+            // Someone changed this very occurrence since we saw it: their
+            // change wins. (Changes to other occurrences don't matter.)
+            if etag.is_some() && etag != server_etag.as_deref() && ical::has_override(&ics, key) {
+                return Err(dav_error(412, "Precondition Failed: changed on the server".into()));
+            }
+            if !ical::remove_occurrence(&mut ics, key).map_err(|e| Unworkable(format!("{e:#}")))? {
                 return self.delete(cal, href, server_etag.as_deref());
             }
             let pre = server_etag.as_deref().unwrap_or("*");
