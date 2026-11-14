@@ -76,6 +76,7 @@ Data is kept in two SQLite databases, split by who owns it:
 The cache is attached to the same connection, so each save commits to both files at once. Only rows that changed are written. A `store.json` from an older version is imported on first start and renamed to `store.json.migrated`. Files in the folders older versions used (`%APPDATA%\CleanCalendar\CleanCalendar\data\`, `~/Library/Application Support/com.CleanCalendar.CleanCalendar/`) are moved over on first start.
 
 Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (the token still goes to the credential store, under an entry named after that folder).
+Set `CLEANCALENDAR_START=month:2026-11-14` (or just `day`, `week`, `month`, `year`) to open on a given view and date, which is handy together with `CLEANCALENDAR_DATA` for screenshots and testing by hand.
 
 ## Code layout
 

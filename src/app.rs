@@ -108,6 +108,9 @@ impl App {
             show_google: false,
             icon: AppIcon::new(&cc.egui_ctx),
         };
+        if let Some((view, date)) = std::env::var("CLEANCALENDAR_START").ok().and_then(|s| parse_start(&s)) {
+            app.go_to(date.unwrap_or(today), view);
+        }
         SyncEngine::prepare(&mut app.store);
         app.sync();
         app
@@ -1017,6 +1020,17 @@ impl eframe::App for App {
 
 // ---------------------------------------------------------------------------
 // Widgets
+
+/// `CLEANCALENDAR_START=month:2026-11-14` (or just `day`, `week`, `month`,
+/// `year`): where to open, for screenshots and testing by hand.
+fn parse_start(s: &str) -> Option<(View, Option<NaiveDate>)> {
+    let (view, date) = match s.split_once(':') {
+        Some((v, d)) => (v, Some(NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").ok()?)),
+        None => (s, None),
+    };
+    let view = View::ALL.into_iter().find(|v| v.label().eq_ignore_ascii_case(view.trim()))?;
+    Some((view, date))
+}
 
 /// Whether `id` names an occurrence of a repeating event stored here (rather
 /// than an event of its own).
