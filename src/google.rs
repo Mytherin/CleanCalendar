@@ -214,7 +214,9 @@ fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
             continue;
         }
         let path = line.split_whitespace().nth(1).unwrap_or("/");
-        let url = Url::parse(&format!("http://127.0.0.1{path}"))?;
+        // Something else poking the port (a scanner, a malformed request)
+        // mustn't end the sign-in: ignore it and keep waiting.
+        let Ok(url) = Url::parse(&format!("http://127.0.0.1{path}")) else { continue };
         let param = |k: &str| url.query_pairs().find(|(key, _)| key == k).map(|(_, v)| v.into_owned());
 
         let (result, body) = if let Some(err) = param("error") {
@@ -712,6 +714,25 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stray_requests_to_the_sign_in_port_are_ignored() {
+        use std::net::TcpStream;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let browser = std::thread::spawn(move || {
+            let send = |line: &str| {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                let _ = s.write_all(format!("{line}\r\n\r\n").as_bytes());
+                let _ = std::io::Read::read_to_end(&mut s, &mut Vec::new());
+            };
+            send("GET :99999 HTTP/1.1"); // "http://127.0.0.1:99999": not a valid URL
+            send("GET /favicon.ico HTTP/1.1");
+            send("GET /?code=abc&state=s1 HTTP/1.1");
+        });
+        assert_eq!(wait_for_code(&listener, "s1").unwrap(), "abc");
+        browser.join().unwrap();
+    }
 
     #[test]
     fn signs_in_with_the_builtin_client_unless_one_is_set() {
