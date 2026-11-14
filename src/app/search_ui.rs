@@ -71,7 +71,7 @@ impl App {
             s.open = false;
         } else if enter {
             // Go to the first thing coming up.
-            let results = search::search(&self.store, &self.search.query, self.today);
+            let results = self.search.cache.get(&self.store, &self.search.query, self.today).to_vec();
             if let Some(i) = search::first_upcoming(&results, self.today) {
                 self.show_result(&results[i]);
             }
@@ -82,7 +82,7 @@ impl App {
 
     /// The results, in a panel on the right, scrolled to what's coming up.
     pub(super) fn search_results(&mut self, ctx: &egui::Context, p: &Palette) {
-        let results = search::search(&self.store, &self.search.query, self.today);
+        let results = self.search.cache.get(&self.store, &self.search.query, self.today).to_vec();
         let new_query = self.search.scrolled_for.as_deref() != Some(self.search.query.as_str());
         if new_query {
             self.search.scrolled_for = Some(self.search.query.clone());
