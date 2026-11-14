@@ -220,7 +220,7 @@ fn calendar_chip(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
     }
     // A macOS-style menu: a rounded, outlined panel with the calendars grouped
     // under their account (as in the sidebar), a check by the current one,
-    // and the hovered row filled with that calendar's color.
+    // and the hovered row filled with the macOS menu highlight red.
     ui.scope(|ui| {
         let v = &mut ui.style_mut().visuals;
         v.menu_rounding = egui::Rounding::same(10.0);
@@ -232,6 +232,10 @@ fn calendar_chip(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
         });
     });
 }
+
+/// The hovered row of the calendar menu: the red macOS Calendar uses for its
+/// menu highlight, whatever the calendar's own color.
+const MENU_HIGHLIGHT: Color32 = Color32::from_rgb(0xB8, 0x43, 0x40);
 
 fn calendar_menu(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) {
     const ROW_H: f32 = 22.0;
@@ -265,15 +269,10 @@ fn calendar_menu(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette)
 
         for c in cals {
             let (r, row) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
-            let color = theme::rgb(c.color);
-            let (mut dot, mut text) = (color, p.text);
+            let mut text = p.text;
             if row.hovered() {
-                ui.painter().rect_filled(r, 5.0, color);
-                // Keep the dot visible on its own color, and the name legible.
-                dot = color.gamma_multiply(0.6).to_opaque();
-                let [cr, cg, cb, _] = color.to_array();
-                let lum = 0.299 * cr as f32 + 0.587 * cg as f32 + 0.114 * cb as f32;
-                text = if lum > 170.0 { Color32::from_gray(20) } else { Color32::WHITE };
+                ui.painter().rect_filled(r, 5.0, MENU_HIGHLIGHT);
+                text = Color32::WHITE;
             }
             if c.id == ed.draft.calendar_id {
                 // A "✓", drawn (the UI font may not have the glyph).
@@ -282,7 +281,7 @@ fn calendar_menu(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette)
                 ui.painter().line_segment([c + Vec2::new(-4.0, 0.0), c + Vec2::new(-1.0, 3.5)], s);
                 ui.painter().line_segment([c + Vec2::new(-1.0, 3.5), c + Vec2::new(4.5, -4.5)], s);
             }
-            ui.painter().circle_filled(Pos2::new(r.left() + PAD + 22.0, r.center().y), 6.0, dot);
+            ui.painter().circle_filled(Pos2::new(r.left() + PAD + 22.0, r.center().y), 6.0, theme::rgb(c.color));
             let at = r.left_center() + Vec2::new(PAD + 36.0, 0.0);
             ui.painter().text(at, Align2::LEFT_CENTER, &c.name, theme::font(14.0), text);
             if row.clicked() {
