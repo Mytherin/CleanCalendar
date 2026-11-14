@@ -25,8 +25,8 @@ use rusqlite::{params, Connection, Row, Transaction};
 
 use crate::model::{Calendar, Event, GoogleSettings, PendingDelete, Source, Store, SyncState};
 
-const DATA_VERSION: i32 = 1;
-const CACHE_VERSION: i32 = 1;
+const DATA_VERSION: i32 = 2;
+const CACHE_VERSION: i32 = 2;
 
 /// Where the two databases (and the old JSON store, for migration) live.
 #[derive(Clone, Debug)]
@@ -108,7 +108,7 @@ impl std::fmt::Display for TooNew {
 impl std::error::Error for TooNew {}
 
 const EVENT_COLUMNS: &str = "id, calendar_id, title, start_at, end_at, all_day, location, notes, \
-                             remote_id, recurring_id, pending, rev, etag, base";
+                             remote_id, recurring_id, pending, rev, etag, base, attendees";
 
 fn event_table(name: &str) -> String {
     format!(
@@ -126,7 +126,8 @@ fn event_table(name: &str) -> String {
             pending INTEGER NOT NULL,
             rev INTEGER NOT NULL,
             etag TEXT,
-            base TEXT
+            base TEXT,
+            attendees TEXT NOT NULL DEFAULT '[]'
         );"
     )
 }
@@ -253,6 +254,16 @@ fn open_data(path: &Path) -> Result<(Connection, DataPart)> {
     if version > DATA_VERSION {
         return Err(TooNew(version).into());
     }
+    if version == 1 {
+        // Version 2 added invitees.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE main.events ADD COLUMN attendees TEXT NOT NULL DEFAULT '[]';
+             ALTER TABLE main.outbox ADD COLUMN attendees TEXT NOT NULL DEFAULT '[]';
+             PRAGMA main.user_version = 2;
+             COMMIT;",
+        )?;
+    }
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS main.settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS main.calendars (
@@ -360,13 +371,13 @@ fn load_events(conn: &Connection, place: Place) -> rusqlite::Result<Vec<Event>> 
 }
 
 fn read_event(r: &Row) -> rusqlite::Result<Event> {
+    fn json<T: serde::de::DeserializeOwned>(col: usize, text: &str) -> rusqlite::Result<T> {
+        serde_json::from_str(text)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(col, rusqlite::types::Type::Text, Box::new(e)))
+    }
     let base: Option<String> = r.get(13)?;
-    let base = match base {
-        Some(text) => Some(serde_json::from_str(&text).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(e))
-        })?),
-        None => None,
-    };
+    let base = base.map(|text| json(13, &text)).transpose()?;
+    let attendees: String = r.get(14)?;
     Ok(Event {
         id: r.get(0)?,
         calendar_id: r.get(1)?,
@@ -376,6 +387,7 @@ fn read_event(r: &Row) -> rusqlite::Result<Event> {
         all_day: r.get(5)?,
         location: r.get(6)?,
         notes: r.get(7)?,
+        attendees: json(14, &attendees)?,
         remote_id: r.get(8)?,
         recurring_id: r.get(9)?,
         pending: r.get(10)?,
@@ -387,8 +399,9 @@ fn read_event(r: &Row) -> rusqlite::Result<Event> {
 
 fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
     let base = ev.base.as_ref().map(serde_json::to_string).transpose()?;
+    let attendees = serde_json::to_string(&ev.attendees)?;
     tx.prepare_cached(&format!(
-        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         place.table()
     ))?
     .execute(params![
@@ -406,6 +419,7 @@ fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
         ev.rev as i64,
         ev.etag,
         base,
+        attendees,
     ])?;
     Ok(())
 }
@@ -658,6 +672,7 @@ mod tests {
             all_day: false,
             location: "Room 1".into(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: None,
             recurring_id: None,
             pending: false,
@@ -718,6 +733,37 @@ mod tests {
         let conn = Connection::open(path).unwrap();
         let mut stmt = conn.prepare(&format!("SELECT id FROM {table} ORDER BY id")).unwrap();
         stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn a_version_1_database_gains_invitees() {
+        let dir = TempDir::new();
+        drop(populated(&dir));
+        // Turn data.db back into the version-1 layout (no attendees column).
+        let conn = Connection::open(&dir.paths().data).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events DROP COLUMN attendees;
+             ALTER TABLE outbox DROP COLUMN attendees;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = open(&dir.paths());
+        let ids: Vec<_> = sorted(&store.events).iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&"local1".to_owned()) && ids.contains(&"g2".to_owned()), "local data kept: {ids:?}");
+        assert!(store.events.iter().all(|e| e.attendees.is_empty()));
+        assert_eq!(store.google.refresh_token.as_deref(), Some("refresh"));
+
+        // Invitees are saved from now on.
+        let ev = store.event_mut("local1").unwrap();
+        ev.attendees.push(crate::model::Attendee::new("ann@example.com"));
+        store.save();
+        drop(store);
+        let store = open(&dir.paths());
+        assert_eq!(store.event("local1").unwrap().attendees[0].email, "ann@example.com");
+        let conn = Connection::open(&dir.paths().data).unwrap();
+        assert_eq!(user_version(&conn, "main").unwrap(), DATA_VERSION);
     }
 
     #[test]

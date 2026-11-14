@@ -473,6 +473,7 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
                 all_day: false,
                 location: String::new(),
                 notes: String::new(),
+                attendees: Vec::new(),
                 remote_id: None,
                 recurring_id: None,
                 pending: false,
