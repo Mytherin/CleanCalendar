@@ -128,7 +128,23 @@ pub enum Failure {
     Gone,
     /// Google refused the change; retrying won't help.
     Rejected,
+    /// Google no longer accepts our sign-in (revoked, expired, or the
+    /// client credentials changed): nothing works until the user connects
+    /// again. Changes are kept for then.
+    SignedOut,
 }
+
+/// The token endpoint refused our refresh token.
+#[derive(Debug)]
+pub struct AuthError(String);
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Google sign-in expired or was revoked ({}); connect again", self.0)
+    }
+}
+
+impl std::error::Error for AuthError {}
 
 /// Results sent from the worker back to the UI.
 pub enum Msg {
@@ -168,6 +184,9 @@ fn http_status(e: &anyhow::Error) -> Option<u16> {
 }
 
 fn classify(e: &anyhow::Error) -> Failure {
+    if e.downcast_ref::<AuthError>().is_some() {
+        return Failure::SignedOut;
+    }
     match e.downcast_ref::<HttpError>() {
         // Network errors, timeouts, token refresh problems: transient.
         None => Failure::Retry,
@@ -468,6 +487,11 @@ impl Client {
             ])
             .send()?
             .json()?;
+        // OAuth errors that retrying can't fix (RFC 6749 §5.2). Anything else
+        // (a server hiccup, a garbled reply) is treated as transient.
+        if let Some(code @ ("invalid_grant" | "invalid_client" | "unauthorized_client")) = resp["error"].as_str() {
+            return Err(AuthError(code.to_owned()).into());
+        }
         let tok = resp["access_token"]
             .as_str()
             .ok_or_else(|| anyhow!("Could not refresh Google access: {}", resp))?
@@ -644,7 +668,26 @@ impl Client {
                 let id = client_event_id(&ev.id).ok_or(e)?;
                 return match self.get_event(cal_id, &id)? {
                     Some(existing) => Ok((id, existing.etag)),
-                    None => Err(anyhow!("Google reported event {id} as a duplicate but doesn't have it")),
+                    // Google keeps the ids of deleted events, so ours can
+                    // never be used again: create it under a new one.
+                    None => {
+                        if let Some(o) = body.as_object_mut() {
+                            o.remove("id");
+                        }
+                        let url = self.url(&["calendars", cal_id, "events"]);
+                        let req = self.http.post(url);
+                        let req = if notify { req.query(&[("sendUpdates", "all")]) } else { req };
+                        let token = self.token()?;
+                        let resp: Value = req
+                            .bearer_auth(token)
+                            .json(&body)
+                            .send()
+                            .map_err(anyhow::Error::from)
+                            .and_then(Self::check)?
+                            .json()?;
+                        let id = resp["id"].as_str().ok_or_else(|| anyhow!("Google returned no event id"))?.to_owned();
+                        Ok((id, resp["etag"].as_str().map(str::to_owned)))
+                    }
                 };
             }
             Err(e) => return Err(e),
