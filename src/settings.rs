@@ -88,6 +88,24 @@ pub const REFRESH_CHOICES: [u32; 6] = [1, 5, 15, 30, 60, 0];
 pub const DURATION_CHOICES: [u32; 6] = [15, 30, 45, 60, 90, 120];
 
 impl Settings {
+    /// Brings values read from disk (possibly hand-edited, or from another
+    /// version) into the ranges the app relies on, so e.g. `day_start + 1`
+    /// can't overflow and the working day is never empty.
+    pub fn sanitized(mut self) -> Self {
+        if self.days_per_week != 5 {
+            self.days_per_week = 7;
+        }
+        self.week_start = self.week_start.filter(|&d| d < 7);
+        self.day_start = self.day_start.min(23);
+        self.day_end = self.day_end.clamp(self.day_start + 1, 24);
+        self.hours_shown = self.hours_shown.clamp(1, 24);
+        if self.event_minutes == 0 {
+            self.event_minutes = Settings::default().event_minutes;
+        }
+        self.event_minutes = self.event_minutes.min(24 * 60);
+        self
+    }
+
     /// The first day of the week, with "system" resolved.
     pub fn first_weekday(&self) -> Weekday {
         match self.week_start {
@@ -194,6 +212,18 @@ fn read_system_week_start() -> Option<Weekday> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn out_of_range_values_from_disk_are_brought_back_in_range() {
+        let s: Settings = serde_json::from_str(
+            r#"{"day_start": 255, "day_end": 3, "hours_shown": 0, "event_minutes": 0, "days_per_week": 3, "week_start": 9}"#,
+        )
+        .unwrap();
+        let s = s.sanitized();
+        assert!(s.day_start < s.day_end && s.day_end <= 24, "{} – {}", s.day_start, s.day_end);
+        assert_eq!((s.hours_shown, s.event_minutes, s.days_per_week, s.week_start), (1, 60, 7, None));
+        assert_eq!(Settings::default().sanitized(), Settings::default(), "defaults are already fine");
+    }
 
     #[test]
     fn missing_fields_take_their_defaults() {

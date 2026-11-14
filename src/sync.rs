@@ -605,7 +605,12 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
     let take_when = take_ours("time", when(base), when(ours), when(theirs));
     // Who is invited is compared by address; replies are only ever made on
     // the server, so they don't count as our change.
-    let emails = |f: &EventFields| f.attendees.iter().map(|a| a.email.to_lowercase()).collect::<Vec<_>>();
+    // Compared as sets: the same guests in another order is no change.
+    let emails = |f: &EventFields| {
+        let mut v = f.attendees.iter().map(|a| a.email.to_lowercase()).collect::<Vec<_>>();
+        v.sort();
+        v
+    };
     let take_invitees = take_ours("invitees", emails(base).join(","), emails(ours).join(","), emails(theirs).join(","));
 
     let from = |take_ours: bool| if take_ours { ours } else { theirs };
@@ -1430,6 +1435,21 @@ mod tests {
         // A reply alone isn't a change of ours: theirs is kept as is.
         let (m, _) = merge_fields(&base, &base, &theirs);
         assert_eq!(m.attendees, theirs.attendees);
+    }
+
+    #[test]
+    fn the_same_guests_in_another_order_are_not_a_change() {
+        use crate::model::Attendee;
+        let mut base = gev("a", "T").fields();
+        base.attendees = vec![Attendee::new("ann@example.com"), Attendee::new("bob@example.com")];
+        // We added Cy; the service lists the same two guests the other way round.
+        let mut ours = base.clone();
+        ours.attendees.push(Attendee::new("cy@example.com"));
+        let mut theirs = base.clone();
+        theirs.attendees.reverse();
+        let (m, clashes) = merge_fields(&base, &ours, &theirs);
+        assert!(clashes.is_empty(), "no invitee clash: {clashes:?}");
+        assert_eq!(m.attendees.len(), 3, "our new guest is kept");
     }
 
     #[test]

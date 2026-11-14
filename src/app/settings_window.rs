@@ -996,7 +996,7 @@ fn advanced_tab(ui: &mut Ui, s: &mut Settings) {
         combo(ui, "history", &mut s.history_months, &options, 120.0);
     })
     .response
-    .on_hover_text("How much of the past to download from iCloud, CalDAV and Google calendars (and to search)");
+    .on_hover_text("How much of the past to download from iCloud, CalDAV and Google calendars. Keeping everything can mean many thousands of events (a long-running repeating event is stored occurrence by occurrence).");
     ui.add_space(2.0);
 }
 
