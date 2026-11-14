@@ -186,11 +186,34 @@ pub enum Failure {
     Gone,
     /// The service refused the change; retrying won't help.
     Rejected,
+    /// The service no longer accepts our sign-in (revoked, expired, or the
+    /// client credentials changed): nothing works until the user connects
+    /// again. Changes are kept for then.
+    SignedOut,
 }
+
+/// The service refused our sign-in in a way retrying can't fix (for Google,
+/// the token endpoint rejecting the refresh token).
+#[derive(Debug)]
+pub struct AuthError {
+    pub service: &'static str,
+    pub code: String,
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} sign-in expired or was revoked ({}); connect again", self.service, self.code)
+    }
+}
+
+impl std::error::Error for AuthError {}
 
 pub fn classify(e: &anyhow::Error) -> Failure {
     if e.is::<Unworkable>() {
         return Failure::Rejected;
+    }
+    if e.is::<AuthError>() {
+        return Failure::SignedOut;
     }
     match e.downcast_ref::<HttpError>() {
         // Network errors, timeouts, token refresh problems: transient.

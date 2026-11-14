@@ -5,6 +5,7 @@
 //! `layout.rs`, and what the pointer does comes from `interact.rs`;
 //! [`drive_pointer`] is the thin adapter that feeds egui's input to it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
@@ -16,7 +17,7 @@ use eframe::egui::{
 use crate::app::{Action, App, View};
 use crate::dates::*;
 use crate::interact::{Cursor, Input};
-use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GUTTER, HOUR_H};
+use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GRID_PAD, GUTTER};
 use crate::model::Event;
 use crate::recurrence;
 use crate::theme::{self, Palette, RED};
@@ -43,8 +44,30 @@ fn draw_text(ui: &Ui, painter: &egui::Painter, pos: Pos2, text: &str, font: Font
     w
 }
 
-/// One line of text starting at `x`, vertically centered in `rect` using the
-/// font's real line height (fixed offsets drift when the UI font changes).
+/// Distance from the top of a one-line galley in `font` to the middle of its
+/// capital letters. Centering the line box instead leaves text visibly low:
+/// fonts like Segoe UI reserve much more room above the caps than below the
+/// baseline. Measured from the real "H" glyph so it tracks the loaded font.
+fn cap_middle(ui: &Ui, font: FontId) -> f32 {
+    cap_middle_in(ui.ctx(), font)
+}
+
+fn cap_middle_in(ctx: &egui::Context, font: FontId) -> f32 {
+    let g = ctx.fonts(|f| f.layout_no_wrap("H".to_owned(), font, Color32::WHITE));
+    match g.rows.first().and_then(|r| r.glyphs.first()) {
+        Some(h) if h.uv_rect.size.y > 0.0 => h.pos.y + h.uv_rect.offset.y + h.uv_rect.size.y / 2.0,
+        _ => g.size().y / 2.0,
+    }
+}
+
+/// Top y at which to place a one-line galley in `font` so its capitals are
+/// vertically centered on `center_y`.
+fn text_top_for_center(ui: &Ui, font: FontId, center_y: f32) -> f32 {
+    (center_y - cap_middle(ui, font)).round()
+}
+
+/// One line of text starting at `x`, vertically centered in `rect` on the
+/// font's real cap height (fixed offsets drift when the UI font changes).
 fn draw_text_centered(
     ui: &Ui,
     painter: &egui::Painter,
@@ -55,8 +78,8 @@ fn draw_text_centered(
     color: Color32,
     max_w: f32,
 ) {
+    let y = text_top_for_center(ui, font.clone(), rect.center().y);
     let g = text_galley(ui, text, font, color, max_w);
-    let y = (rect.center().y - g.size().y / 2.0).round();
     painter.galley(Pos2::new(x, y), g, color);
 }
 
@@ -102,6 +125,7 @@ fn ghost_event(start: NaiveDateTime, end: NaiveDateTime, all_day: bool) -> Event
         all_day,
         location: String::new(),
         notes: String::new(),
+        attendees: Vec::new(),
         remote_id: None,
         recurring_id: None,
         pending: false,
@@ -133,13 +157,34 @@ fn is_selected(app: &App, ev: &Event) -> bool {
     app.selected.as_deref() == Some(ev.id.as_str())
 }
 
+/// One line of text placed by `align` horizontally, with its capitals
+/// vertically centered on `pos.y` (see [`cap_middle`]).
+fn text_cap_centered(painter: &egui::Painter, pos: Pos2, align: Align2, text: &str, font: FontId, color: Color32) {
+    let top = (pos.y - cap_middle_in(painter.ctx(), font.clone())).round();
+    let g = painter.layout_no_wrap(text.to_owned(), font, color);
+    let x = match align.x() {
+        egui::Align::Min => pos.x,
+        egui::Align::Center => pos.x - g.size().x / 2.0,
+        egui::Align::Max => pos.x - g.size().x,
+    };
+    painter.galley(Pos2::new(x, top), g, color);
+}
+
+/// Size of the red "today" badge behind a day number: a circle for one or
+/// two digits, a pill for longer labels ("Nov 1").
+fn badge_size(painter: &egui::Painter, text: &str, font: &FontId) -> Vec2 {
+    let w = painter.layout_no_wrap(text.to_owned(), theme::bold_font(font.size), Color32::WHITE).size().x;
+    let h = font.size + 8.0;
+    Vec2::new((w + 10.0).max(h), h)
+}
+
 fn day_number_badge(painter: &egui::Painter, center: Pos2, text: &str, is_today: bool, font: FontId, color: Color32) {
     if is_today {
-        let w = (text.len() as f32 * font.size * 0.32).max(font.size * 0.62);
-        painter.rect_filled(Rect::from_center_size(center, Vec2::new(w * 2.0 + 4.0, font.size + 8.0)), 50.0, RED);
-        painter.text(center, Align2::CENTER_CENTER, text, theme::bold_font(font.size), Color32::WHITE);
+        let size = badge_size(painter, text, &font);
+        painter.rect_filled(Rect::from_center_size(center, size), size.y / 2.0, RED);
+        text_cap_centered(painter, center, Align2::CENTER_CENTER, text, theme::bold_font(font.size), Color32::WHITE);
     } else {
-        painter.text(center, Align2::CENTER_CENTER, text, font, color);
+        text_cap_centered(painter, center, Align2::CENTER_CENTER, text, font, color);
     }
 }
 
@@ -187,7 +232,9 @@ fn draw_banner(ui: &Ui, painter: &egui::Painter, rect: Rect, ev: &Event, color: 
     draw_text_centered(ui, painter, rect.left() + 6.0, rect, &text, theme::bold_font(11.5), text_color, max_w);
 }
 
-fn hover_text(ev: &Event) -> String {
+/// The event's title, when it happens, how it repeats and where (its
+/// tooltip, and the start of the text it's shared as).
+pub(crate) fn hover_text(ev: &Event) -> String {
     let when = if ev.all_day {
         let last = last_day(ev.start, ev.end);
         if last == ev.start.date() {
@@ -235,16 +282,24 @@ fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
     let (events, time, any_down, latest) =
         ctx.input(|i| (i.events.clone(), i.time, i.pointer.any_down(), i.pointer.latest_pos()));
 
+    // Like macOS, a click outside an open context menu only closes it.
+    let menu_open = app.menu.is_some();
     let mut actions = Vec::new();
     let mut released = false;
     for event in events {
         let input = match event {
             egui::Event::PointerMoved(pos) => Input::Move { pos },
             egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, .. } => {
-                if !ours(pos) {
+                if !ours(pos) || menu_open {
                     continue;
                 }
                 Input::Press { pos }
+            }
+            egui::Event::PointerButton { pos, button: PointerButton::Secondary, pressed: true, .. } => {
+                if !ours(pos) {
+                    continue;
+                }
+                Input::ContextPress { pos }
             }
             egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, .. } => {
                 released = true;
@@ -270,7 +325,7 @@ fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
             Cursor::PointingHand => CursorIcon::PointingHand,
         });
     }
-    if let (false, Some(Target::Event { id, .. })) = (app.pointer.is_active(), target) {
+    if let (false, Some(Target::Event { id, .. })) = (app.pointer.is_active() || menu_open, target) {
         let still = ctx.input(|i| i.pointer.time_since_last_movement());
         if still < TOOLTIP_DELAY {
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(TOOLTIP_DELAY - still));
@@ -312,8 +367,10 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
 
     let painter = ui.painter_at(rect);
     for i in 0..7 {
-        let x = rect.left() + (i as f32 + 1.0) * lay.cell_w - 8.0;
-        painter.text(
+        // Right-aligned with the day numbers below.
+        let x = rect.left() + (i as f32 + 1.0) * lay.cell_w - layout::MONTH_NUMBER_INSET;
+        text_cap_centered(
+            &painter,
             Pos2::new(x, rect.top() + lay.header_h / 2.0),
             Align2::RIGHT_CENTER,
             weekday_short(i),
@@ -323,9 +380,18 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
     painter.hline(rect.x_range(), rect.top() + lay.header_h, Stroke::new(1.0_f32, p.grid));
 
-    for cell in &lay.cells {
+    for (k, cell) in lay.cells.iter().enumerate() {
         if is_weekend(cell.day) {
             painter.rect_filled(cell.rect, 0.0, p.weekend);
+        }
+        if app.store.settings.week_numbers && k % 7 == 0 {
+            painter.text(
+                Pos2::new(cell.rect.left() + 8.0, cell.number.center().y),
+                Align2::LEFT_CENTER,
+                format!("W{}", week_number(cell.day)),
+                theme::font(11.0),
+                p.secondary,
+            );
         }
         painter.hline(cell.rect.x_range(), cell.rect.bottom(), Stroke::new(1.0_f32, p.grid));
         if cell.rect.left() > rect.left() + 1.0 {
@@ -359,31 +425,32 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
         painter.rect_filled(bar, 1.5, if selected { Color32::WHITE } else { color });
         let time = fmt_time(ev.start.time());
         let time_font = theme::font(11.0);
-        let tw = text_galley(ui, &time, time_font.clone(), p.secondary, 100.0).size().x;
+        let time_color = if selected { Color32::WHITE } else { p.secondary };
+        let time_g = text_galley(ui, &time, time_font.clone(), time_color, 100.0);
+        let tw = time_g.size().x;
         let show_time = r.width() > tw + 60.0;
         if show_time {
-            painter.text(
-                Pos2::new(r.right() - 4.0, r.center().y),
-                Align2::RIGHT_CENTER,
-                &time,
-                time_font,
-                if selected { Color32::WHITE } else { p.secondary },
-            );
+            let y = text_top_for_center(ui, time_font, r.center().y);
+            painter.galley(Pos2::new(r.right() - 4.0 - tw, y), time_g, time_color);
         }
         let max_w = r.width() - 16.0 - if show_time { tw + 8.0 } else { 0.0 };
         draw_text_centered(ui, &painter, r.left() + 11.0, r, &ev.title, theme::font(12.5), text_color, max_w);
     }
 
     for &(_, more, r) in &lay.more {
-        painter.text(r.min, Align2::LEFT_TOP, format!("+{more} more"), theme::font(11.5), p.secondary);
+        // Lined up with the event titles above it.
+        draw_text_centered(ui, &painter, r.left() + 11.0, r, &format!("+{more} more"), theme::font(11.5), p.secondary, r.width() - 11.0);
     }
 }
 
 // ---------------------------------------------------------------------------
 // Day / Week time grid
 
+/// Hours never get shorter than this, however many are asked to fit.
+const MIN_HOUR_H: f32 = 20.0;
+
 pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
-    let first = if ndays == 7 { start_of_week(app.date) } else { app.date };
+    let first = app.grid_first(ndays);
     let events = shown_events(app, first, ndays);
 
     let full = ui.available_rect_before_wrap();
@@ -395,14 +462,18 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
     // Header and all-day lane stay put; paint them with the outer painter.
     let outer = ui.painter().clone();
 
+    // "Show N hours at a time": N hours fill the visible part of the grid.
+    let visible_h = full.height() - header_h - lane_h - 2.0 * GRID_PAD;
+    let hour_h = (visible_h / app.store.settings.hours_shown.max(1) as f32).max(MIN_HOUR_H);
+
     // Our own pointer handling does drags, so the scroll area must not.
     let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).drag_to_scroll(false);
-    if let Some(off) = app.scroll_to.take() {
-        scroll = scroll.vertical_scroll_offset(off);
+    if let Some(hour) = app.scroll_to.take() {
+        scroll = scroll.vertical_scroll_offset(hour * hour_h);
     }
     scroll.show(ui, |ui| {
-        let (grid, _) = ui.allocate_exact_size(Vec2::new(full.width(), layout::grid_height()), Sense::hover());
-        let rects = WeekRects { header, allday, grid, grid_clip: ui.clip_rect().intersect(grid) };
+        let (grid, _) = ui.allocate_exact_size(Vec2::new(full.width(), layout::grid_height(hour_h)), Sense::hover());
+        let rects = WeekRects { header, allday, grid, grid_clip: ui.clip_rect().intersect(grid), hour_h };
         let lay = layout::week(&events, first, ndays, rects, &|ev| !is_read_only(app, ev));
         record_rects(app, &events, lay.timed.iter().chain(lay.banners.iter()).map(|t| (t.ev, t.rect)));
 
@@ -417,6 +488,15 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
 fn paint_day_headers(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayout, p: &Palette) {
     let g = &lay.geom;
     let cy = lay.rects.header.center().y;
+    if app.store.settings.week_numbers && lay.ndays > 1 {
+        painter.text(
+            Pos2::new(lay.rects.header.left() + GUTTER - 8.0, cy),
+            Align2::RIGHT_CENTER,
+            format!("W{}", week_number(lay.first)),
+            theme::font(11.0),
+            p.secondary,
+        );
+    }
     for i in 0..lay.ndays {
         let day = lay.first + Duration::days(i);
         let x = g.col_x(i);
@@ -437,9 +517,12 @@ fn paint_day_headers(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayo
         } else {
             let label_w = text_galley(ui, wd, font.clone(), color, 100.0).size().x;
             let nw = text_galley(ui, &num, font.clone(), color, 50.0).size().x;
-            let x0 = x + (g.col_w - (label_w + 6.0 + nw)) / 2.0;
-            painter.text(Pos2::new(x0, cy), Align2::LEFT_CENTER, wd, font.clone(), color);
-            day_number_badge(painter, Pos2::new(x0 + label_w + 6.0 + nw / 2.0, cy), &num, is_today, font, color);
+            // Today's number sits in a badge wider than the digits; keep
+            // the same gap between the weekday and the badge's edge.
+            let (gap, num_w) = if is_today { (4.0, badge_size(painter, &num, &font).x) } else { (6.0, nw) };
+            let x0 = (x + (g.col_w - (label_w + gap + num_w)) / 2.0).round();
+            text_cap_centered(painter, Pos2::new(x0, cy), Align2::LEFT_CENTER, wd, font.clone(), color);
+            day_number_badge(painter, Pos2::new(x0 + label_w + gap + num_w / 2.0, cy), &num, is_today, font, color);
         }
     }
 }
@@ -471,6 +554,15 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
     let painter = ui.painter_at(grid);
 
     // (No weekend shading here: Apple's week view keeps all days alike.)
+    // Hours outside the working day ("Day starts/ends at") are shaded.
+    let s = &app.store.settings;
+    let x_range = (grid.left() + GUTTER)..=grid.right();
+    for (from, to) in [(0, s.day_start), (s.day_end, 24)] {
+        if from < to {
+            let r = Rect::from_x_y_ranges(x_range.clone(), g.y_of(from as i64 * 60)..=g.y_of(to as i64 * 60));
+            painter.rect_filled(r, 0.0, p.off_hours);
+        }
+    }
     let now = Local::now().naive_local();
     let now_y = g.y_of(minute_of_day(now));
     let today_col = (0..lay.ndays).find(|&i| lay.first + Duration::days(i) == app.today);
@@ -507,7 +599,7 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
                 continue;
             }
             let y0 = g.y_of((ps - ds).num_minutes());
-            let y1 = g.y_of((pe - ds).num_minutes()).max(y0 + HOUR_H / 4.0);
+            let y1 = g.y_of((pe - ds).num_minutes()).max(y0 + g.hour_h / 4.0);
             let r = Rect::from_min_max(Pos2::new(g.col_x(i) + 0.5, y0 + 0.5), Pos2::new(g.col_x(i + 1) - 0.5, y1 - 0.5));
             draw_timed(ui, &painter, r, &ghost_event(s, e, false), theme::ACCENT, false, p);
         }
@@ -549,10 +641,13 @@ fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Colo
     let title_font = theme::bold_font(12.0);
 
     if r.height() < 2.0 * LINE + 4.0 {
-        // Too short for a second line: title only, centered (e.g. a 15-min stand-up).
-        draw_text_centered(ui, &p_clip, x, r, &ev.title, title_font, text_color, title_w);
+        // Too short for a second line: title only (e.g. a 15-min stand-up),
+        // centered in the shortest block's height, so short events that
+        // start together (15 and 30 min) have their titles on one line.
+        let line = Rect::from_min_size(r.min, Vec2::new(r.width(), r.height().min(layout::MIN_EVENT_H)));
+        draw_text_centered(ui, &p_clip, x, line, &ev.title, title_font, text_color, title_w);
         if repeat {
-            draw_repeat_marker(&p_clip, Pos2::new(r.right() - 5.0, r.center().y), text_color);
+            draw_repeat_marker(&p_clip, Pos2::new(r.right() - 5.0, line.center().y), text_color);
         }
         return;
     }
@@ -591,6 +686,7 @@ pub fn year(app: &mut App, ui: &mut Ui, p: &Palette) {
     let cw = rect.width() / cols as f32;
     let ch = rect.height() / rows as f32;
     let jan = NaiveDate::from_ymd_opt(app.date.year(), 1, 1).unwrap();
+    let heat = app.store.settings.year_heatmap.then(|| events_per_day(app, jan));
     for m in 0..12 {
         let cell = Rect::from_min_size(
             Pos2::new(rect.left() + (m % cols) as f32 * cw, rect.top() + (m / cols) as f32 * ch),
@@ -615,13 +711,43 @@ pub fn year(app: &mut App, ui: &mut Ui, p: &Palette) {
             app.actions.push(Action::GoTo(month, View::Month));
         }
         let grid = Rect::from_min_max(Pos2::new(cell.left(), title_rect.bottom() + 4.0), cell.max);
-        if let Some(day) = mini_month(ui, grid, month, app.today, None, p, true) {
+        if let Some(day) = mini_month(ui, grid, month, app.today, None, p, true, heat.as_ref()) {
             app.actions.push(Action::GoTo(day, View::Day));
         }
     }
 }
 
-/// Draws a compact month grid in `rect`; returns a clicked day.
+/// How many shown events touch each day of the year starting at `jan`.
+fn events_per_day(app: &App, jan: NaiveDate) -> HashMap<NaiveDate, usize> {
+    let next_jan = add_months(jan, 12);
+    let mut counts = HashMap::new();
+    for ev in layout::events_in(&app.store, jan, (next_jan - jan).num_days()) {
+        let mut day = ev.start.date().max(jan);
+        let last = last_day(ev.start, ev.end).min(next_jan - Duration::days(1));
+        while day <= last {
+            *counts.entry(day).or_insert(0) += 1;
+            day += Duration::days(1);
+        }
+    }
+    counts
+}
+
+/// The year view's shading for a day with `n` events (like macOS: yellow
+/// for a few, through orange, to a deep red for a busy day; deeper than the
+/// red "today" badge so the two don't mix up).
+fn heat_color(n: usize) -> Option<Color32> {
+    let (r, g, b) = match n {
+        0 => return None,
+        1..=2 => (0xFF, 0xCC, 0x00),
+        3..=4 => (0xFF, 0x95, 0x00),
+        _ => (0xB0, 0x1E, 0x1E),
+    };
+    Some(Color32::from_rgba_unmultiplied(r, g, b, if n >= 5 { 150 } else { 90 }))
+}
+
+/// Draws a compact month grid in `rect`; returns a clicked day. `heat`
+/// (event counts per day) shades busy days, as in the year view.
+#[allow(clippy::too_many_arguments)]
 pub fn mini_month(
     ui: &mut Ui,
     rect: Rect,
@@ -630,6 +756,7 @@ pub fn mini_month(
     selected: Option<NaiveDate>,
     p: &Palette,
     show_outside: bool,
+    heat: Option<&HashMap<NaiveDate, usize>>,
 ) -> Option<NaiveDate> {
     let first = first_of_month(month);
     let start = start_of_week(first);
@@ -668,6 +795,8 @@ pub fn mini_month(
             painter.circle_filled(center, radius, p.grid_strong);
         } else if resp.hovered() {
             painter.circle_filled(center, radius, p.selection);
+        } else if let Some(c) = heat.filter(|_| in_month).and_then(|h| heat_color(h.get(&day).copied().unwrap_or(0))) {
+            painter.circle_filled(center, radius, c);
         }
         let color = if is_today {
             Color32::WHITE

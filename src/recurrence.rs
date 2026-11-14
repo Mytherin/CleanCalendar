@@ -20,7 +20,7 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, Time
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
-use crate::dates::{add_months, day_short, first_of_month, midnight, week_index};
+use crate::dates::{day_short, first_of_month, midnight, week_index};
 use crate::model::Event;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,32 +128,42 @@ impl Recurrence {
     /// month or year counted in steps of `interval` from `first`. Months and
     /// years without the start's day (the 31st, 29 February) are skipped, as
     /// in RFC 5545.
+    ///
+    /// Periods beyond the dates chrono can represent (a remote rule with an
+    /// absurd INTERVAL) produce nothing rather than overflowing.
     fn period(&self, first: NaiveDateTime, k: i64, out: &mut Vec<NaiveDateTime>) {
-        let step = k * self.interval.max(1) as i64;
+        let Some(step) = k.checked_mul(self.interval.max(1) as i64) else { return };
         let time = first.time();
+        let days_later = |d: NaiveDate, n: i64| Duration::try_days(n).and_then(|n| d.checked_add_signed(n));
         match self.freq {
-            Freq::Daily => out.push(first + Duration::days(step)),
+            Freq::Daily => {
+                if let Some(d) = days_later(first.date(), step) {
+                    out.push(d.and_time(time));
+                }
+            }
             Freq::Weekly => {
                 // Weeks start on Monday here, like RFC 5545's default WKST.
                 let monday = first.date() - Duration::days(first.weekday().num_days_from_monday() as i64);
-                let week = monday + Duration::weeks(step);
+                let Some(week) = step.checked_mul(7).and_then(|n| days_later(monday, n)) else { return };
                 let mut days = self.days_of_week(first.date());
                 days.sort_by_key(|d| d.num_days_from_monday());
                 for d in days {
-                    let t = (week + Duration::days(d.num_days_from_monday() as i64)).and_time(time);
+                    let Some(day) = days_later(week, d.num_days_from_monday() as i64) else { continue };
+                    let t = day.and_time(time);
                     if t >= first {
                         out.push(t);
                     }
                 }
             }
             Freq::Monthly => {
-                let month = add_months(first_of_month(first.date()), step as i32);
-                if let Some(d) = month.with_day(first.day()) {
+                let Ok(step) = u32::try_from(step) else { return };
+                let month = first_of_month(first.date()).checked_add_months(chrono::Months::new(step));
+                if let Some(d) = month.and_then(|m| m.with_day(first.day())) {
                     out.push(d.and_time(time));
                 }
             }
             Freq::Yearly => {
-                let year = first.year() + step as i32;
+                let Some(year) = i32::try_from(step).ok().and_then(|s| first.year().checked_add(s)) else { return };
                 if let Some(d) = NaiveDate::from_ymd_opt(year, first.month(), first.day()) {
                     out.push(d.and_time(time));
                 }
@@ -313,6 +323,32 @@ pub fn occurrence(series: &Event, id: &str) -> Option<Event> {
     occurrences(series, start - Duration::hours(1), start + len + Duration::hours(1))
         .into_iter()
         .find(|o| o.id == id)
+}
+
+/// A weekly series whose first day isn't one of its weekdays (created on a
+/// Wednesday, repeating Mondays and Thursdays) moved to its first actual
+/// occurrence. Google, like RFC 5545, always counts the start as an
+/// occurrence; this app doesn't, so without this the two would disagree
+/// (an extra Wednesday on Google, and one occurrence short with a count).
+pub fn aligned(mut ev: Event) -> Event {
+    let Some(rule) = ev.recurrence.as_ref().filter(|r| r.freq == Freq::Weekly && !r.weekdays.is_empty()) else {
+        return ev;
+    };
+    let zone = zone_of(&ev);
+    let first = to_zone(ev.start, zone);
+    if rule.weekdays.contains(&first.weekday()) {
+        return ev;
+    }
+    let mut candidates = Vec::new();
+    rule.period(first, 0, &mut candidates);
+    if candidates.is_empty() {
+        rule.period(first, 1, &mut candidates);
+    }
+    let Some(&start) = candidates.iter().min() else { return ev };
+    let len = to_zone(ev.end, zone) - first;
+    ev.start = from_zone(start, zone);
+    ev.end = from_zone(start + len, zone);
+    ev
 }
 
 /// When an event (or occurrence) starts in its series time.
@@ -525,6 +561,7 @@ mod tests {
             all_day: false,
             location: String::new(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: None,
             recurring_id: None,
             pending: false,
@@ -581,6 +618,38 @@ mod tests {
         let ev = series(at(d(2024, 2, 29), 8, 0), 15, Recurrence::new(Freq::Yearly));
         let got: Vec<NaiveDate> = starts(&ev, d(2024, 1, 1), d(2033, 1, 1)).iter().map(|t| t.date()).collect();
         assert_eq!(got, [d(2024, 2, 29), d(2028, 2, 29), d(2032, 2, 29)]);
+    }
+
+    #[test]
+    fn a_weekly_series_starts_on_one_of_its_weekdays() {
+        // Wednesday 18 Nov 2026, repeating Mondays and Thursdays.
+        let mut rule = Recurrence::new(Freq::Weekly);
+        rule.weekdays = vec![Weekday::Mon, Weekday::Thu];
+        let ev = aligned(series(at(d(2026, 11, 18), 9, 0), 90, rule.clone()));
+        assert_eq!((ev.start, ev.end), (at(d(2026, 11, 19), 9, 0), at(d(2026, 11, 19), 10, 30)), "the Thursday after");
+
+        // Every other week, Mondays only, starting on a Friday: the Monday
+        // of the next period.
+        rule.weekdays = vec![Weekday::Mon];
+        rule.interval = 2;
+        let ev = aligned(series(at(d(2026, 11, 20), 9, 0), 60, rule.clone()));
+        assert_eq!(ev.start, at(d(2026, 11, 30), 9, 0));
+
+        // Already on one of its days: unchanged.
+        let ev = aligned(series(at(d(2026, 11, 16), 9, 0), 60, rule));
+        assert_eq!(ev.start, at(d(2026, 11, 16), 9, 0));
+    }
+
+    #[test]
+    fn an_absurd_interval_from_google_does_not_overflow() {
+        for freq in Freq::ALL {
+            let mut rule = Recurrence::new(freq);
+            rule.interval = u32::MAX;
+            let ev = series(at(d(2026, 11, 14), 9, 0), 60, rule);
+            let far = NaiveDate::MAX.and_hms_opt(0, 0, 0).unwrap();
+            let shown = occurrences(&ev, at(d(2026, 1, 1), 0, 0), far);
+            assert_eq!(shown.len(), 1, "{freq:?}: just the first");
+        }
     }
 
     #[test]

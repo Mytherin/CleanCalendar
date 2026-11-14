@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::model::Event;
+use crate::model::{Attendee, Event, Response};
 use crate::recurrence;
 #[cfg(test)]
 use crate::remote::{classify, run, sync_all, Cmd, Connections, Failure, Login, Msg, GOOGLE};
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 pub fn test_conns(endpoints: &Endpoints) -> Connections {
     Connections::new(endpoints.clone(), Box::new(|_: &str| panic!("tests never open a browser")))
 }
-use crate::remote::{http_status, CalRef, CalendarChanges, HttpError, Query, Remote, RemoteCalendar, TokenExpired};
+use crate::remote::{http_status, AuthError, CalRef, CalendarChanges, HttpError, Query, Remote, RemoteCalendar, TokenExpired};
 
 /// Where sign-in, token, and Calendar API requests go.
 #[derive(Clone, Debug, PartialEq)]
@@ -261,6 +261,11 @@ impl Client {
             ])
             .send()?
             .json()?;
+        // OAuth errors that retrying can't fix (RFC 6749 §5.2). Anything else
+        // (a server hiccup, a garbled reply) is treated as transient.
+        if let Some(code @ ("invalid_grant" | "invalid_client" | "unauthorized_client")) = resp["error"].as_str() {
+            return Err(AuthError { service: "Google", code: code.to_owned() }.into());
+        }
         let tok = resp["access_token"]
             .as_str()
             .ok_or_else(|| anyhow!("Could not refresh Google access: {}", resp))?
@@ -396,8 +401,23 @@ impl Client {
     /// instead of overwriting someone else's newer change. New events carry
     /// an id derived from the local id, so retrying a create whose reply was
     /// lost can't produce a duplicate.
+    ///
+    /// Invitees are sent when the guest list changed (a PATCH replaces the
+    /// whole list, so leaving it out otherwise can't lose anything we don't
+    /// model). For events with guests, Google emails them invitations and
+    /// updates (`sendUpdates=all`), as Apple Calendar does.
     fn save_event(&mut self, cal_id: &str, ev: &Event) -> Result<(String, Option<String>)> {
         let mut body = event_to_json(ev);
+        let before = ev.base.as_ref().map(|b| b.attendees.as_slice());
+        let guests_changed = match (&ev.remote_id, before) {
+            (None, _) => !ev.attendees.is_empty(),
+            (Some(_), Some(before)) => !same_guests(before, &ev.attendees),
+            (Some(_), None) => !ev.attendees.is_empty(),
+        };
+        if guests_changed {
+            body["attendees"] = attendees_to_json(&ev.attendees);
+        }
+        let notify = !ev.attendees.is_empty() || before.is_some_and(|b| !b.is_empty());
         let token = self.token()?;
         let req = match &ev.remote_id {
             Some(rid) => {
@@ -414,6 +434,7 @@ impl Client {
                 self.http.post(self.url(&["calendars", cal_id, "events"]))
             }
         };
+        let req = if notify { req.query(&[("sendUpdates", "all")]) } else { req };
         let result = req.bearer_auth(token).json(&body).send().map_err(anyhow::Error::from).and_then(Self::check);
         let resp: Value = match result {
             Ok(resp) => resp.json()?,
@@ -422,7 +443,26 @@ impl Client {
                 let id = client_event_id(&ev.id).ok_or(e)?;
                 return match self.get_event(cal_id, &id)? {
                     Some(existing) => Ok((id, existing.etag)),
-                    None => Err(anyhow!("Google reported event {id} as a duplicate but doesn't have it")),
+                    // Google keeps the ids of deleted events, so ours can
+                    // never be used again: create it under a new one.
+                    None => {
+                        if let Some(o) = body.as_object_mut() {
+                            o.remove("id");
+                        }
+                        let url = self.url(&["calendars", cal_id, "events"]);
+                        let req = self.http.post(url);
+                        let req = if notify { req.query(&[("sendUpdates", "all")]) } else { req };
+                        let token = self.token()?;
+                        let resp: Value = req
+                            .bearer_auth(token)
+                            .json(&body)
+                            .send()
+                            .map_err(anyhow::Error::from)
+                            .and_then(Self::check)?
+                            .json()?;
+                        let id = resp["id"].as_str().ok_or_else(|| anyhow!("Google returned no event id"))?.to_owned();
+                        Ok((id, resp["etag"].as_str().map(str::to_owned)))
+                    }
                 };
             }
             Err(e) => return Err(e),
@@ -443,8 +483,13 @@ impl Client {
     }
 
     /// Deletes the event, only if it's still at `etag` when one is given.
+    /// Guests, if any, are told it was cancelled.
     fn delete_event(&mut self, cal_id: &str, remote_id: &str, etag: Option<&str>) -> Result<()> {
-        let mut req = self.http.delete(self.url(&["calendars", cal_id, "events", remote_id])).bearer_auth(self.token()?);
+        let mut req = self
+            .http
+            .delete(self.url(&["calendars", cal_id, "events", remote_id]))
+            .query(&[("sendUpdates", "all")])
+            .bearer_auth(self.token()?);
         if let Some(etag) = etag {
             req = req.header("If-Match", etag);
         }
@@ -473,7 +518,7 @@ pub fn local_calendar_id(google_calendar_id: &str) -> String {
 /// The Google id to request for a new event, derived from its local id
 /// ("local:<uuid hex>"). Google accepts lowercase base32hex (a–v, 0–9),
 /// 5–1024 characters, which hex UUIDs satisfy.
-fn client_event_id(local_id: &str) -> Option<String> {
+pub fn client_event_id(local_id: &str) -> Option<String> {
     let id = local_id.strip_prefix("local:")?;
     let ok = (5..=1024).contains(&id.len()) && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='v'));
     ok.then(|| id.to_owned())
@@ -512,6 +557,7 @@ fn event_from_json(cal_id: &str, v: &Value) -> Option<Event> {
         all_day,
         location: v["location"].as_str().unwrap_or_default().to_owned(),
         notes: v["description"].as_str().unwrap_or_default().to_owned(),
+        attendees: attendees_from_json(&v["attendees"]),
         remote_id: Some(remote_id),
         recurring_id: v["recurringEventId"].as_str().map(str::to_owned),
         pending: false,
@@ -541,14 +587,15 @@ fn event_to_json(ev: &Event) -> Value {
         (None, Some(_)) => recurrence::local_zone_name(),
         (None, None) => None,
     };
+    // Updates are PATCHes, which merge into Google's `start`/`end`: the
+    // fields that don't apply are sent as null so they're cleared (otherwise
+    // turning a timed event into an all-day one leaves its `dateTime`, and
+    // Google rejects the mix).
     let when = |t: NaiveDateTime| {
         if ev.all_day {
-            json!({ "date": t.date().format("%Y-%m-%d").to_string() })
+            json!({ "date": t.date().format("%Y-%m-%d").to_string(), "dateTime": null, "timeZone": null })
         } else {
-            match &zone {
-                Some(z) => json!({ "dateTime": to_rfc3339(t), "timeZone": z }),
-                None => json!({ "dateTime": to_rfc3339(t) }),
-            }
+            json!({ "dateTime": to_rfc3339(t), "timeZone": zone, "date": null })
         }
     };
     let mut body = json!({
@@ -564,12 +611,69 @@ fn event_to_json(ev: &Event) -> Value {
     body
 }
 
+fn attendees_from_json(v: &Value) -> Vec<Attendee> {
+    let Some(list) = v.as_array() else { return Vec::new() };
+    list.iter()
+        .filter_map(|a| {
+            Some(Attendee {
+                email: a["email"].as_str()?.to_owned(),
+                name: a["displayName"].as_str().unwrap_or_default().to_owned(),
+                response: Response::from_google(a["responseStatus"].as_str().unwrap_or_default()),
+                organizer: a["organizer"].as_bool().unwrap_or(false),
+                is_self: a["self"].as_bool().unwrap_or(false),
+                optional: a["optional"].as_bool().unwrap_or(false),
+                resource: a["resource"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn attendees_to_json(list: &[Attendee]) -> Value {
+    Value::Array(
+        list.iter()
+            .map(|a| {
+                let mut v = json!({ "email": a.email, "responseStatus": a.response.as_google() });
+                if !a.name.is_empty() {
+                    v["displayName"] = json!(a.name);
+                }
+                if a.optional {
+                    v["optional"] = json!(true);
+                }
+                if a.resource {
+                    v["resource"] = json!(true);
+                }
+                v
+            })
+            .collect(),
+    )
+}
+
+/// Whether two guest lists invite the same addresses.
+fn same_guests(a: &[Attendee], b: &[Attendee]) -> bool {
+    let emails = |l: &[Attendee]| {
+        let mut v: Vec<_> = l.iter().map(|x| x.email.to_lowercase()).collect();
+        v.sort();
+        v
+    };
+    emails(a) == emails(b)
+}
+
 fn to_rfc3339(t: NaiveDateTime) -> String {
-    Local
-        .from_local_datetime(&t)
-        .earliest()
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(|| t.and_utc().to_rfc3339())
+    to_rfc3339_in(t, &Local)
+}
+
+/// Wall time `t` in `zone` as RFC 3339. A time skipped by a daylight-saving
+/// change (02:30 on the night clocks go forward) is moved forward an hour,
+/// as `recurrence::convert` does, rather than being sent as UTC.
+fn to_rfc3339_in<Z: TimeZone>(t: NaiveDateTime, zone: &Z) -> String
+where
+    Z::Offset: std::fmt::Display,
+{
+    let at = |t| zone.from_local_datetime(&t).earliest();
+    match at(t).or_else(|| at(t + chrono::Duration::hours(1))) {
+        Some(dt) => dt.to_rfc3339(),
+        None => t.and_utc().to_rfc3339(),
+    }
 }
 
 fn parse_hex(s: &str) -> Option<[u8; 3]> {
@@ -584,6 +688,14 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_in_a_skipped_hour_move_forward_instead_of_becoming_utc() {
+        let ny: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let t = |h, m| NaiveDate::from_ymd_opt(2027, 3, 14).unwrap().and_hms_opt(h, m, 0).unwrap();
+        assert_eq!(to_rfc3339_in(t(2, 30), &ny), "2027-03-14T03:30:00-04:00");
+        assert_eq!(to_rfc3339_in(t(1, 30), &ny), "2027-03-14T01:30:00-05:00");
+    }
 
     #[test]
     fn parses_all_day_and_timed_events() {
@@ -628,8 +740,28 @@ mod tests {
         let plain = json!({"id": "p", "start": {"dateTime": "2026-11-14T18:00:00Z"}, "end": {"dateTime": "2026-11-14T19:00:00Z"}});
         let plain = event_from_json("c", &plain).unwrap();
         assert!(plain.time_zone.is_none() && plain.recurrence.is_none());
-        assert!(event_to_json(&plain)["start"].get("timeZone").is_none());
+        let start = &event_to_json(&plain)["start"];
+        assert!(start["timeZone"].is_null() && start["date"].is_null(), "cleared, for PATCH: {start}");
         assert!(event_to_json(&plain).get("recurrence").is_none());
+    }
+
+    #[test]
+    fn parses_attendees() {
+        let v = json!({"id": "x", "start": {"date": "2026-11-11"}, "attendees": [
+            {"email": "me@example.com", "organizer": true, "self": true, "responseStatus": "accepted"},
+            {"email": "ann@example.com", "displayName": "Ann", "responseStatus": "tentative", "optional": true},
+            {"email": "room@resource.calendar.google.com", "resource": true},
+            {"displayName": "no email, skipped"}
+        ]});
+        let a = event_from_json("c", &v).unwrap().attendees;
+        assert_eq!(a.len(), 3);
+        assert!(a[0].organizer && a[0].is_self && a[0].response == Response::Accepted);
+        assert_eq!((a[1].label(), a[1].response, a[1].optional), ("Ann", Response::Tentative, true));
+        assert_eq!((a[2].response, a[2].resource), (Response::NeedsAction, true));
+        // Rooms and optional flags survive the round trip.
+        let back = attendees_to_json(&a);
+        assert_eq!(back[1]["optional"], true);
+        assert_eq!(back[2]["resource"], true);
     }
 
     #[test]

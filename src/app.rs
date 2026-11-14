@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{Duration, Local, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, Stroke, Vec2};
 
 use crate::app_icon::AppIcon;
@@ -11,18 +11,20 @@ use crate::editor::{self, Editor, Outcome, Placement, Scope};
 use crate::dates::*;
 use crate::caldav;
 use crate::google;
+use crate::menu::{self, Command, ContextMenu, Icon, Item, MenuAt};
 use crate::model::{CalDavAccount, Calendar, Event, Source, Store, CALENDAR_COLORS};
 use crate::remote::{Cmd, Worker, GOOGLE};
 use crate::recurrence;
+use crate::settings::WeekScroll;
 use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, ACCENT, RED};
 use crate::interact::Pointer;
-use crate::layout;
 use crate::views;
 
-/// How often to pull changes from the servers.
-const AUTO_SYNC: StdDuration = StdDuration::from_secs(5 * 60);
-/// How often to retry while local changes are waiting to upload.
+mod settings_window;
+
+/// How often to retry while local changes are waiting to upload. (How
+/// often to pull changes is the "Refresh Calendars" setting.)
 const RETRY_SYNC: StdDuration = StdDuration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +60,8 @@ pub enum Action {
     SetTimes { id: String, start: NaiveDateTime, end: NaiveDateTime },
     /// A drag finished changing this event.
     Committed(String),
+    /// Open the right-click menu for what's at `pos`.
+    ContextMenu { at: MenuAt, pos: egui::Pos2 },
 }
 
 pub struct App {
@@ -67,7 +71,14 @@ pub struct App {
     pub today: NaiveDate,
     pub selected: Option<String>,
     pub pointer: Pointer,
+    /// Scroll the day/week grid to this hour on the next frame.
     pub scroll_to: Option<f32>,
+    /// The week view's first day while scrolling by days (see
+    /// [`App::grid_first`]).
+    week_first: Option<NaiveDate>,
+    /// While stepping by months or years: the day of the month to go back
+    /// to, so 31 Jan → Feb → Mar lands on 31 Mar, not 28 Mar.
+    month_anchor: Option<u32>,
     pub actions: Vec<Action>,
     /// The event being edited (in a popover, or the day view's inspector).
     pub editor: Option<Editor>,
@@ -75,12 +86,18 @@ pub struct App {
     pub event_rects: HashMap<String, egui::Rect>,
     /// The last pointer position, to anchor the popover of a new event.
     last_pointer: Option<egui::Pos2>,
+    /// The open right-click menu, and its items (worked out when it opened).
+    pub menu: Option<ContextMenu>,
+    menu_items: Vec<Item>,
+    /// The event last copied or cut, for pasting.
+    clipboard: Option<Event>,
     sidebar_open: bool,
     mini_month: NaiveDate,
     worker: Worker,
     engine: SyncEngine,
     last_sync: Option<Instant>,
     status: Option<(String, bool)>,
+    settings_ui: settings_window::SettingsUi,
     show_accounts: bool,
     caldav_form: CalDavForm,
     icon: AppIcon,
@@ -102,28 +119,39 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let today = Local::now().date_naive();
+        let store = Store::load();
+        store.settings.apply();
         let mut app = App {
-            store: Store::load(),
+            scroll_to: Some(store.settings.scroll_hour()),
+            store,
             view: View::Week,
             date: today,
             today,
             selected: None,
             pointer: Pointer::default(),
-            scroll_to: Some(layout::HOUR_H * 7.5),
+            week_first: None,
+            month_anchor: None,
             actions: Vec::new(),
             editor: None,
             event_rects: HashMap::new(),
             last_pointer: None,
+            menu: None,
+            menu_items: Vec::new(),
+            clipboard: None,
             sidebar_open: true,
             mini_month: first_of_month(today),
             worker: Worker::spawn(cc.egui_ctx.clone(), google::Endpoints::from_env()),
             engine: SyncEngine::default(),
             last_sync: None,
             status: None,
+            settings_ui: Default::default(),
             show_accounts: false,
             caldav_form: CalDavForm::default(),
             icon: AppIcon::new(&cc.egui_ctx),
         };
+        if let Some((view, date)) = std::env::var("CLEANCALENDAR_START").ok().and_then(|s| parse_start(&s)) {
+            app.go_to(date.unwrap_or(today), view);
+        }
         SyncEngine::prepare(&mut app.store);
         app.sync();
         app
@@ -132,6 +160,10 @@ impl App {
     // ---- Sync glue (the logic lives in sync.rs) ---------------------------
 
     fn sync(&mut self) {
+        // A switched-off account isn't synced; its changes wait until it's back on.
+        if !self.store.settings.google_enabled {
+            return;
+        }
         if self.engine.sync(&self.store, self.today) {
             self.last_sync = Some(Instant::now());
         }
@@ -210,16 +242,27 @@ impl App {
 
     // ---- Event operations -------------------------------------------------
 
-    fn new_event(&mut self, start: NaiveDateTime, end: NaiveDateTime, all_day: bool) {
-        let calendar_id = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.store.find_event(id))
-            .map(|e| e.calendar_id)
-            .filter(|cid| self.store.calendar(cid).is_some_and(|c| !c.read_only))
+    /// The calendar new events go on: the "Default Calendar" setting, else
+    /// the selected event's, else the first visible one that can be written to.
+    fn default_calendar(&self) -> Option<String> {
+        let writable = |cid: &String| self.store.writable_calendars().any(|c| &c.id == cid);
+        self.store
+            .settings
+            .default_calendar
+            .clone()
+            .filter(writable)
+            .or_else(|| self.selected.as_ref().and_then(|id| self.store.find_event(id)).map(|e| e.calendar_id))
+            .filter(writable)
             .or_else(|| self.store.writable_calendars().find(|c| c.visible).map(|c| c.id.clone()))
-            .or_else(|| self.store.writable_calendars().next().map(|c| c.id.clone()));
-        let Some(calendar_id) = calendar_id else { return };
+            .or_else(|| self.store.writable_calendars().next().map(|c| c.id.clone()))
+    }
+
+    fn is_writable(&self, calendar_id: &str) -> bool {
+        self.store.calendar(calendar_id).is_some_and(|c| !c.read_only)
+    }
+
+    fn new_event(&mut self, start: NaiveDateTime, end: NaiveDateTime, all_day: bool) {
+        let Some(calendar_id) = self.default_calendar() else { return };
         let draft = Event {
             id: format!("local:{}", uuid::Uuid::new_v4().simple()),
             calendar_id,
@@ -229,6 +272,7 @@ impl App {
             all_day,
             location: String::new(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: None,
             recurring_id: None,
             pending: false,
@@ -239,6 +283,10 @@ impl App {
             time_zone: None,
         };
         self.finish_editor(Outcome::Done);
+        if self.editor.is_some() {
+            // The open editor can't be saved yet; it shows why.
+            return;
+        }
         let placement = if self.view == View::Day {
             Placement::Inspector
         } else {
@@ -254,6 +302,9 @@ impl App {
             return;
         }
         self.finish_editor(Outcome::Done);
+        if self.editor.is_some() {
+            return;
+        }
         if let Some(ev) = self.store.find_event(id) {
             let placement = if self.view == View::Day {
                 Placement::Inspector
@@ -281,7 +332,7 @@ impl App {
                 }
                 match ed.result() {
                     Ok(ev) if is_occurrence(&self.store, &ev.id) => self.commit_occurrence(ev, ed.scope),
-                    Ok(ev) => self.commit_event(ev, ed.is_new),
+                    Ok(ev) => self.commit_event(recurrence::aligned(ev), ed.is_new),
                     // Keep it open so the problem can be fixed.
                     Err(_) => self.editor = Some(ed),
                 }
@@ -305,6 +356,15 @@ impl App {
         }
 
         let (s, shown) = recurrence::edit_series(&series, stamp, &ev);
+        // If the series' first day isn't one of its weekdays any more, it
+        // moves to its first occurrence, and so does the selection on it.
+        let unaligned_first = recurrence::occurrence_id(&s.id, recurrence::series_start(&s));
+        let s = recurrence::aligned(s);
+        let shown = if shown == unaligned_first {
+            recurrence::occurrence_id(&s.id, recurrence::series_start(&s))
+        } else {
+            shown
+        };
         self.commit_event(s, false);
         self.selected = Some(shown);
     }
@@ -420,6 +480,9 @@ impl App {
         if self.selected.as_deref() == Some(id) {
             self.selected = None;
         }
+        // An editor left open on it (e.g. the day view's inspector when
+        // Delete is pressed) would save it right back when it closes.
+        self.close_editor_if(|draft| draft.id == id);
         if is_occurrence(&self.store, id) {
             let Some((series_id, stamp)) = recurrence::split_occurrence(id) else { return };
             let Some(mut series) = self.store.event(series_id).cloned() else { return };
@@ -433,6 +496,13 @@ impl App {
         self.store.events.retain(|e| e.id != id);
         self.engine.event_deleted(&mut self.store, &ev, true);
         self.flush();
+    }
+
+    /// Drops the editor, unsaved, when its draft matches (its event is gone).
+    fn close_editor_if(&mut self, gone: impl Fn(&Event) -> bool) {
+        if self.editor.as_ref().is_some_and(|ed| gone(&ed.draft)) {
+            self.editor = None;
+        }
     }
 
     /// Deletes every occurrence of the repeating event `id` belongs to.
@@ -466,6 +536,11 @@ impl App {
         };
         let members: Vec<Event> = self.store.events.iter().filter(|e| in_series(e)).cloned().collect();
         self.store.events.retain(|e| !members.iter().any(|m| m.id == e.id));
+        self.close_editor_if(|draft| {
+            draft.id == id
+                || members.iter().any(|m| m.id == draft.id)
+                || recurrence::split_occurrence(&draft.id).is_some_and(|(s, _)| s == series_id)
+        });
         match (&local_series, self.store.remote_of(&ev)) {
             (Some(_), _) => {
                 for m in &members {
@@ -481,6 +556,193 @@ impl App {
         }
         self.selected = None;
         self.flush();
+    }
+
+    // ---- The right-click menu and the edit commands -----------------------
+
+    /// What the right-click menu offers for `at`, as in macOS Calendar.
+    fn menu_items_for(&self, at: &MenuAt) -> Vec<Item> {
+        let can_create = self.store.writable_calendars().next().is_some();
+        let can_paste = can_create && self.clipboard.is_some();
+        let id = match at {
+            MenuAt::Event(id) => id,
+            MenuAt::Time(_) | MenuAt::Day { .. } => {
+                return vec![
+                    Item::new(Icon::Plus, "New Event", can_create, Command::NewEvent),
+                    Item::Separator,
+                    Item::new(Icon::Paste, "Paste", can_paste, Command::Paste),
+                ];
+            }
+        };
+        let Some(ev) = self.store.find_event(id) else { return Vec::new() };
+        let writable = !self.is_read_only(&ev);
+        let mut items = vec![
+            Item::new(Icon::Info, "Get Info", true, Command::GetInfo),
+            Item::Calendars { enabled: writable, current: ev.calendar_id.clone() },
+            Item::Separator,
+            Item::new(Icon::Trash, "Delete", writable, Command::Delete),
+            Item::new(Icon::Scissors, "Cut", writable, Command::Cut),
+            Item::new(Icon::Copy, "Copy", true, Command::Copy),
+            Item::new(Icon::Paste, "Paste", can_paste, Command::Paste),
+            Item::new(Icon::Duplicate, "Duplicate", can_create, Command::Duplicate),
+        ];
+        if ev.repeats() {
+            let next = self.store.adjacent_occurrence(id, true).is_some();
+            let prev = self.store.adjacent_occurrence(id, false).is_some();
+            items.extend([
+                Item::Separator,
+                Item::new(Icon::Next, "Go to Next Occurrence", next, Command::NextOccurrence).shortcut("Ctrl+]"),
+                Item::new(Icon::Previous, "Go to Previous Occurrence", prev, Command::PreviousOccurrence).shortcut("Ctrl+["),
+            ]);
+        }
+        items.push(Item::Separator);
+        items.push(Item::new(Icon::Envelope, "Email Event", true, Command::EmailEvent));
+        if ev.repeats() {
+            items.push(Item::new(Icon::Envelopes, "Email Event Series", true, Command::EmailSeries));
+        }
+        // Events don't have participants here (yet), so these stay greyed
+        // out, as macOS shows them for events without any.
+        let none = Command::EmailEvent;
+        items.push(Item::new(Icon::EnvelopePerson, "Email All Participants", false, none.clone()));
+        items.push(Item::new(Icon::Bubble, "Message All Participants", false, none));
+        items
+    }
+
+    /// Draws the open right-click menu and runs what's picked from it.
+    fn context_menu(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(m) = self.menu.as_mut() else { return };
+        match menu::show(ctx, m, &self.menu_items, &self.store, p) {
+            menu::Outcome::Open => {}
+            menu::Outcome::Close => self.menu = None,
+            menu::Outcome::Run(cmd) => {
+                let at = self.menu.take().map(|m| m.at);
+                if let Some(at) = at {
+                    self.run_command(ctx, at, cmd);
+                }
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Runs a command from the right-click menu or the keyboard.
+    fn run_command(&mut self, ctx: &egui::Context, at: MenuAt, cmd: Command) {
+        match (at, cmd) {
+            (MenuAt::Event(id), Command::GetInfo) => self.open_event(&id),
+            (MenuAt::Event(id), Command::MoveTo(cal)) => self.move_to_calendar(&id, &cal),
+            (MenuAt::Event(id), Command::Delete) => {
+                self.finish_editor(Outcome::Done);
+                self.delete_event(&id);
+            }
+            (MenuAt::Event(id), Command::Cut) => {
+                self.finish_editor(Outcome::Done);
+                if self.store.find_event(&id).is_some_and(|ev| !self.is_read_only(&ev)) {
+                    self.copy_event(ctx, &id);
+                    self.delete_event(&id);
+                }
+            }
+            (MenuAt::Event(id), Command::Copy) => self.copy_event(ctx, &id),
+            // Onto the right-clicked event's day, at the copied event's time.
+            (MenuAt::Event(id), Command::Paste) => {
+                if let Some(ev) = self.store.find_event(&id) {
+                    self.paste(ev.start.date(), None);
+                }
+            }
+            (MenuAt::Event(id), Command::Duplicate) => self.duplicate(&id),
+            (MenuAt::Event(id), Command::NextOccurrence) => self.go_to_occurrence(&id, true),
+            (MenuAt::Event(id), Command::PreviousOccurrence) => self.go_to_occurrence(&id, false),
+            (MenuAt::Event(id), Command::EmailEvent) => self.email(&id, false),
+            (MenuAt::Event(id), Command::EmailSeries) => self.email(&id, true),
+            (MenuAt::Time(t), Command::NewEvent) => self.new_event(t, t + Duration::hours(1), false),
+            (MenuAt::Day { day, all_day: true }, Command::NewEvent) => {
+                self.new_event(midnight(day), midnight(day) + Duration::days(1), true)
+            }
+            (MenuAt::Day { day, all_day: false }, Command::NewEvent) => {
+                let start = midnight(day) + Duration::hours(9);
+                self.new_event(start, start + Duration::hours(1), false);
+            }
+            (MenuAt::Time(t), Command::Paste) => self.paste(t.date(), Some(t)),
+            (MenuAt::Day { day, .. }, Command::Paste) => self.paste(day, None),
+            _ => {}
+        }
+        // The day view's inspector follows the selection.
+        if self.view == View::Day && self.editor.is_none() {
+            if let Some(id) = self.selected.clone() {
+                self.open_event(&id);
+            }
+        }
+    }
+
+    /// Moves an event to another calendar. A repeating event moves as a
+    /// whole series (as in macOS Calendar).
+    fn move_to_calendar(&mut self, id: &str, calendar_id: &str) {
+        self.finish_editor(Outcome::Done);
+        let target = match recurrence::split_occurrence(id) {
+            Some((series, _)) if is_occurrence(&self.store, id) => series.to_owned(),
+            _ => id.to_owned(),
+        };
+        let Some(mut ev) = self.store.event(&target).cloned() else { return };
+        if ev.calendar_id == calendar_id || self.is_read_only(&ev) || !self.is_writable(calendar_id) {
+            return;
+        }
+        ev.calendar_id = calendar_id.to_owned();
+        self.commit_event(ev, false);
+        self.selected = Some(id.to_owned());
+    }
+
+    /// Copies an event for pasting, and as text to the system clipboard.
+    fn copy_event(&mut self, ctx: &egui::Context, id: &str) {
+        if let Some(ev) = self.store.find_event(id) {
+            ctx.copy_text(menu::event_text(&ev, false));
+            self.clipboard = Some(ev);
+        }
+    }
+
+    /// A calendar a copy of an event can go on: its own if possible.
+    fn calendar_for_copy(&self, preferred: &str) -> Option<String> {
+        Some(preferred.to_owned()).filter(|c| self.is_writable(c)).or_else(|| self.default_calendar())
+    }
+
+    /// Pastes the copied event on `day`: at `time` if given (a slot in the
+    /// hour grid), else at the time it had. An all-day event stays all-day.
+    fn paste(&mut self, day: NaiveDate, time: Option<NaiveDateTime>) {
+        let Some(src) = self.clipboard.clone() else { return };
+        let start = match (src.all_day, time) {
+            (true, _) => midnight(day),
+            (false, Some(t)) => t,
+            (false, None) => day.and_time(src.start.time()),
+        };
+        let Some(calendar_id) = self.calendar_for_copy(&src.calendar_id) else { return };
+        self.finish_editor(Outcome::Done);
+        self.commit_event(src.copy_as_new(calendar_id, start), true);
+    }
+
+    /// A copy of the event at the same time, selected (macOS's Duplicate).
+    fn duplicate(&mut self, id: &str) {
+        let Some(ev) = self.store.find_event(id) else { return };
+        let Some(calendar_id) = self.calendar_for_copy(&ev.calendar_id) else { return };
+        self.finish_editor(Outcome::Done);
+        self.commit_event(ev.copy_as_new(calendar_id, ev.start), true);
+    }
+
+    /// Selects and shows the next (or previous) occurrence of a repeating event.
+    fn go_to_occurrence(&mut self, id: &str, forward: bool) {
+        let Some(occ) = self.store.adjacent_occurrence(id, forward) else { return };
+        self.finish_editor(Outcome::Done);
+        self.go_to(occ.start.date(), self.view);
+        if matches!(self.view, View::Day | View::Week) && !occ.is_banner() {
+            let hours = minute_of_day(occ.start) as f32 / 60.0;
+            self.scroll_to = Some((hours - 1.0).max(0.0));
+        }
+        self.selected = Some(occ.id);
+    }
+
+    /// Opens a new message in the mail app with the event's details.
+    fn email(&mut self, id: &str, series: bool) {
+        let Some(ev) = self.store.find_event(id) else { return };
+        let url = menu::mailto(&ev.title, &menu::event_text(&ev, series));
+        if let Err(e) = open::that(&url) {
+            self.status = Some((format!("Could not open your mail app: {e}"), true));
+        }
     }
 
     fn apply_actions(&mut self) {
@@ -527,6 +789,10 @@ impl App {
                     self.engine.event_changed(&mut self.store, &id);
                     self.flush();
                 }
+                Action::ContextMenu { at, pos } => {
+                    self.menu_items = self.menu_items_for(&at);
+                    self.menu = (!self.menu_items.is_empty()).then(|| ContextMenu::new(at, pos));
+                }
             }
         }
     }
@@ -535,37 +801,116 @@ impl App {
 
     pub fn go_to(&mut self, date: NaiveDate, view: View) {
         if matches!(view, View::Day | View::Week) && !matches!(self.view, View::Day | View::Week) {
-            self.scroll_to = Some(layout::HOUR_H * 7.5);
+            self.scroll_to = Some(self.store.settings.scroll_hour());
         }
         self.date = date;
+        self.month_anchor = None;
         if view != self.view {
             self.finish_editor(Outcome::Done);
+            // Still open (it can't be saved as is): the inspector only
+            // exists in the day view, so show it as a popover elsewhere.
+            if let Some(ed) = self.editor.as_mut().filter(|_| view != View::Day) {
+                if ed.placement == Placement::Inspector {
+                    ed.placement = Placement::Popover { anchor: None };
+                }
+            }
         }
         self.view = view;
         self.mini_month = first_of_month(date);
     }
 
+    /// Days the week view shows (the "Days per week" setting).
+    fn week_days(&self) -> i64 {
+        self.store.settings.week_days()
+    }
+
+    /// The first day shown in the day/week grid. A week normally starts on
+    /// the first day of the week (Monday, for a 5-day week). When scrolling
+    /// by days, it starts wherever scrolling left it, as long as the current
+    /// date is still in view.
+    pub fn grid_first(&mut self, ndays: i64) -> NaiveDate {
+        if ndays == 1 {
+            return self.date;
+        }
+        let in_view = |first: NaiveDate| self.date >= first && self.date < first + Duration::days(ndays);
+        if self.store.settings.week_scroll == WeekScroll::Day {
+            if let Some(first) = self.week_first.filter(|&f| in_view(f)) {
+                return first;
+            }
+        }
+        let mut first = start_of_week(self.date);
+        if ndays == 5 {
+            first += Duration::days(((7 - first.weekday().num_days_from_monday()) % 7) as i64);
+        }
+        self.week_first = Some(first);
+        first
+    }
+
     fn step(&mut self, dir: i32) {
+        let by_day = self.store.settings.week_scroll == WeekScroll::Day;
         self.date = match self.view {
             View::Day => self.date + Duration::days(dir as i64),
+            View::Week if by_day => {
+                let n = self.week_days();
+                let first = self.grid_first(n) + Duration::days(dir as i64);
+                self.week_first = Some(first);
+                (self.date + Duration::days(dir as i64)).clamp(first, first + Duration::days(n - 1))
+            }
             View::Week => self.date + Duration::days(7 * dir as i64),
-            View::Month => add_months(self.date, dir),
-            View::Year => add_months(self.date, 12 * dir),
+            View::Month | View::Year => {
+                let anchor = *self.month_anchor.get_or_insert(self.date.day());
+                let months = if self.view == View::Year { 12 * dir } else { dir };
+                step_months(self.date, months, anchor)
+            }
         };
+        if !matches!(self.view, View::Month | View::Year) {
+            self.month_anchor = None;
+        }
         self.mini_month = first_of_month(self.date);
+        // Don't leave an event selected (and deletable with Backspace)
+        // that's no longer on screen.
+        if self.editor.is_none() {
+            self.selected = None;
+        }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
         let popover = self.editor.as_ref().is_some_and(|ed| matches!(ed.placement, Placement::Popover { .. }));
-        let modal = popover || self.show_accounts;
+        let modal = popover || self.settings_ui.open || self.show_accounts || self.menu.is_some();
         let mut view = None;
         let mut step = 0;
         let mut today = false;
         let mut new = false;
         let mut delete = false;
+        let mut edit: Option<Command> = None;
+        let mut settings = false;
         ctx.input(|i| {
+            if !typing {
+                // Ctrl+X/C/V arrive as clipboard events, not key presses.
+                for e in &i.events {
+                    match e {
+                        egui::Event::Cut => edit = Some(Command::Cut),
+                        egui::Event::Copy => edit = Some(Command::Copy),
+                        egui::Event::Paste(_) => edit = Some(Command::Paste),
+                        _ => {}
+                    }
+                }
+                let cmd = i.modifiers.command;
+                if cmd && i.key_pressed(Key::D) {
+                    edit = Some(Command::Duplicate);
+                }
+                if cmd && i.key_pressed(Key::CloseBracket) {
+                    edit = Some(Command::NextOccurrence);
+                }
+                if cmd && i.key_pressed(Key::OpenBracket) {
+                    edit = Some(Command::PreviousOccurrence);
+                }
+            }
             let cmd = i.modifiers.command;
+            if cmd && i.key_pressed(Key::Comma) {
+                settings = true;
+            }
             for (n, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4].into_iter().enumerate() {
                 if cmd && i.key_pressed(k) {
                     view = Some(View::ALL[n]);
@@ -589,6 +934,9 @@ impl App {
                 }
             }
         });
+        if settings && !popover {
+            self.open_settings();
+        }
         if modal {
             return;
         }
@@ -603,12 +951,22 @@ impl App {
         }
         if new {
             let start = midnight(self.date) + Duration::hours(9);
-            self.new_event(start, start + Duration::hours(1), false);
+            self.new_event(start, start + default_event_len(), false);
         }
         if delete {
             if let Some(id) = self.selected.clone() {
                 self.delete_event(&id);
             }
+        }
+        match (edit, self.selected.clone()) {
+            // Onto the selected event's day (else the day shown), at the
+            // copied event's time.
+            (Some(Command::Paste), selected) => {
+                let day = selected.and_then(|id| self.store.find_event(&id)).map_or(self.date, |ev| ev.start.date());
+                self.paste(day, None);
+            }
+            (Some(cmd), Some(id)) => self.run_command(ctx, MenuAt::Event(id), cmd),
+            _ => {}
         }
     }
 
@@ -629,9 +987,12 @@ impl App {
                     }
                     if pill_button(ui, "+", p.seg_track, p).on_hover_text("New event (Ctrl+N)").clicked() {
                         let start = midnight(self.date) + Duration::hours(9);
-                        self.new_event(start, start + Duration::hours(1), false);
+                        self.new_event(start, start + default_event_len(), false);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, "⚙", "Settings (Ctrl+,)").clicked() {
+                            self.open_settings();
+                        }
                         let connected = !self.store.accounts().is_empty();
                         if connected {
                             let label = if self.worker.busy > 0 { "Syncing…" } else { "⟳" };
@@ -640,7 +1001,7 @@ impl App {
                             }
                         }
                         let accounts_label = if connected { "Accounts" } else { "Add Account" };
-                        if ui.button(accounts_label).clicked() {
+                        if ui.button(accounts_label).on_hover_text("iCloud, CalDAV and Google accounts").clicked() {
                             self.show_accounts = true;
                         }
                         let unsynced = self.store.unsynced_count();
@@ -710,12 +1071,15 @@ impl App {
             let google = account.is_some();
             let idxs: Vec<usize> = (0..self.store.calendars.len())
                 .filter(|&i| self.store.calendars[i].account() == account.as_deref())
+                .filter(|&i| self.store.is_listed(&self.store.calendars[i]))
                 .collect();
             if idxs.is_empty() && google {
                 continue;
             }
+            let description = self.store.settings.google_description.trim();
             let header = match account.as_deref() {
                 None => "On My Computer".to_owned(),
+                Some(GOOGLE) if !description.is_empty() => description.to_owned(),
                 Some(GOOGLE) => self.store.google.account_email.clone().unwrap_or_else(|| "Google".to_owned()),
                 Some(a) => self.store.account_name(a),
             };
@@ -769,6 +1133,10 @@ impl App {
             }
         }
         if let Some(id) = remove {
+            self.close_editor_if(|draft| draft.calendar_id == id);
+            if self.selected.as_ref().and_then(|s| self.store.find_event(s)).is_some_and(|e| e.calendar_id == id) {
+                self.selected = None;
+            }
             self.store.calendars.retain(|c| c.id != id);
             self.store.events.retain(|e| e.calendar_id != id);
             self.store.save();
@@ -795,8 +1163,9 @@ impl App {
         }
         let w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 7.0 * 24.0), Sense::hover());
-        if let Some(day) = views::mini_month(ui, rect, self.mini_month, self.today, Some(self.date), p, true) {
+        if let Some(day) = views::mini_month(ui, rect, self.mini_month, self.today, Some(self.date), p, true, None) {
             self.date = day;
+            self.month_anchor = None;
             if self.view == View::Year {
                 self.view = View::Day;
             }
@@ -869,7 +1238,7 @@ impl App {
                 ui.painter().vline(r.left() - 12.0, r.y_range().expand(20.0), Stroke::new(1.0_f32, p.grid));
                 let w = ui.available_width();
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 7.0 * 24.0), Sense::hover());
-                if let Some(day) = views::mini_month(ui, rect, first_of_month(self.date), self.today, Some(self.date), p, true) {
+                if let Some(day) = views::mini_month(ui, rect, first_of_month(self.date), self.today, Some(self.date), p, true, None) {
                     self.go_to(day, View::Day);
                 }
                 ui.add_space(14.0);
@@ -1063,10 +1432,18 @@ impl eframe::App for App {
         let p = Palette::get(ctx);
         self.today = Local::now().date_naive();
         self.icon.update(ctx, frame, self.today);
+        self.store.settings.apply();
 
         self.handle_messages();
-        let interval = if self.store.unsynced_count() > 0 { RETRY_SYNC } else { AUTO_SYNC };
-        if self.last_sync.is_some_and(|t| t.elapsed() > interval) {
+        // Unsent changes are retried every minute even when refreshing is
+        // manual; otherwise pull as often as "Refresh Calendars" says.
+        let refresh = self.store.settings.refresh_minutes;
+        let interval = if self.store.unsynced_count() > 0 {
+            Some(RETRY_SYNC)
+        } else {
+            (refresh > 0).then(|| StdDuration::from_secs(refresh as u64 * 60))
+        };
+        if interval.is_some_and(|i| self.last_sync.is_some_and(|t| t.elapsed() > i)) {
             self.sync();
         }
         self.shortcuts(ctx);
@@ -1085,7 +1462,10 @@ impl eframe::App for App {
             ui.add_space(6.0);
             match self.view {
                 View::Day => views::time_grid(self, ui, &p, 1),
-                View::Week => views::time_grid(self, ui, &p, 7),
+                View::Week => {
+                    let n = self.week_days();
+                    views::time_grid(self, ui, &p, n)
+                }
                 View::Month => views::month(self, ui, &p),
                 View::Year => views::year(self, ui, &p),
             }
@@ -1098,6 +1478,8 @@ impl eframe::App for App {
         }
         self.apply_actions();
         self.editor_popover(ctx, &p);
+        self.context_menu(ctx, &p);
+        self.settings_window(ctx, &p);
         self.accounts_window(ctx, &p);
 
         // Keep the current-time line moving.
@@ -1107,6 +1489,17 @@ impl eframe::App for App {
 
 // ---------------------------------------------------------------------------
 // Widgets
+
+/// `CLEANCALENDAR_START=month:2026-11-14` (or just `day`, `week`, `month`,
+/// `year`): where to open, for screenshots and testing by hand.
+fn parse_start(s: &str) -> Option<(View, Option<NaiveDate>)> {
+    let (view, date) = match s.split_once(':') {
+        Some((v, d)) => (v, Some(NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").ok()?)),
+        None => (s, None),
+    };
+    let view = View::ALL.into_iter().find(|v| v.label().eq_ignore_ascii_case(view.trim()))?;
+    Some((view, date))
+}
 
 /// Whether `id` names an occurrence of a repeating event stored here (rather
 /// than an event of its own).

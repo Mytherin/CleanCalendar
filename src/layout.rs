@@ -13,14 +13,16 @@ use crate::dates::*;
 use crate::model::{Event, Store};
 use crate::recurrence;
 
-/// Matches macOS Calendar's hour spacing (~53px at 100% scaling).
+/// A typical hour height (macOS Calendar showing 12 hours), for tests. The
+/// views size hours to the "Show N hours at a time" setting.
+#[cfg(test)]
 pub const HOUR_H: f32 = 52.0;
 /// Shortest drawn height of a timed event, enough for one line of title.
 pub const MIN_EVENT_H: f32 = 18.0;
 
-/// `MIN_EVENT_H` in minutes of the time grid.
-fn min_event_minutes() -> i64 {
-    (MIN_EVENT_H / HOUR_H * 60.0).ceil() as i64
+/// `MIN_EVENT_H` in minutes of a time grid with hours `hour_h` tall.
+fn min_event_minutes(hour_h: f32) -> i64 {
+    (MIN_EVENT_H / hour_h * 60.0).ceil() as i64
 }
 pub const GUTTER: f32 = 58.0;
 pub const BANNER_H: f32 = 20.0;
@@ -38,6 +40,9 @@ pub const SCROLLBAR_W: f32 = 12.0;
 const RESIZE_GRIP: f32 = 6.0;
 const MONTH_HEADER_H: f32 = 26.0;
 const MONTH_ROW_H: f32 = 18.0;
+/// Gap between a month cell's right edge and its day number (the weekday
+/// header above is right-aligned on the same line).
+pub const MONTH_NUMBER_INSET: f32 = 10.0;
 
 // ---------------------------------------------------------------------------
 // Hit map
@@ -120,6 +125,8 @@ pub struct TimeGrid {
     pub col_w: f32,
     /// y of the midnight line.
     pub top: f32,
+    /// Height of one hour.
+    pub hour_h: f32,
 }
 
 impl TimeGrid {
@@ -133,12 +140,12 @@ impl TimeGrid {
     }
 
     pub fn time_at(&self, pos: Pos2) -> NaiveDateTime {
-        let mins = (((pos.y - self.top) / HOUR_H) * 60.0).clamp(0.0, 24.0 * 60.0 - 1.0) as i64;
+        let mins = (((pos.y - self.top) / self.hour_h) * 60.0).clamp(0.0, 24.0 * 60.0 - 1.0) as i64;
         midnight(self.day_at(pos.x)) + Duration::minutes(mins)
     }
 
     pub fn y_of(&self, minutes: i64) -> f32 {
-        self.top + minutes as f32 / 60.0 * HOUR_H
+        self.top + minutes as f32 / 60.0 * self.hour_h
     }
 }
 
@@ -211,6 +218,8 @@ pub struct WeekRects {
     pub grid: Rect,
     /// The visible part of the hour grid.
     pub grid_clip: Rect,
+    /// Height of one hour in `grid` (see [`grid_height`]).
+    pub hour_h: f32,
 }
 
 pub struct WeekLayout {
@@ -230,8 +239,8 @@ pub fn allday_height(events: &[Event], first: NaiveDate, ndays: i64) -> f32 {
 }
 
 /// Total height of the scrollable hour grid.
-pub fn grid_height() -> f32 {
-    24.0 * HOUR_H + 2.0 * GRID_PAD
+pub fn grid_height(hour_h: f32) -> f32 {
+    24.0 * hour_h + 2.0 * GRID_PAD
 }
 
 pub fn week(
@@ -242,7 +251,14 @@ pub fn week(
     editable: &dyn Fn(&Event) -> bool,
 ) -> WeekLayout {
     let col_w = (rects.grid.width() - GUTTER) / ndays as f32;
-    let geom = TimeGrid { first, ndays, left: rects.grid.left() + GUTTER, col_w, top: rects.grid.top() + GRID_PAD };
+    let geom = TimeGrid {
+        first,
+        ndays,
+        left: rects.grid.left() + GUTTER,
+        col_w,
+        top: rects.grid.top() + GRID_PAD,
+        hour_h: rects.hour_h,
+    };
     let mut hits = HitMap { hits: Vec::new(), grid: Some(geom) };
 
     // Day headers (double-click to open that day).
@@ -281,7 +297,7 @@ pub fn week(
     for d in 0..ndays {
         // Edge to edge between the gridlines.
         let left = geom.col_x(d) + HALF_LINE;
-        for seg in layout_day(events, &timed_idx, first + Duration::days(d), col_w - 2.0 * HALF_LINE) {
+        for seg in layout_day(events, &timed_idx, first + Duration::days(d), col_w - 2.0 * HALF_LINE, rects.hour_h) {
             let ev = &events[seg.ev];
             let x0 = left + seg.x;
             let w = seg.w;
@@ -333,7 +349,7 @@ const NEST_INDENT: f32 = 8.0;
 ///
 /// Segments come back in drawing order (later ones on top), which is also
 /// the order their hit areas must be registered in.
-pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate, width: f32) -> Vec<Segment> {
+pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate, width: f32, hour_h: f32) -> Vec<Segment> {
     let ds = midnight(day);
     let de = ds + Duration::days(1);
     let mut segs: Vec<Segment> = idx
@@ -347,7 +363,7 @@ pub fn layout_day(events: &[Event], idx: &[usize], day: NaiveDate, width: f32) -
             // Short events are drawn taller than their duration so the title
             // fits; lay them out at that drawn length, so the next event goes
             // beside them instead of underneath their text.
-            let end_min = ((end - ds).num_minutes()).max(start_min + min_event_minutes());
+            let end_min = ((end - ds).num_minutes()).max(start_min + min_event_minutes(hour_h));
             Segment { ev: i, start_min, end_min, x: 0.0, w: width, ends_here: e.end <= de }
         })
         .collect();
@@ -466,20 +482,34 @@ pub fn month(
             let day = week_start + Duration::days(d);
             let cell = Rect::from_min_size(Pos2::new(rect.left() + d as f32 * cell_w, top), Vec2::new(cell_w, cell_h));
             let nw = number_w(day);
-            let number = Rect::from_center_size(Pos2::new(cell.right() - 10.0 - nw / 2.0, cell.top() + 14.0), Vec2::new(nw + 12.0, 22.0));
+            let number = Rect::from_center_size(
+                Pos2::new(cell.right() - MONTH_NUMBER_INSET - nw / 2.0, cell.top() + 14.0),
+                Vec2::new(nw + 12.0, 22.0),
+            );
             out.hits.push(cell, rect, Target::MonthCell(day));
             out.hits.push(number, rect, Target::MonthDayNumber(day));
             out.cells.push(MonthCell { day, rect: cell, number, in_month: day.month() == month.month() });
         }
 
         // Banners spanning across the week row.
+        let lanes = banner_lanes(events, week_start, 7);
+        let timed_on = |d: i64| {
+            let day = week_start + Duration::days(d);
+            (0..events.len()).filter(|&i| !events[i].is_banner() && events[i].occurs_on(day)).collect::<Vec<usize>>()
+        };
+        let timed_by_day: Vec<Vec<usize>> = (0..7).map(timed_on).collect();
         let mut used = [0usize; 7];
-        let mut hidden = [0usize; 7];
-        for (i, c0, c1, lane) in banner_lanes(events, week_start, 7) {
+        for &(_, c0, c1, lane) in &lanes {
             for c in c0..=c1 {
                 used[c as usize] = used[c as usize].max(lane + 1);
             }
-            if lane + 1 >= max_rows {
+        }
+        // The last row is kept for "N more" where a day has more than fits;
+        // a banner may use it only where everything else fits too.
+        let fits = |c: i64| used[c as usize] + timed_by_day[c as usize].len() <= max_rows;
+        let mut hidden = [0usize; 7];
+        for (i, c0, c1, lane) in lanes {
+            if lane >= max_rows || (lane + 1 == max_rows && !(c0..=c1).all(fits)) {
                 for c in c0..=c1 {
                     hidden[c as usize] += 1;
                 }
@@ -497,7 +527,7 @@ pub fn month(
         for d in 0..7 {
             let day = week_start + Duration::days(d);
             let left = rect.left() + d as f32 * cell_w;
-            let timed: Vec<usize> = (0..events.len()).filter(|&i| !events[i].is_banner() && events[i].occurs_on(day)).collect();
+            let timed = &timed_by_day[d as usize];
             let mut row = used[d as usize];
             let mut more = hidden[d as usize];
             for (k, &i) in timed.iter().enumerate() {
@@ -512,8 +542,9 @@ pub fn month(
                 row += 1;
             }
             if more > 0 {
-                let pos = Pos2::new(left + 10.0, top + 28.0 + row.min(max_rows - 1) as f32 * row_h + 1.0);
-                let r = Rect::from_min_size(pos, Vec2::new(cell_w - 20.0, row_h - 2.0));
+                // Where the next event row would go.
+                let pos = Pos2::new(left + 3.0, top + 28.0 + row.min(max_rows - 1) as f32 * row_h);
+                let r = Rect::from_min_size(pos, Vec2::new(cell_w - 6.0, row_h - 2.0));
                 out.more.push((day, more, r));
                 out.hits.push(r, rect, Target::More(day));
             }
@@ -537,6 +568,7 @@ mod tests {
             all_day: false,
             location: String::new(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: None,
             recurring_id: None,
             pending: false,
@@ -556,7 +588,7 @@ mod tests {
     fn events_starting_together_share_the_column() {
         // Like "hairdresser" 14:45 and "Engineering Process Meeting" 15:00.
         let all = [ev("a", (14, 45), (15, 45)), ev("b", (15, 0), (16, 0)), ev("c", (17, 0), (18, 0))];
-        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0);
+        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0, HOUR_H);
         let get = |id: &str| segs.iter().find(|s| all[s.ev].id == id).unwrap();
         assert_eq!((get("a").x, get("a").w), (0.0, 100.0));
         assert_eq!((get("b").x, get("b").w), (100.0, 100.0));
@@ -567,11 +599,99 @@ mod tests {
     fn later_overlapping_event_is_indented_on_top() {
         // Like "Colour Consultation" 17:30 inside "Nvidia sync" 17:00–18:00.
         let all = [ev("inner", (17, 30), (18, 0)), ev("outer", (17, 0), (18, 0))];
-        let segs = layout_day(&all, &[0, 1], day(), 200.0);
+        let segs = layout_day(&all, &[0, 1], day(), 200.0, HOUR_H);
         let order: Vec<&str> = segs.iter().map(|s| all[s.ev].id.as_str()).collect();
         assert_eq!(order, ["outer", "inner"], "the later one is drawn (and hit) on top");
         assert_eq!((segs[0].x, segs[0].w), (0.0, 200.0), "the one below keeps the full width");
         assert_eq!((segs[1].x, segs[1].x + segs[1].w), (NEST_INDENT, 200.0), "indented, to the right edge");
+    }
+
+    fn all_day(id: &str, first: u32, days: i64) -> Event {
+        let mut e = ev(id, (0, 0), (0, 0));
+        e.start = midnight(NaiveDate::from_ymd_opt(2026, 11, first).unwrap());
+        e.end = e.start + Duration::days(days);
+        e.all_day = true;
+        e
+    }
+
+    /// November 2026 (six week rows) in a rect whose cells fit 3 rows.
+    fn month_3_rows(events: &[Event]) -> MonthLayout {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, MONTH_HEADER_H + 6.0 * 90.0));
+        let lay = month(events, day(), rect, &|_| 14.0, &|_| true);
+        let cell_h = 90.0;
+        assert_eq!(((cell_h - 30.0) / MONTH_ROW_H).floor() as usize, 3);
+        lay
+    }
+
+    fn assert_no_overlaps(lay: &MonthLayout) {
+        let mut rects: Vec<Rect> = lay.banners.iter().chain(&lay.rows).map(|p| p.rect).collect();
+        rects.extend(lay.more.iter().map(|m| m.2));
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                assert!(!a.intersects(b.shrink(0.5)), "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_banner_in_the_last_row_shows_when_the_day_has_room() {
+        // Three all-day events on the 10th and nothing else: all three fit.
+        let all = [all_day("a", 10, 1), all_day("b", 10, 1), all_day("c", 10, 1)];
+        let lay = month_3_rows(&all);
+        assert_eq!(lay.banners.len(), 3);
+        assert!(lay.more.is_empty(), "no \"1 more\" in place of the third");
+        assert_no_overlaps(&lay);
+    }
+
+    #[test]
+    fn a_banner_in_the_last_row_folds_into_more_when_the_day_overflows() {
+        // Three banners plus a timed event on the 10th: four things, three rows.
+        let all = [all_day("a", 10, 1), all_day("b", 10, 1), all_day("c", 10, 1), ev("t", (9, 0), (10, 0))];
+        let lay = month_3_rows(&all);
+        assert_eq!(lay.banners.len(), 2);
+        assert!(lay.rows.is_empty());
+        assert_eq!(lay.more.len(), 1);
+        assert_eq!(lay.more[0].1, 2, "the hidden banner and the timed event");
+        assert_no_overlaps(&lay);
+    }
+
+    #[test]
+    fn a_long_banner_in_the_last_row_hides_where_any_of_its_days_overflow() {
+        // Lanes 0 and 1 on the 9th–10th; "c" lands in lane 2 across 9th–11th,
+        // and the 11th also has two timed events, so it doesn't fit there.
+        let all = [
+            all_day("a", 9, 2),
+            all_day("b", 9, 2),
+            all_day("c", 9, 3),
+            {
+                let mut t = ev("t1", (9, 0), (10, 0));
+                t.start += Duration::days(1);
+                t.end += Duration::days(1);
+                t
+            },
+            {
+                let mut t = ev("t2", (11, 0), (12, 0));
+                t.start += Duration::days(1);
+                t.end += Duration::days(1);
+                t
+            },
+        ];
+        let lay = month_3_rows(&all);
+        assert!(lay.banners.iter().all(|b| all[b.ev].id != "c"));
+        assert_no_overlaps(&lay);
+    }
+
+    #[test]
+    fn more_label_lines_up_with_the_event_rows() {
+        let all: Vec<Event> = (0..6).map(|h| ev(&format!("e{h}"), (8 + h, 0), (8 + h, 30))).collect();
+        let lay = month_3_rows(&all);
+        assert_eq!(lay.rows.len(), 2);
+        let (_, n, more) = lay.more[0];
+        assert_eq!(n, 4);
+        assert_eq!(more.left(), lay.rows[0].rect.left());
+        assert_eq!(more.width(), lay.rows[0].rect.width());
+        assert_eq!(more.top() - lay.rows[1].rect.top(), MONTH_ROW_H, "the row after the last event");
+        assert_no_overlaps(&lay);
     }
 
     #[test]
@@ -580,7 +700,7 @@ mod tests {
         // koffie nests in the photoshoot; lunch starts 35 min after koffie, so
         // it nests again, one more indent in.
         let all = [ev("shoot", (10, 30), (11, 30)), ev("koffie", (11, 15), (12, 0)), ev("lunch", (11, 50), (12, 30))];
-        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0);
+        let segs = layout_day(&all, &[0, 1, 2], day(), 200.0, HOUR_H);
         let x: Vec<f32> = segs.iter().map(|s| s.x).collect();
         assert_eq!(x, [0.0, NEST_INDENT, 2.0 * NEST_INDENT]);
     }

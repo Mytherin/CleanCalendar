@@ -27,11 +27,16 @@ use rusqlite::{params, Connection, Row, Transaction};
 
 use crate::model::{CalDavAccount, Calendar, Event, GoogleSettings, PendingDelete, Source, Store, SyncState};
 use crate::remote::{CalRef, GOOGLE};
+use crate::settings::Settings;
 
-const DATA_VERSION: i32 = 3;
+/// The `main.settings` row holding the app's preferences (as JSON).
+const PREFS_KEY: &str = "app.settings";
+
+/// 2 added repeating events and time zones, 3 invitees, 4 CalDAV accounts.
+const DATA_VERSION: i32 = 4;
 /// Bumped when cached events gain fields (or sync state changes meaning),
 /// so they are downloaded again.
-const CACHE_VERSION: i32 = 3;
+const CACHE_VERSION: i32 = 4;
 
 /// Where the two databases (and the old JSON store, for migration) live, and
 /// where secrets are kept.
@@ -231,6 +236,7 @@ struct Saved {
     caldav: Vec<CalDavAccount>,
     pending_deletes: Vec<PendingDelete>,
     sync_state: HashMap<String, SyncState>,
+    settings: Settings,
     events: HashMap<String, (Place, Event)>,
 }
 
@@ -257,7 +263,12 @@ impl std::fmt::Display for TooNew {
 impl std::error::Error for TooNew {}
 
 const EVENT_COLUMNS: &str = "id, calendar_id, title, start_at, end_at, all_day, location, notes, \
-                             remote_id, recurring_id, pending, rev, etag, base, recurrence, time_zone";
+                             remote_id, recurring_id, pending, rev, etag, base, recurrence, time_zone, attendees";
+
+/// Columns added to `events` and `outbox` since version 1, so older files
+/// can be brought up to date (whichever of them they already have).
+const ADDED_EVENT_COLUMNS: [(&str, &str); 3] =
+    [("recurrence", "TEXT"), ("time_zone", "TEXT"), ("attendees", "TEXT NOT NULL DEFAULT '[]'")];
 
 fn event_table(name: &str) -> String {
     format!(
@@ -277,7 +288,8 @@ fn event_table(name: &str) -> String {
             etag TEXT,
             base TEXT,
             recurrence TEXT,
-            time_zone TEXT
+            time_zone TEXT,
+            attendees TEXT NOT NULL DEFAULT '[]'
         );"
     )
 }
@@ -382,6 +394,7 @@ struct DataPart {
     local: Vec<Event>,
     outbox: Vec<Event>,
     pending_deletes: Vec<PendingDelete>,
+    settings: Settings,
 }
 
 impl DataPart {
@@ -393,6 +406,7 @@ impl DataPart {
             && self.pending_deletes.is_empty()
             && self.caldav.is_empty()
             && self.google == GoogleSettings::default()
+            && self.settings == Settings::default()
     }
 }
 
@@ -403,10 +417,11 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<
     Ok(names.iter().any(|n| n == column))
 }
 
-/// Version 3 added CalDAV accounts: calendars and pending deletes say which
+/// Version 4 added CalDAV accounts: calendars and pending deletes say which
 /// account they belong to, and their Google-specific columns got neutral
-/// names. Everything already there is Google's.
-fn upgrade_to_3(conn: &Connection) -> Result<()> {
+/// names. Everything already there is Google's. Safe to run on a file that
+/// already has these changes.
+fn upgrade_to_accounts(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     if has_column(&tx, "calendars", "google_id")? {
         tx.execute_batch(
@@ -421,7 +436,6 @@ fn upgrade_to_3(conn: &Connection) -> Result<()> {
              ALTER TABLE main.pending_deletes ADD COLUMN account TEXT NOT NULL DEFAULT 'google';",
         )?;
     }
-    tx.execute_batch("PRAGMA main.user_version = 3;")?;
     tx.commit()?;
     Ok(())
 }
@@ -439,20 +453,25 @@ fn open_data(path: &Path) -> Result<(Connection, DataPart)> {
     if version > DATA_VERSION {
         return Err(TooNew(version).into());
     }
-    if version == 1 {
-        // Version 2 added repeating events and time zones.
-        conn.execute_batch(
-            "BEGIN;
-             ALTER TABLE main.events ADD COLUMN recurrence TEXT;
-             ALTER TABLE main.events ADD COLUMN time_zone TEXT;
-             ALTER TABLE main.outbox ADD COLUMN recurrence TEXT;
-             ALTER TABLE main.outbox ADD COLUMN time_zone TEXT;
-             PRAGMA main.user_version = 2;
-             COMMIT;",
-        )?;
-    }
-    if (1..3).contains(&version) {
-        upgrade_to_3(&conn)?;
+    if (1..DATA_VERSION).contains(&version) {
+        // Add the event columns this file doesn't have yet. Checking each one
+        // (rather than going by the version) also covers files written by
+        // builds that added them in a different order.
+        let mut sql = String::from("BEGIN;");
+        for table in ["events", "outbox"] {
+            let have: HashSet<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}', 'main')"))?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (col, decl) in ADDED_EVENT_COLUMNS.iter().filter(|(col, _)| !have.contains(*col)) {
+                sql += &format!("ALTER TABLE main.{table} ADD COLUMN {col} {decl};");
+            }
+        }
+        sql += "COMMIT;";
+        conn.execute_batch(&sql)?;
+        upgrade_to_accounts(&conn)?;
+        // The version is raised below, once every table is in place; if the
+        // app stops before then, these steps simply run again.
     }
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS main.settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -523,6 +542,15 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
         refresh_token: settings.remove("google.refresh_token"),
         account_email: settings.remove("google.account_email"),
     };
+    // Unreadable preferences (e.g. hand-edited) fall back to the defaults
+    // rather than failing the whole load.
+    let prefs = match settings.remove(PREFS_KEY) {
+        Some(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+            eprintln!("Ignoring unreadable settings ({e}); using defaults");
+            Settings::default()
+        }),
+        None => Settings::default(),
+    };
 
     let calendars = conn
         .prepare("SELECT id, name, color, visible, remote_id, read_only, account FROM main.calendars ORDER BY position")?
@@ -574,6 +602,7 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
         local: load_events(conn, Place::Local)?,
         outbox: load_events(conn, Place::Outbox)?,
         pending_deletes,
+        settings: prefs,
     })
 }
 
@@ -612,6 +641,7 @@ fn read_event(r: &Row) -> rusqlite::Result<Event> {
         all_day: r.get(5)?,
         location: r.get(6)?,
         notes: r.get(7)?,
+        attendees: json_column(r, 16)?.unwrap_or_default(),
         remote_id: r.get(8)?,
         recurring_id: r.get(9)?,
         pending: r.get(10)?,
@@ -626,8 +656,9 @@ fn read_event(r: &Row) -> rusqlite::Result<Event> {
 fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
     let base = ev.base.as_ref().map(serde_json::to_string).transpose()?;
     let recurrence = ev.recurrence.as_ref().map(serde_json::to_string).transpose()?;
+    let attendees = serde_json::to_string(&ev.attendees)?;
     tx.prepare_cached(&format!(
-        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         place.table()
     ))?
     .execute(params![
@@ -647,6 +678,7 @@ fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
         base,
         recurrence,
         ev.time_zone,
+        attendees,
     ])?;
     Ok(())
 }
@@ -791,6 +823,7 @@ impl Db {
         self.saved.caldav = data.caldav.clone();
         self.saved.pending_deletes = data.pending_deletes.clone();
         self.saved.sync_state = cache.sync_state.clone();
+        self.saved.settings = data.settings.clone();
 
         Store {
             calendars: data.calendars,
@@ -799,6 +832,7 @@ impl Db {
             caldav: data.caldav,
             pending_deletes: data.pending_deletes,
             sync_state: cache.sync_state,
+            settings: data.settings,
             db: Some(self),
         }
     }
@@ -851,6 +885,7 @@ impl Db {
         let caldav_changed = s.caldav != self.saved.caldav;
         let deletes_changed = s.pending_deletes != self.saved.pending_deletes;
         let sync_changed = s.sync_state != self.saved.sync_state;
+        let settings_changed = s.settings != self.saved.settings;
 
         if upserts.is_empty()
             && deletes.is_empty()
@@ -859,6 +894,7 @@ impl Db {
             && !caldav_changed
             && !deletes_changed
             && !sync_changed
+            && !settings_changed
         {
             return Ok(());
         }
@@ -903,6 +939,12 @@ impl Db {
                     tx.execute("INSERT INTO main.settings (key, value) VALUES (?1, ?2)", params![key, value])?;
                 }
             }
+        }
+        if settings_changed {
+            tx.execute(
+                "INSERT OR REPLACE INTO main.settings (key, value) VALUES (?1, ?2)",
+                params![PREFS_KEY, serde_json::to_string(&s.settings)?],
+            )?;
         }
         if calendars_changed {
             tx.execute("DELETE FROM main.calendars", [])?;
@@ -978,6 +1020,9 @@ impl Db {
         if sync_changed {
             self.saved.sync_state = s.sync_state.clone();
         }
+        if settings_changed {
+            self.saved.settings = s.settings.clone();
+        }
         Ok(())
     }
 }
@@ -1034,6 +1079,7 @@ mod tests {
             all_day: false,
             location: "Room 1".into(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: None,
             recurring_id: None,
             pending: false,
@@ -1082,6 +1128,9 @@ mod tests {
             "g:me@example.com".into(),
             SyncState { token: Some("tok".into()), full_sync_on: Some(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()) },
         );
+        store.settings.days_per_week = 5;
+        store.settings.week_start = Some(6);
+        store.settings.google_description = "Work".into();
         store.save();
         store
     }
@@ -1099,6 +1148,37 @@ mod tests {
     }
 
     #[test]
+    fn a_version_1_database_gains_invitees() {
+        let dir = TempDir::new();
+        drop(populated(&dir));
+        // Turn data.db back into the version-1 layout (no attendees column).
+        let conn = Connection::open(&dir.paths().data).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events DROP COLUMN attendees;
+             ALTER TABLE outbox DROP COLUMN attendees;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = open(&dir.paths());
+        let ids: Vec<_> = sorted(&store.events).iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&"local1".to_owned()) && ids.contains(&"g2".to_owned()), "local data kept: {ids:?}");
+        assert!(store.events.iter().all(|e| e.attendees.is_empty()));
+        assert_eq!(store.google.refresh_token.as_deref(), Some("refresh"));
+
+        // Invitees are saved from now on.
+        let ev = store.event_mut("local1").unwrap();
+        ev.attendees.push(crate::model::Attendee::new("ann@example.com"));
+        store.save();
+        drop(store);
+        let store = open(&dir.paths());
+        assert_eq!(store.event("local1").unwrap().attendees[0].email, "ann@example.com");
+        let conn = Connection::open(&dir.paths().data).unwrap();
+        assert_eq!(user_version(&conn, "main").unwrap(), DATA_VERSION);
+    }
+
+    #[test]
     fn a_new_install_starts_with_the_default_calendars() {
         let dir = TempDir::new();
         let store = open(&dir.paths());
@@ -1112,12 +1192,13 @@ mod tests {
     fn everything_round_trips() {
         let dir = TempDir::new();
         let store = populated(&dir);
-        let (calendars, events, google, deletes, sync) = (
+        let (calendars, events, google, deletes, sync, settings) = (
             store.calendars.clone(),
             store.events.clone(),
             store.google.clone(),
             store.pending_deletes.clone(),
             store.sync_state.clone(),
+            store.settings.clone(),
         );
         drop(store);
 
@@ -1127,6 +1208,18 @@ mod tests {
         assert_eq!(again.google, google);
         assert_eq!(again.pending_deletes, deletes);
         assert_eq!(again.sync_state, sync);
+        assert_eq!(again.settings, settings);
+        assert_eq!(again.settings.days_per_week, 5);
+    }
+
+    #[test]
+    fn signing_out_keeps_the_settings() {
+        let dir = TempDir::new();
+        let mut store = populated(&dir);
+        store.google = GoogleSettings::default();
+        store.save();
+        drop(store);
+        assert_eq!(open(&dir.paths()).settings.google_description, "Work");
     }
 
     #[test]
@@ -1229,7 +1322,7 @@ mod tests {
         assert_eq!(dir.token().as_deref(), Some("refresh"));
         assert_eq!(
             setting_keys(&dir.paths().data),
-            ["google.account_email", "google.client_id", "google.client_secret"],
+            ["app.settings", "google.account_email", "google.client_id", "google.client_secret"],
             "no token in data.db"
         );
 
