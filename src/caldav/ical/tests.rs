@@ -138,6 +138,17 @@ fn durations() {
     assert_eq!(parse_duration("-PT15M"), Some(Duration::minutes(-15)));
     assert_eq!(parse_duration("P1DT12H"), Some(Duration::hours(36)));
     assert_eq!(parse_duration("1H"), None);
+    // Out of range: invalid, not a panic.
+    assert_eq!(parse_duration("P100000000000000W"), None);
+    assert_eq!(parse_duration("P99999999999999999999D"), None);
+}
+
+#[test]
+fn an_absurd_duration_from_the_server_does_not_panic() {
+    let c = ics("BEGIN:VEVENT\r\nUID:x\r\nSUMMARY:Broken\r\nDTSTART:20260101T090000Z\r\nDURATION:P100000000D\r\nEND:VEVENT\r\n");
+    let evs = events(&cal(), "/cal/home/x.ics", None, &c, year().0, year().1);
+    assert_eq!(evs.len(), 1, "shown, with no end beyond its start");
+    assert_eq!(evs[0].duration(), Duration::zero());
 }
 
 // ---- reading -----------------------------------------------------------------------

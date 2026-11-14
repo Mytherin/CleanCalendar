@@ -289,7 +289,12 @@ impl Worker {
                 let open_browser = |url: &str| open::that(url).context("opening the browser");
                 let mut conns = Connections::new(google, Box::new(open_browser));
                 for cmd in cmd_rx {
-                    let msg = run(&mut conns, cmd);
+                    // A panic on unexpected remote data must not end syncing
+                    // for good (it would happen again on every launch):
+                    // report it as this command's failure and carry on.
+                    let fallback = panicked(&cmd);
+                    let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&mut conns, cmd)))
+                        .unwrap_or(fallback);
                     if msg_tx.send(msg).is_err() {
                         break;
                     }
@@ -304,6 +309,26 @@ impl Worker {
         if self.tx.send(cmd).is_ok() {
             self.busy += 1;
         }
+    }
+}
+
+/// The reply for a command whose handling panicked. Saves and deletes are
+/// reported as refused, not as transient, so they aren't retried forever.
+fn panicked(cmd: &Cmd) -> Msg {
+    let error = "Unexpected data from the server (see the log)".to_owned();
+    match cmd {
+        Cmd::ConnectGoogle { .. } => Msg::ConnectFailed { account: GOOGLE.into(), error },
+        Cmd::ConnectCalDav { account, .. } => Msg::ConnectFailed { account: account.clone(), error },
+        Cmd::Sync { account, .. } => Msg::SyncFailed { account: account.clone(), error },
+        Cmd::Save { calendar, event, .. } => {
+            Msg::SaveFailed { local_id: event.id.clone(), calendar: calendar.clone(), error, kind: Failure::Rejected }
+        }
+        Cmd::Delete { calendar, remote_id, .. } => Msg::DeleteFailed {
+            remote_id: remote_id.clone(),
+            calendar: calendar.clone(),
+            error,
+            kind: Failure::Rejected,
+        },
     }
 }
 

@@ -523,15 +523,18 @@ fn parse_duration(v: &str) -> Option<Duration> {
             'T' => in_time = true,
             '0'..='9' => num.push(c),
             _ => {
+                // Out-of-range values (from a broken or hostile server)
+                // make the duration invalid rather than panicking.
                 let n: i64 = std::mem::take(&mut num).parse().ok()?;
-                total += match (c, in_time) {
-                    ('W', _) => Duration::weeks(n),
-                    ('D', _) => Duration::days(n),
-                    ('H', true) => Duration::hours(n),
-                    ('M', true) => Duration::minutes(n),
-                    ('S', true) => Duration::seconds(n),
+                let part = match (c, in_time) {
+                    ('W', _) => Duration::try_weeks(n),
+                    ('D', _) => Duration::try_days(n),
+                    ('H', true) => Duration::try_hours(n),
+                    ('M', true) => Duration::try_minutes(n),
+                    ('S', true) => Duration::try_seconds(n),
                     _ => return None,
-                };
+                }?;
+                total = total.checked_add(&part)?;
             }
         }
     }
@@ -547,7 +550,7 @@ fn span(ev: &Component, s: &Series) -> Option<(NaiveDateTime, NaiveDateTime)> {
     let start = s.wall(start_w);
     let end = match (ev.prop("DTEND").and_then(when), ev.prop("DURATION").and_then(|p| parse_duration(&p.value))) {
         (Some(e), _) => s.wall(e),
-        (None, Some(d)) => start + d,
+        (None, Some(d)) => start.checked_add_signed(d).unwrap_or(start),
         // RFC 5545: a day for a date, nothing for a date-time.
         (None, None) if matches!(start_w, When::Date(_)) => start + Duration::days(1),
         (None, None) => start,
@@ -794,7 +797,7 @@ fn fill(v: &mut Component, ev: &Event, master_series: bool) {
     v.set(Prop::new("DTSTAMP", now_utc()));
     v.set(Prop::new("LAST-MODIFIED", now_utc()));
     let seq = v.prop("SEQUENCE").and_then(|p| p.value.trim().parse::<u32>().ok());
-    v.set(Prop::new("SEQUENCE", seq.map_or(0, |n| n + 1).to_string()));
+    v.set(Prop::new("SEQUENCE", seq.map_or(0, |n| n.saturating_add(1)).to_string()));
     if master_series {
         for name in ["RRULE", "RDATE", "EXDATE", "EXRULE"] {
             v.remove(name);
@@ -880,7 +883,7 @@ pub fn remove_occurrence(cal: &mut Component, key: &str) -> Result<bool> {
     if let Some(m) = cal.subs.iter_mut().find(|c| c.name == "VEVENT" && c.prop("RECURRENCE-ID").is_none()) {
         m.props.push(s.stamp_prop("EXDATE", t));
         let seq = m.prop("SEQUENCE").and_then(|p| p.value.trim().parse::<u32>().ok());
-        m.set(Prop::new("SEQUENCE", seq.map_or(0, |n| n + 1).to_string()));
+        m.set(Prop::new("SEQUENCE", seq.map_or(0, |n| n.saturating_add(1)).to_string()));
         m.set(Prop::new("DTSTAMP", now_utc()));
     }
     add_timezones(cal);
