@@ -73,6 +73,8 @@ fn fold(c: char, out: &mut String) {
         'ź' | 'ż' | 'ž' => "z",
         'þ' => "th",
         'ð' => "d",
+        // Lowercasing "İ" leaves "i" plus this combining dot.
+        '\u{307}' => "",
         _ => {
             out.push(c);
             return;
@@ -480,7 +482,9 @@ impl Library {
     fn run(&self, job: &Job) -> Result<()> {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
         let target = self.dir.join(file_name(&job.region.id));
-        let part = target.with_extension("part");
+        // Unique per download: another running copy of the app may be fetching
+        // the same country, and each removes its own temporary file.
+        let part = target.with_extension(format!("{}.part", uuid::Uuid::new_v4().simple()));
         let result = self.download_and_install(job, &part, &target);
         let _ = std::fs::remove_file(&part);
         result
@@ -492,7 +496,8 @@ impl Library {
         if r.file.contains(['/', '\\']) || r.file.starts_with('.') {
             bail!("bad file name in the manifest: {}", r.file);
         }
-        download(&format!("{}{}", self.base, r.file), part, &job.downloaded, &job.size, &job.cancel)?;
+        let max = (r.bytes > 0).then_some(r.bytes);
+        download(&format!("{}{}", self.base, r.file), part, max, &job.downloaded, &job.size, &job.cancel)?;
         if !sha256_hex(part)?.eq_ignore_ascii_case(&r.sha256) {
             bail!("the download of {} was damaged; please try again", r.name);
         }
@@ -508,7 +513,16 @@ impl Library {
 
 /// Downloads `url` to `to`, counting bytes into `done` (of `size`, once
 /// known); stops with an error when `cancel` is set.
-pub fn download(url: &str, to: &Path, done: &AtomicU64, size: &AtomicU64, cancel: &AtomicBool) -> Result<()> {
+/// With `max` (the size the manifest promises), a server sending more is
+/// cut off rather than allowed to fill the disk before the checksum runs.
+pub fn download(
+    url: &str,
+    to: &Path,
+    max: Option<u64>,
+    done: &AtomicU64,
+    size: &AtomicU64,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let mut resp = http()?.get(url).send()?.error_for_status().with_context(|| format!("downloading {url}"))?;
     size.store(resp.content_length().unwrap_or(0), Ordering::Relaxed);
     let mut out = std::io::BufWriter::new(File::create(to).with_context(|| format!("creating {}", to.display()))?);
@@ -522,7 +536,10 @@ pub fn download(url: &str, to: &Path, done: &AtomicU64, size: &AtomicU64, cancel
             break;
         }
         out.write_all(&buf[..n]).context("saving the download (is the disk full?)")?;
-        done.fetch_add(n as u64, Ordering::Relaxed);
+        let total = done.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        if max.is_some_and(|m| total > m) {
+            bail!("the download is larger than expected");
+        }
     }
     out.flush()?;
     let expected = size.load(Ordering::Relaxed);
@@ -619,6 +636,22 @@ mod tests {
     fn words_are_folded() {
         let t: Vec<String> = tokens("Café-de Jaren, Straße ŁÓDŹ 12a").collect();
         assert_eq!(t, ["cafe", "de", "jaren", "strasse", "lodz", "12a"]);
+        assert_eq!(tokens("İstanbul").collect::<Vec<_>>(), ["istanbul"]);
+    }
+
+    #[test]
+    fn a_download_larger_than_promised_is_cut_off() {
+        let port = serve(HashMap::from([("/big".to_owned(), vec![7u8; 300_000])]));
+        let to = std::env::temp_dir().join(format!("cc-big-{}.part", uuid::Uuid::new_v4()));
+        let (done, size, cancel) = (AtomicU64::new(0), AtomicU64::new(0), AtomicBool::new(false));
+        let url = format!("http://127.0.0.1:{port}/big");
+        let err = download(&url, &to, Some(100_000), &done, &size, &cancel).unwrap_err();
+        assert!(err.to_string().contains("larger than expected"), "{err}");
+        assert!(done.load(Ordering::Relaxed) < 300_000, "stopped early");
+        let (done, size) = (AtomicU64::new(0), AtomicU64::new(0));
+        download(&url, &to, None, &done, &size, &cancel).unwrap();
+        assert_eq!(done.load(Ordering::Relaxed), 300_000);
+        let _ = std::fs::remove_file(&to);
     }
 
     #[test]

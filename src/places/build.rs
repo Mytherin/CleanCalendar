@@ -141,7 +141,7 @@ pub fn build_one(c: &Country, dir: &Path) -> Result<Region> {
     {
         let (d, s) = (done.clone(), size.clone());
         let _t = Ticker::start(move || format!("downloaded {} of {}", mb(d.load(Ordering::Relaxed)), mb(s.load(Ordering::Relaxed))));
-        download(&c.pbf, &pbf, &done, &size, &cancel)?;
+        download(&c.pbf, &pbf, None, &done, &size, &cancel)?;
     }
     let pbf_bytes = done.load(Ordering::Relaxed);
 
