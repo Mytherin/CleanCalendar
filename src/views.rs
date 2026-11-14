@@ -143,6 +143,20 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     let events = events_in(app, grid_start, weeks * 7);
     let row_h = 18.0;
 
+    // Drag-to-create all-day events: track the day under the pointer anywhere in the grid.
+    let day_at = |pos: Pos2| {
+        let col = (((pos.x - rect.left()) / cell_w).floor() as i64).clamp(0, 6);
+        let row = (((pos.y - rect.top() - header_h) / cell_h).floor() as i64).clamp(0, weeks - 1);
+        grid_start + Duration::days(row * 7 + col)
+    };
+    if let (Some(Drag::CreateAllDay { current, .. }), Some(pos)) = (&mut app.drag, ui.ctx().pointer_latest_pos()) {
+        *current = day_at(pos);
+    }
+    let create_range = match &app.drag {
+        Some(Drag::CreateAllDay { anchor, current }) => Some(if current < anchor { (*current, *anchor) } else { (*anchor, *current) }),
+        _ => None,
+    };
+
     for w in 0..weeks {
         let week_start = grid_start + Duration::days(w * 7);
         let top = rect.top() + header_h + w as f32 * cell_h;
@@ -156,6 +170,9 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
             if d == 0 || d == 6 {
                 painter.rect_filled(cell, 0.0, p.weekend);
             }
+            if create_range.is_some_and(|(s, e)| s <= day && day <= e) {
+                painter.rect_filled(cell, 0.0, theme::ACCENT.gamma_multiply(0.18));
+            }
             painter.hline(cell.x_range(), cell.bottom(), Stroke::new(1.0_f32, p.grid));
             if d > 0 {
                 painter.vline(cell.left(), cell.y_range(), Stroke::new(1.0_f32, p.grid));
@@ -168,7 +185,17 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
             let center = Pos2::new(cell.right() - 10.0 - w / 2.0, cell.top() + 14.0);
             day_number_badge(&painter, center, &label, day == app.today, font, color);
 
-            let resp = ui.interact(cell, ui.id().with(("cell", day)), Sense::click());
+            let resp = ui.interact(cell, ui.id().with(("cell", day)), Sense::click_and_drag());
+            if resp.drag_started() {
+                let origin = ui.input(|i| i.pointer.press_origin()).map_or(day, day_at);
+                app.drag = Some(Drag::CreateAllDay { anchor: origin, current: origin });
+            }
+            if resp.drag_stopped() {
+                if let (Some(Drag::CreateAllDay { .. }), Some((s, e))) = (&app.drag, create_range) {
+                    app.drag = None;
+                    app.actions.push(Action::New { start: midnight(s), end: midnight(e) + Duration::days(1), all_day: true });
+                }
+            }
             if resp.double_clicked() {
                 let start = midnight(day) + Duration::hours(9);
                 app.actions.push(Action::New { start, end: start + Duration::hours(1), all_day: false });
@@ -339,9 +366,13 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
 
     // ---- All-day lane
     let lanes = banner_lanes(&events, first, ndays);
-    let n_lanes = lanes.iter().map(|l| l.3 + 1).max().unwrap_or(0).max(1);
+    let used_lanes = lanes.iter().map(|l| l.3 + 1).max().unwrap_or(0);
+    // While drag-creating, reserve a lane below the existing banners for the ghost.
+    let creating = matches!(app.drag, Some(Drag::CreateAllDay { .. }));
+    let n_lanes = (used_lanes + creating as usize).max(1);
     let lane_h = n_lanes as f32 * BANNER_H + 6.0;
-    let (allday, allday_resp) = ui.allocate_exact_size(Vec2::new(full.width(), lane_h), Sense::click());
+    let (allday, allday_resp) = ui.allocate_exact_size(Vec2::new(full.width(), lane_h), Sense::click_and_drag());
+    let day_at = |pos: Pos2| first + Duration::days((((pos.x - col_x(0)) / col_w).floor() as i64).clamp(0, ndays - 1));
     let painter = ui.painter();
     painter.hline(full.x_range(), allday.top(), Stroke::new(1.0_f32, p.grid));
     painter.hline(full.x_range(), allday.bottom(), Stroke::new(1.0_f32, p.grid_strong));
@@ -363,6 +394,43 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
         }
     } else if allday_resp.clicked() {
         app.actions.push(Action::Select(None));
+    }
+    // Drag across days to create a multi-day all-day event.
+    if allday_resp.drag_started() {
+        if let Some(origin) = ui.input(|i| i.pointer.press_origin()) {
+            let d = day_at(origin);
+            app.drag = Some(Drag::CreateAllDay { anchor: d, current: d });
+        }
+    }
+    if let (Some(Drag::CreateAllDay { current, .. }), Some(pos)) = (&mut app.drag, allday_resp.interact_pointer_pos()) {
+        *current = day_at(pos);
+    }
+    if allday_resp.drag_stopped() {
+        if let Some(Drag::CreateAllDay { anchor, current }) = app.drag.take() {
+            let (s, e) = if current < anchor { (current, anchor) } else { (anchor, current) };
+            app.actions.push(Action::New { start: midnight(s), end: midnight(e) + Duration::days(1), all_day: true });
+        }
+    }
+    if let Some(Drag::CreateAllDay { anchor, current }) = &app.drag {
+        let (s, e) = if current < anchor { (*current, *anchor) } else { (*anchor, *current) };
+        let (c0, c1) = ((s - first).num_days(), (e - first).num_days());
+        let y = allday.top() + 3.0 + used_lanes as f32 * BANNER_H;
+        let r = Rect::from_min_max(Pos2::new(col_x(c0) + 2.0, y), Pos2::new(col_x(c1 + 1) - 2.0, y + BANNER_H - 2.0));
+        let ghost = Event {
+            id: String::new(),
+            calendar_id: String::new(),
+            title: "New Event".into(),
+            start: midnight(s),
+            end: midnight(e) + Duration::days(1),
+            all_day: true,
+            location: String::new(),
+            notes: String::new(),
+            remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
+        };
+        draw_banner(ui, ui.painter(), r, &ghost, theme::ACCENT, false, p);
     }
     for &(i, c0, c1, lane) in &lanes {
         let ev = &events[i];
