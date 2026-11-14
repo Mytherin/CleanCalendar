@@ -5,6 +5,7 @@
 //! `layout.rs`, and what the pointer does comes from `interact.rs`;
 //! [`drive_pointer`] is the thin adapter that feeds egui's input to it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
@@ -16,7 +17,7 @@ use eframe::egui::{
 use crate::app::{Action, App, View};
 use crate::dates::*;
 use crate::interact::{Cursor, Input};
-use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GUTTER, HOUR_H};
+use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GRID_PAD, GUTTER};
 use crate::model::Event;
 use crate::recurrence;
 use crate::theme::{self, Palette, RED};
@@ -351,9 +352,18 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
     }
     painter.hline(rect.x_range(), rect.top() + lay.header_h, Stroke::new(1.0_f32, p.grid));
 
-    for cell in &lay.cells {
+    for (k, cell) in lay.cells.iter().enumerate() {
         if is_weekend(cell.day) {
             painter.rect_filled(cell.rect, 0.0, p.weekend);
+        }
+        if app.store.settings.week_numbers && k % 7 == 0 {
+            painter.text(
+                Pos2::new(cell.rect.left() + 8.0, cell.number.center().y),
+                Align2::LEFT_CENTER,
+                format!("W{}", week_number(cell.day)),
+                theme::font(11.0),
+                p.secondary,
+            );
         }
         painter.hline(cell.rect.x_range(), cell.rect.bottom(), Stroke::new(1.0_f32, p.grid));
         if cell.rect.left() > rect.left() + 1.0 {
@@ -407,8 +417,11 @@ pub fn month(app: &mut App, ui: &mut Ui, p: &Palette) {
 // ---------------------------------------------------------------------------
 // Day / Week time grid
 
+/// Hours never get shorter than this, however many are asked to fit.
+const MIN_HOUR_H: f32 = 20.0;
+
 pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
-    let first = if ndays == 7 { start_of_week(app.date) } else { app.date };
+    let first = app.grid_first(ndays);
     let events = shown_events(app, first, ndays);
 
     let full = ui.available_rect_before_wrap();
@@ -420,14 +433,18 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
     // Header and all-day lane stay put; paint them with the outer painter.
     let outer = ui.painter().clone();
 
+    // "Show N hours at a time": N hours fill the visible part of the grid.
+    let visible_h = full.height() - header_h - lane_h - 2.0 * GRID_PAD;
+    let hour_h = (visible_h / app.store.settings.hours_shown.max(1) as f32).max(MIN_HOUR_H);
+
     // Our own pointer handling does drags, so the scroll area must not.
     let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]).drag_to_scroll(false);
-    if let Some(off) = app.scroll_to.take() {
-        scroll = scroll.vertical_scroll_offset(off);
+    if let Some(hour) = app.scroll_to.take() {
+        scroll = scroll.vertical_scroll_offset(hour * hour_h);
     }
     scroll.show(ui, |ui| {
-        let (grid, _) = ui.allocate_exact_size(Vec2::new(full.width(), layout::grid_height()), Sense::hover());
-        let rects = WeekRects { header, allday, grid, grid_clip: ui.clip_rect().intersect(grid) };
+        let (grid, _) = ui.allocate_exact_size(Vec2::new(full.width(), layout::grid_height(hour_h)), Sense::hover());
+        let rects = WeekRects { header, allday, grid, grid_clip: ui.clip_rect().intersect(grid), hour_h };
         let lay = layout::week(&events, first, ndays, rects, &|ev| !is_read_only(app, ev));
         record_rects(app, &events, lay.timed.iter().chain(lay.banners.iter()).map(|t| (t.ev, t.rect)));
 
@@ -442,6 +459,15 @@ pub fn time_grid(app: &mut App, ui: &mut Ui, p: &Palette, ndays: i64) {
 fn paint_day_headers(app: &App, ui: &Ui, painter: &egui::Painter, lay: &WeekLayout, p: &Palette) {
     let g = &lay.geom;
     let cy = lay.rects.header.center().y;
+    if app.store.settings.week_numbers && lay.ndays > 1 {
+        painter.text(
+            Pos2::new(lay.rects.header.left() + GUTTER - 8.0, cy),
+            Align2::RIGHT_CENTER,
+            format!("W{}", week_number(lay.first)),
+            theme::font(11.0),
+            p.secondary,
+        );
+    }
     for i in 0..lay.ndays {
         let day = lay.first + Duration::days(i);
         let x = g.col_x(i);
@@ -496,6 +522,15 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
     let painter = ui.painter_at(grid);
 
     // (No weekend shading here: Apple's week view keeps all days alike.)
+    // Hours outside the working day ("Day starts/ends at") are shaded.
+    let s = &app.store.settings;
+    let x_range = (grid.left() + GUTTER)..=grid.right();
+    for (from, to) in [(0, s.day_start), (s.day_end, 24)] {
+        if from < to {
+            let r = Rect::from_x_y_ranges(x_range.clone(), g.y_of(from as i64 * 60)..=g.y_of(to as i64 * 60));
+            painter.rect_filled(r, 0.0, p.off_hours);
+        }
+    }
     let now = Local::now().naive_local();
     let now_y = g.y_of(minute_of_day(now));
     let today_col = (0..lay.ndays).find(|&i| lay.first + Duration::days(i) == app.today);
@@ -532,7 +567,7 @@ fn paint_hour_grid(app: &App, ui: &Ui, lay: &WeekLayout, events: &[Event], p: &P
                 continue;
             }
             let y0 = g.y_of((ps - ds).num_minutes());
-            let y1 = g.y_of((pe - ds).num_minutes()).max(y0 + HOUR_H / 4.0);
+            let y1 = g.y_of((pe - ds).num_minutes()).max(y0 + g.hour_h / 4.0);
             let r = Rect::from_min_max(Pos2::new(g.col_x(i) + 0.5, y0 + 0.5), Pos2::new(g.col_x(i + 1) - 0.5, y1 - 0.5));
             draw_timed(ui, &painter, r, &ghost_event(s, e, false), theme::ACCENT, false, p);
         }
@@ -616,6 +651,7 @@ pub fn year(app: &mut App, ui: &mut Ui, p: &Palette) {
     let cw = rect.width() / cols as f32;
     let ch = rect.height() / rows as f32;
     let jan = NaiveDate::from_ymd_opt(app.date.year(), 1, 1).unwrap();
+    let heat = app.store.settings.year_heatmap.then(|| events_per_day(app, jan));
     for m in 0..12 {
         let cell = Rect::from_min_size(
             Pos2::new(rect.left() + (m % cols) as f32 * cw, rect.top() + (m / cols) as f32 * ch),
@@ -640,13 +676,43 @@ pub fn year(app: &mut App, ui: &mut Ui, p: &Palette) {
             app.actions.push(Action::GoTo(month, View::Month));
         }
         let grid = Rect::from_min_max(Pos2::new(cell.left(), title_rect.bottom() + 4.0), cell.max);
-        if let Some(day) = mini_month(ui, grid, month, app.today, None, p, true) {
+        if let Some(day) = mini_month(ui, grid, month, app.today, None, p, true, heat.as_ref()) {
             app.actions.push(Action::GoTo(day, View::Day));
         }
     }
 }
 
-/// Draws a compact month grid in `rect`; returns a clicked day.
+/// How many shown events touch each day of the year starting at `jan`.
+fn events_per_day(app: &App, jan: NaiveDate) -> HashMap<NaiveDate, usize> {
+    let next_jan = add_months(jan, 12);
+    let mut counts = HashMap::new();
+    for ev in layout::events_in(&app.store, jan, (next_jan - jan).num_days()) {
+        let mut day = ev.start.date().max(jan);
+        let last = last_day(ev.start, ev.end).min(next_jan - Duration::days(1));
+        while day <= last {
+            *counts.entry(day).or_insert(0) += 1;
+            day += Duration::days(1);
+        }
+    }
+    counts
+}
+
+/// The year view's shading for a day with `n` events (like macOS: yellow
+/// for a few, through orange, to a deep red for a busy day; deeper than the
+/// red "today" badge so the two don't mix up).
+fn heat_color(n: usize) -> Option<Color32> {
+    let (r, g, b) = match n {
+        0 => return None,
+        1..=2 => (0xFF, 0xCC, 0x00),
+        3..=4 => (0xFF, 0x95, 0x00),
+        _ => (0xB0, 0x1E, 0x1E),
+    };
+    Some(Color32::from_rgba_unmultiplied(r, g, b, if n >= 5 { 150 } else { 90 }))
+}
+
+/// Draws a compact month grid in `rect`; returns a clicked day. `heat`
+/// (event counts per day) shades busy days, as in the year view.
+#[allow(clippy::too_many_arguments)]
 pub fn mini_month(
     ui: &mut Ui,
     rect: Rect,
@@ -655,6 +721,7 @@ pub fn mini_month(
     selected: Option<NaiveDate>,
     p: &Palette,
     show_outside: bool,
+    heat: Option<&HashMap<NaiveDate, usize>>,
 ) -> Option<NaiveDate> {
     let first = first_of_month(month);
     let start = start_of_week(first);
@@ -693,6 +760,8 @@ pub fn mini_month(
             painter.circle_filled(center, radius, p.grid_strong);
         } else if resp.hovered() {
             painter.circle_filled(center, radius, p.selection);
+        } else if let Some(c) = heat.filter(|_| in_month).and_then(|h| heat_color(h.get(&day).copied().unwrap_or(0))) {
+            painter.circle_filled(center, radius, c);
         }
         let color = if is_today {
             Color32::WHITE

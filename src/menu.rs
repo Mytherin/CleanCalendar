@@ -413,7 +413,7 @@ pub fn calendar_menu(ui: &mut egui::Ui, store: &Store, current: &str, p: &Palett
     let groups = [(false, "On My Computer".to_owned()), (true, google_header)];
     let mut first = true;
     for (google, header) in groups {
-        let cals: Vec<_> = store.calendars.iter().filter(|c| !c.read_only && c.google_id().is_some() == google).collect();
+        let cals: Vec<_> = store.calendars.iter().filter(|c| !c.read_only && store.is_listed(c) && c.google_id().is_some() == google).collect();
         if cals.is_empty() {
             continue;
         }

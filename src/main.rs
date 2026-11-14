@@ -12,6 +12,7 @@ mod layout;
 mod menu;
 mod model;
 mod recurrence;
+mod settings;
 mod sync;
 mod theme;
 mod views;

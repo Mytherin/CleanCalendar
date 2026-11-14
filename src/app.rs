@@ -3,25 +3,26 @@
 use std::collections::HashMap;
 use std::time::{Duration as StdDuration, Instant};
 
-use chrono::{Duration, Local, NaiveDate, NaiveDateTime};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, RichText, Sense, Stroke, Vec2};
 
 use crate::app_icon::AppIcon;
 use crate::editor::{self, Editor, Outcome, Placement, Scope};
 use crate::dates::*;
-use crate::google::{self, Cmd, Worker};
+use crate::google::{self, Worker};
 use crate::menu::{self, Command, ContextMenu, Icon, Item, MenuAt};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
 use crate::recurrence;
+use crate::settings::WeekScroll;
 use crate::sync::{Notice, SyncEngine};
-use crate::theme::{self, Palette, ACCENT, RED};
+use crate::theme::{self, Palette, RED};
 use crate::interact::Pointer;
-use crate::layout;
 use crate::views;
 
-/// How often to pull changes from Google.
-const AUTO_SYNC: StdDuration = StdDuration::from_secs(5 * 60);
-/// How often to retry while local changes are waiting to upload.
+mod settings_window;
+
+/// How often to retry while local changes are waiting to upload. (How
+/// often to pull changes is the "Refresh Calendars" setting.)
 const RETRY_SYNC: StdDuration = StdDuration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +69,11 @@ pub struct App {
     pub today: NaiveDate,
     pub selected: Option<String>,
     pub pointer: Pointer,
+    /// Scroll the day/week grid to this hour on the next frame.
     pub scroll_to: Option<f32>,
+    /// The week view's first day while scrolling by days (see
+    /// [`App::grid_first`]).
+    week_first: Option<NaiveDate>,
     pub actions: Vec<Action>,
     /// The event being edited (in a popover, or the day view's inspector).
     pub editor: Option<Editor>,
@@ -87,7 +92,7 @@ pub struct App {
     engine: SyncEngine,
     last_sync: Option<Instant>,
     status: Option<(String, bool)>,
-    show_google: bool,
+    settings_ui: settings_window::SettingsUi,
     icon: AppIcon,
 }
 
@@ -95,14 +100,17 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let today = Local::now().date_naive();
+        let store = Store::load();
+        store.settings.apply();
         let mut app = App {
-            store: Store::load(),
+            scroll_to: Some(store.settings.scroll_hour()),
+            store,
             view: View::Week,
             date: today,
             today,
             selected: None,
             pointer: Pointer::default(),
-            scroll_to: Some(layout::HOUR_H * 7.5),
+            week_first: None,
             actions: Vec::new(),
             editor: None,
             event_rects: HashMap::new(),
@@ -116,7 +124,7 @@ impl App {
             engine: SyncEngine::default(),
             last_sync: None,
             status: None,
-            show_google: false,
+            settings_ui: Default::default(),
             icon: AppIcon::new(&cc.egui_ctx),
         };
         SyncEngine::prepare(&mut app.store);
@@ -127,6 +135,10 @@ impl App {
     // ---- Google glue (the logic lives in sync.rs) -------------------------
 
     fn sync(&mut self) {
+        // A switched-off account isn't synced; its changes wait until it's back on.
+        if !self.store.settings.google_enabled {
+            return;
+        }
         if self.engine.sync(&self.store, self.today) {
             self.last_sync = Some(Instant::now());
         }
@@ -205,14 +217,17 @@ impl App {
 
     // ---- Event operations -------------------------------------------------
 
-    /// The calendar new events go on: the selected event's, else the first
-    /// visible one that can be written to.
+    /// The calendar new events go on: the "Default Calendar" setting, else
+    /// the selected event's, else the first visible one that can be written to.
     fn default_calendar(&self) -> Option<String> {
-        self.selected
-            .as_ref()
-            .and_then(|id| self.store.find_event(id))
-            .map(|e| e.calendar_id)
-            .filter(|cid| self.is_writable(cid))
+        let writable = |cid: &String| self.store.writable_calendars().any(|c| &c.id == cid);
+        self.store
+            .settings
+            .default_calendar
+            .clone()
+            .filter(writable)
+            .or_else(|| self.selected.as_ref().and_then(|id| self.store.find_event(id)).map(|e| e.calendar_id))
+            .filter(writable)
             .or_else(|| self.store.writable_calendars().find(|c| c.visible).map(|c| c.id.clone()))
             .or_else(|| self.store.writable_calendars().next().map(|c| c.id.clone()))
     }
@@ -646,7 +661,7 @@ impl App {
         self.go_to(occ.start.date(), self.view);
         if matches!(self.view, View::Day | View::Week) && !occ.is_banner() {
             let hours = minute_of_day(occ.start) as f32 / 60.0;
-            self.scroll_to = Some((hours - 1.0).max(0.0) * layout::HOUR_H);
+            self.scroll_to = Some((hours - 1.0).max(0.0));
         }
         self.selected = Some(occ.id);
     }
@@ -716,7 +731,7 @@ impl App {
 
     pub fn go_to(&mut self, date: NaiveDate, view: View) {
         if matches!(view, View::Day | View::Week) && !matches!(self.view, View::Day | View::Week) {
-            self.scroll_to = Some(layout::HOUR_H * 7.5);
+            self.scroll_to = Some(self.store.settings.scroll_hour());
         }
         self.date = date;
         if view != self.view {
@@ -726,9 +741,43 @@ impl App {
         self.mini_month = first_of_month(date);
     }
 
+    /// Days the week view shows (the "Days per week" setting).
+    fn week_days(&self) -> i64 {
+        self.store.settings.week_days()
+    }
+
+    /// The first day shown in the day/week grid. A week normally starts on
+    /// the first day of the week (Monday, for a 5-day week). When scrolling
+    /// by days, it starts wherever scrolling left it, as long as the current
+    /// date is still in view.
+    pub fn grid_first(&mut self, ndays: i64) -> NaiveDate {
+        if ndays == 1 {
+            return self.date;
+        }
+        let in_view = |first: NaiveDate| self.date >= first && self.date < first + Duration::days(ndays);
+        if self.store.settings.week_scroll == WeekScroll::Day {
+            if let Some(first) = self.week_first.filter(|&f| in_view(f)) {
+                return first;
+            }
+        }
+        let mut first = start_of_week(self.date);
+        if ndays == 5 {
+            first += Duration::days(((7 - first.weekday().num_days_from_monday()) % 7) as i64);
+        }
+        self.week_first = Some(first);
+        first
+    }
+
     fn step(&mut self, dir: i32) {
+        let by_day = self.store.settings.week_scroll == WeekScroll::Day;
         self.date = match self.view {
             View::Day => self.date + Duration::days(dir as i64),
+            View::Week if by_day => {
+                let n = self.week_days();
+                let first = self.grid_first(n) + Duration::days(dir as i64);
+                self.week_first = Some(first);
+                (self.date + Duration::days(dir as i64)).clamp(first, first + Duration::days(n - 1))
+            }
             View::Week => self.date + Duration::days(7 * dir as i64),
             View::Month => add_months(self.date, dir),
             View::Year => add_months(self.date, 12 * dir),
@@ -739,13 +788,14 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
         let popover = self.editor.as_ref().is_some_and(|ed| matches!(ed.placement, Placement::Popover { .. }));
-        let modal = popover || self.show_google || self.menu.is_some();
+        let modal = popover || self.settings_ui.open || self.menu.is_some();
         let mut view = None;
         let mut step = 0;
         let mut today = false;
         let mut new = false;
         let mut delete = false;
         let mut edit: Option<Command> = None;
+        let mut settings = false;
         ctx.input(|i| {
             if !typing {
                 // Ctrl+X/C/V arrive as clipboard events, not key presses.
@@ -769,6 +819,9 @@ impl App {
                 }
             }
             let cmd = i.modifiers.command;
+            if cmd && i.key_pressed(Key::Comma) {
+                settings = true;
+            }
             for (n, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4].into_iter().enumerate() {
                 if cmd && i.key_pressed(k) {
                     view = Some(View::ALL[n]);
@@ -792,6 +845,9 @@ impl App {
                 }
             }
         });
+        if settings && !popover {
+            self.open_settings();
+        }
         if modal {
             return;
         }
@@ -806,7 +862,7 @@ impl App {
         }
         if new {
             let start = midnight(self.date) + Duration::hours(9);
-            self.new_event(start, start + Duration::hours(1), false);
+            self.new_event(start, start + default_event_len(), false);
         }
         if delete {
             if let Some(id) = self.selected.clone() {
@@ -842,19 +898,18 @@ impl App {
                     }
                     if pill_button(ui, "+", p.seg_track, p).on_hover_text("New event (Ctrl+N)").clicked() {
                         let start = midnight(self.date) + Duration::hours(9);
-                        self.new_event(start, start + Duration::hours(1), false);
+                        self.new_event(start, start + default_event_len(), false);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let connected = self.store.google.is_connected();
+                        if icon_button(ui, "⚙", "Settings (Ctrl+,)").clicked() {
+                            self.open_settings();
+                        }
+                        let connected = self.store.google.is_connected() && self.store.settings.google_enabled;
                         if connected {
                             let label = if self.worker.busy > 0 { "Syncing…" } else { "⟳" };
                             if icon_button(ui, label, "Sync with Google").clicked() {
                                 self.sync();
                             }
-                        }
-                        let google_label = if connected { "Google: connected" } else { "Connect Google" };
-                        if ui.button(google_label).clicked() {
-                            self.show_google = true;
                         }
                         let unsynced = self.store.unsynced_count();
                         if connected && unsynced > 0 {
@@ -920,11 +975,15 @@ impl App {
         for (title, google) in groups {
             let idxs: Vec<usize> = (0..self.store.calendars.len())
                 .filter(|&i| self.store.calendars[i].google_id().is_some() == google)
+                .filter(|&i| self.store.is_listed(&self.store.calendars[i]))
                 .collect();
             if idxs.is_empty() && google {
                 continue;
             }
-            let header = if google {
+            let description = self.store.settings.google_description.trim();
+            let header = if google && !description.is_empty() {
+                description.to_owned()
+            } else if google {
                 self.store.google.account_email.clone().unwrap_or_else(|| title.to_owned())
             } else {
                 title.to_owned()
@@ -1005,7 +1064,7 @@ impl App {
         }
         let w = ui.available_width();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 7.0 * 24.0), Sense::hover());
-        if let Some(day) = views::mini_month(ui, rect, self.mini_month, self.today, Some(self.date), p, true) {
+        if let Some(day) = views::mini_month(ui, rect, self.mini_month, self.today, Some(self.date), p, true, None) {
             self.date = day;
             if self.view == View::Year {
                 self.view = View::Day;
@@ -1079,7 +1138,7 @@ impl App {
                 ui.painter().vline(r.left() - 12.0, r.y_range().expand(20.0), Stroke::new(1.0_f32, p.grid));
                 let w = ui.available_width();
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 7.0 * 24.0), Sense::hover());
-                if let Some(day) = views::mini_month(ui, rect, first_of_month(self.date), self.today, Some(self.date), p, true) {
+                if let Some(day) = views::mini_month(ui, rect, first_of_month(self.date), self.today, Some(self.date), p, true, None) {
                     self.go_to(day, View::Day);
                 }
                 ui.add_space(14.0);
@@ -1097,78 +1156,6 @@ impl App {
                 });
             });
     }
-
-    fn google_window(&mut self, ctx: &egui::Context, p: &Palette) {
-        let mut open = self.show_google;
-        let mut connect = false;
-        let mut disconnect = false;
-        egui::Window::new("Google Calendar")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(440.0, 0.0))
-            .open(&mut open)
-            .show(ctx, |ui| {
-                let g = &mut self.store.google;
-                if g.is_connected() {
-                    ui.label(format!(
-                        "Connected{}.",
-                        g.account_email.as_ref().map(|e| format!(" as {e}")).unwrap_or_default()
-                    ));
-                    ui.label(
-                        RichText::new("Changes from other devices appear within 5 minutes. Your changes are sent to Google right away; if Google can't be reached they're kept and retried every minute.")
-                            .color(p.secondary),
-                    );
-                    ui.add_space(8.0);
-                    if ui.button(RichText::new("Disconnect").color(RED)).clicked() {
-                        disconnect = true;
-                    }
-                    return;
-                }
-                ui.label("CleanCalendar talks to Google with your own OAuth client:");
-                ui.add_space(4.0);
-                for step in [
-                    "1. In Google Cloud Console, create a project and enable the Google Calendar API.",
-                    "2. Configure the OAuth consent screen and add yourself as a test user.",
-                    "3. Create Credentials → OAuth client ID → Application type “Desktop app”.",
-                    "4. Paste the client ID and secret below, then sign in.",
-                ] {
-                    ui.label(RichText::new(step).color(p.secondary));
-                }
-                ui.hyperlink_to("Open Google Cloud Console", "https://console.cloud.google.com/apis/credentials");
-                ui.add_space(8.0);
-                egui::Grid::new("google-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                    ui.label("Client ID");
-                    ui.add(egui::TextEdit::singleline(&mut g.client_id).desired_width(300.0));
-                    ui.end_row();
-                    ui.label("Client secret");
-                    ui.add(egui::TextEdit::singleline(&mut g.client_secret).password(true).desired_width(300.0));
-                    ui.end_row();
-                });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let busy = self.worker.busy > 0;
-                    let btn = egui::Button::new(RichText::new("Sign in with Google").color(Color32::WHITE)).fill(ACCENT);
-                    if ui.add_enabled(!busy && !g.client_id.trim().is_empty(), btn).clicked() {
-                        connect = true;
-                    }
-                    if busy {
-                        ui.spinner();
-                        ui.label(RichText::new("Waiting for the browser…").color(p.secondary));
-                    }
-                });
-            });
-        self.show_google = open;
-        if connect {
-            self.store.save();
-            let g = &self.store.google;
-            self.worker.send(Cmd::Connect { client_id: g.client_id.clone(), client_secret: g.client_secret.clone() });
-        }
-        if disconnect {
-            self.engine.disconnect(&mut self.store);
-            self.flush();
-        }
-    }
 }
 
 impl eframe::App for App {
@@ -1177,10 +1164,18 @@ impl eframe::App for App {
         let p = Palette::get(ctx);
         self.today = Local::now().date_naive();
         self.icon.update(ctx, frame, self.today);
+        self.store.settings.apply();
 
         self.handle_messages();
-        let interval = if self.store.unsynced_count() > 0 { RETRY_SYNC } else { AUTO_SYNC };
-        if self.last_sync.is_some_and(|t| t.elapsed() > interval) {
+        // Unsent changes are retried every minute even when refreshing is
+        // manual; otherwise pull as often as "Refresh Calendars" says.
+        let refresh = self.store.settings.refresh_minutes;
+        let interval = if self.store.unsynced_count() > 0 {
+            Some(RETRY_SYNC)
+        } else {
+            (refresh > 0).then(|| StdDuration::from_secs(refresh as u64 * 60))
+        };
+        if interval.is_some_and(|i| self.last_sync.is_some_and(|t| t.elapsed() > i)) {
             self.sync();
         }
         self.shortcuts(ctx);
@@ -1199,7 +1194,10 @@ impl eframe::App for App {
             ui.add_space(6.0);
             match self.view {
                 View::Day => views::time_grid(self, ui, &p, 1),
-                View::Week => views::time_grid(self, ui, &p, 7),
+                View::Week => {
+                    let n = self.week_days();
+                    views::time_grid(self, ui, &p, n)
+                }
                 View::Month => views::month(self, ui, &p),
                 View::Year => views::year(self, ui, &p),
             }
@@ -1213,7 +1211,7 @@ impl eframe::App for App {
         self.apply_actions();
         self.editor_popover(ctx, &p);
         self.context_menu(ctx, &p);
-        self.google_window(ctx, &p);
+        self.settings_window(ctx, &p);
 
         // Keep the current-time line moving.
         ctx.request_repaint_after(StdDuration::from_secs(30));
