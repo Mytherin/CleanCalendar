@@ -762,6 +762,9 @@ fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
     if !has_guests && (read_only || !on_google) {
         return;
     }
+    // Guests are sent (and saved) through Google only; elsewhere (CalDAV)
+    // they're shown as the server has them.
+    let editable = !read_only && on_google;
     card(ui, p, |ui| {
         let mut remove = None;
         for (i, a) in ed.draft.attendees.iter().enumerate().filter(|(_, a)| !a.resource) {
@@ -787,7 +790,7 @@ fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
                 if !role.is_empty() {
                     ui.label(RichText::new(role).color(p.secondary).small());
                 }
-                if !read_only && !a.organizer {
+                if editable && !a.organizer {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let x = ui.add(egui::Label::new(RichText::new("\u{2715}").color(p.tertiary)).sense(Sense::click()));
                         if x.on_hover_text("Remove").on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
@@ -800,7 +803,7 @@ fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
         if let Some(i) = remove {
             ed.draft.attendees.remove(i);
         }
-        if !read_only {
+        if editable {
             if has_guests {
                 divider(ui, p);
             }
@@ -828,7 +831,7 @@ fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
             ui.label(RichText::new(err).color(RED).small());
         }
         if !on_google && has_guests {
-            ui.label(RichText::new("Invitations are only sent for events on a Google calendar.").color(p.secondary).small());
+            ui.label(RichText::new("Invitees can only be changed for events on a Google calendar.").color(p.secondary).small());
         }
     });
 }

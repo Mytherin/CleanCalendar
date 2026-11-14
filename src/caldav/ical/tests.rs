@@ -181,6 +181,32 @@ fn calendar_data_indented_by_a_pretty_printing_server_still_parses() {
 }
 
 #[test]
+fn invitees_are_read_from_attendee_lines() {
+    use crate::model::Response;
+    let c = ics("BEGIN:VEVENT\r\nUID:m\r\nSUMMARY:Planning\r\nDTSTART:20261114T090000Z\r\n\
+        ORGANIZER;CN=\"Boss, The\":mailto:boss@example.com\r\n\
+        ATTENDEE;CN=Ana;PARTSTAT=ACCEPTED:mailto:ana@example.com\r\n\
+        ATTENDEE;PARTSTAT=declined;ROLE=OPT-PARTICIPANT:MAILTO:bo@example.com\r\n\
+        ATTENDEE;CUTYPE=ROOM;CN=Room 4:mailto:room4@example.com\r\nEND:VEVENT\r\n");
+    let ev = events(&cal(), "/m.ics", None, &c, year().0, year().1).remove(0);
+    let got: Vec<_> =
+        ev.attendees.iter().map(|a| (a.email.as_str(), a.name.as_str(), a.response, a.organizer, a.optional, a.resource)).collect();
+    assert_eq!(
+        got,
+        [
+            ("boss@example.com", "Boss, The", Response::Accepted, true, false, false),
+            ("ana@example.com", "Ana", Response::Accepted, false, false, false),
+            ("bo@example.com", "", Response::Declined, false, true, false),
+            ("room4@example.com", "Room 4", Response::NeedsAction, false, false, true),
+        ]
+    );
+
+    // A plain event (an ORGANIZER alone, as some servers add) has no guests.
+    let c = ics("BEGIN:VEVENT\r\nUID:p\r\nDTSTART:20261114T090000Z\r\nORGANIZER:mailto:me@example.com\r\nEND:VEVENT\r\n");
+    assert!(events(&cal(), "/p.ics", None, &c, year().0, year().1)[0].attendees.is_empty());
+}
+
+#[test]
 fn durations() {
     assert_eq!(parse_duration("PT1H30M"), Some(Duration::minutes(90)));
     assert_eq!(parse_duration("P2D"), Some(Duration::days(2)));
