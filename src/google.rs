@@ -355,6 +355,7 @@ impl Client {
             events: Vec::new(),
             cancelled: Vec::new(),
             next_token: None,
+            skipped: None,
         };
         let mut page_token: Option<String> = None;
         loop {
