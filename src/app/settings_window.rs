@@ -1008,6 +1008,14 @@ fn fmt_count(n: u64) -> String {
     out
 }
 
+/// Text over as many lines as it needs, breaking even a long word (such as
+/// a URL in an error), so it never widens the window.
+fn wrapped(ui: &mut Ui, text: &str, color: Color32, size: f32) {
+    let mut job = LayoutJob::simple(text.to_owned(), theme::font(size), color, ui.available_width());
+    job.wrap.break_anywhere = true;
+    ui.add(egui::Label::new(job).wrap());
+}
+
 /// A bar filled to `frac` with `text` on it.
 fn progress(ui: &mut Ui, frac: Option<f32>, text: String) {
     let bar = match frac {
@@ -1108,7 +1116,7 @@ impl App {
                         });
                     });
                     if let Phase::Failed(e) = &job.phase {
-                        ui.label(RichText::new(e).color(RED).size(11.5));
+                        wrapped(ui, e, RED, 11.5);
                     }
                 }
             });
