@@ -25,8 +25,9 @@ use rusqlite::{params, Connection, Row, Transaction};
 
 use crate::model::{Calendar, Event, GoogleSettings, PendingDelete, Source, Store, SyncState};
 
-const DATA_VERSION: i32 = 1;
-const CACHE_VERSION: i32 = 1;
+const DATA_VERSION: i32 = 2;
+/// Bumped when cached events gain fields, so they are downloaded again.
+const CACHE_VERSION: i32 = 2;
 
 /// Where the two databases (and the old JSON store, for migration) live, and
 /// where the Google refresh token is kept.
@@ -241,7 +242,7 @@ impl std::fmt::Display for TooNew {
 impl std::error::Error for TooNew {}
 
 const EVENT_COLUMNS: &str = "id, calendar_id, title, start_at, end_at, all_day, location, notes, \
-                             remote_id, recurring_id, pending, rev, etag, base";
+                             remote_id, recurring_id, pending, rev, etag, base, recurrence, time_zone";
 
 fn event_table(name: &str) -> String {
     format!(
@@ -259,7 +260,9 @@ fn event_table(name: &str) -> String {
             pending INTEGER NOT NULL,
             rev INTEGER NOT NULL,
             etag TEXT,
-            base TEXT
+            base TEXT,
+            recurrence TEXT,
+            time_zone TEXT
         );"
     )
 }
@@ -388,6 +391,18 @@ fn open_data(path: &Path) -> Result<(Connection, DataPart)> {
     if version > DATA_VERSION {
         return Err(TooNew(version).into());
     }
+    if version == 1 {
+        // Version 2 added repeating events and time zones.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE main.events ADD COLUMN recurrence TEXT;
+             ALTER TABLE main.events ADD COLUMN time_zone TEXT;
+             ALTER TABLE main.outbox ADD COLUMN recurrence TEXT;
+             ALTER TABLE main.outbox ADD COLUMN time_zone TEXT;
+             PRAGMA main.user_version = 2;
+             COMMIT;",
+        )?;
+    }
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS main.settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS main.calendars (
@@ -494,14 +509,18 @@ fn load_events(conn: &Connection, place: Place) -> rusqlite::Result<Vec<Event>> 
         .collect()
 }
 
+/// A column holding JSON (or NULL).
+fn json_column<T: serde::de::DeserializeOwned>(r: &Row, i: usize) -> rusqlite::Result<Option<T>> {
+    let text: Option<String> = r.get(i)?;
+    text.map(|text| {
+        serde_json::from_str(&text)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e)))
+    })
+    .transpose()
+}
+
 fn read_event(r: &Row) -> rusqlite::Result<Event> {
-    let base: Option<String> = r.get(13)?;
-    let base = match base {
-        Some(text) => Some(serde_json::from_str(&text).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(e))
-        })?),
-        None => None,
-    };
+    let base = json_column(r, 13)?;
     Ok(Event {
         id: r.get(0)?,
         calendar_id: r.get(1)?,
@@ -517,13 +536,16 @@ fn read_event(r: &Row) -> rusqlite::Result<Event> {
         rev: r.get::<_, i64>(11)? as u64,
         etag: r.get(12)?,
         base,
+        recurrence: json_column(r, 14)?,
+        time_zone: r.get(15)?,
     })
 }
 
 fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
     let base = ev.base.as_ref().map(serde_json::to_string).transpose()?;
+    let recurrence = ev.recurrence.as_ref().map(serde_json::to_string).transpose()?;
     tx.prepare_cached(&format!(
-        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         place.table()
     ))?
     .execute(params![
@@ -541,6 +563,8 @@ fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
         ev.rev as i64,
         ev.etag,
         base,
+        recurrence,
+        ev.time_zone,
     ])?;
     Ok(())
 }
@@ -854,6 +878,8 @@ mod tests {
             rev: 0,
             etag: None,
             base: None,
+            recurrence: None,
+            time_zone: None,
         }
     }
 
@@ -1202,5 +1228,91 @@ mod tests {
         store.save();
         drop(store);
         assert!(open(&dir.paths()).event("dup").is_some());
+    }
+
+    /// Opens a copy of a real `data.db` from an older version and checks
+    /// nothing is lost in the upgrade:
+    /// `CLEANCALENDAR_UPGRADE_CHECK=/path/to/data.db cargo test upgrade_check -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn upgrade_check() {
+        let src = std::env::var_os("CLEANCALENDAR_UPGRADE_CHECK").expect("set CLEANCALENDAR_UPGRADE_CHECK");
+        let dir = TempDir::new();
+        let p = dir.paths();
+        std::fs::copy(&src, &p.data).unwrap();
+        let before = (rows(&p.data, "events"), rows(&p.data, "outbox"));
+        let old_version = user_version(&Connection::open(&p.data).unwrap(), "main").unwrap();
+
+        let store = open(&p);
+        assert_eq!((rows(&p.data, "events"), rows(&p.data, "outbox")), before);
+        let mut ids: Vec<String> = store.events.iter().map(|e| e.id.clone()).collect();
+        ids.sort();
+        let mut expected = [before.0.clone(), before.1.clone()].concat();
+        expected.sort();
+        assert_eq!(ids, expected);
+        assert_eq!(user_version(&Connection::open(&p.data).unwrap(), "main").unwrap(), DATA_VERSION);
+        println!(
+            "schema {old_version} -> {DATA_VERSION}: {} calendars, {} local events, {} unsynced kept",
+            store.calendars.len(),
+            before.0.len(),
+            before.1.len()
+        );
+    }
+
+    #[test]
+    fn repeat_rules_and_time_zones_are_saved() {
+        use crate::recurrence::{Freq, Recurrence, RepeatEnd};
+        let dir = TempDir::new();
+        let mut store = populated(&dir);
+        let mut rule = Recurrence::new(Freq::Weekly);
+        rule.weekdays = vec![chrono::Weekday::Mon, chrono::Weekday::Fri];
+        rule.end = RepeatEnd::Until(NaiveDate::from_ymd_opt(2027, 1, 1).unwrap());
+        rule.exceptions = vec![at(9) + chrono::Duration::days(3)];
+        let ev = store.event_mut("local1").unwrap();
+        ev.recurrence = Some(rule);
+        ev.time_zone = Some("America/New_York".into());
+        // A pending edit's base snapshot carries them too.
+        let g2 = store.event_mut("g2").unwrap();
+        g2.time_zone = Some("Asia/Tokyo".into());
+        g2.base.as_mut().unwrap().time_zone = Some("Europe/Paris".into());
+        store.save();
+        let events = store.events.clone();
+        drop(store);
+        assert_eq!(sorted(&open(&dir.paths()).events), sorted(&events));
+    }
+
+    #[test]
+    fn a_version_1_data_file_is_upgraded_in_place() {
+        let dir = TempDir::new();
+        let p = dir.paths();
+        {
+            // The event tables as version 1 had them.
+            let conn = Connection::open(&p.data).unwrap();
+            let v1 = |name: &str| {
+                format!(
+                    "CREATE TABLE {name} (id TEXT PRIMARY KEY, calendar_id TEXT NOT NULL, title TEXT NOT NULL,
+                     start_at TEXT NOT NULL, end_at TEXT NOT NULL, all_day INTEGER NOT NULL, location TEXT NOT NULL,
+                     notes TEXT NOT NULL, remote_id TEXT, recurring_id TEXT, pending INTEGER NOT NULL,
+                     rev INTEGER NOT NULL, etag TEXT, base TEXT);"
+                )
+            };
+            conn.execute_batch(&format!("{} {} PRAGMA user_version = 1;", v1("events"), v1("outbox"))).unwrap();
+            conn.execute(
+                "INSERT INTO events VALUES ('local1', 'local:home', 'Dentist', ?1, ?2, 0, '', '', NULL, NULL, 0, 0, NULL, ?3)",
+                params![at(9), at(10), r#"{"title":"Dentist","location":"","notes":"","start":"2026-11-14T09:00:00","end":"2026-11-14T10:00:00","all_day":false}"#],
+            )
+            .unwrap();
+        }
+        let mut store = open(&p);
+        let ev = store.event("local1").expect("kept");
+        assert_eq!((ev.title.as_str(), &ev.recurrence, &ev.time_zone), ("Dentist", &None, &None));
+        assert_eq!(ev.base.as_ref().unwrap().time_zone, None, "old snapshots read without the new fields");
+
+        store.event_mut("local1").unwrap().time_zone = Some("Europe/Amsterdam".into());
+        store.save();
+        drop(store);
+        let again = open(&p);
+        assert_eq!(again.event("local1").unwrap().time_zone.as_deref(), Some("Europe/Amsterdam"));
+        assert_eq!(user_version(&Connection::open(&p.data).unwrap(), "main").unwrap(), DATA_VERSION);
     }
 }

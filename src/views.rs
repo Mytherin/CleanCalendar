@@ -18,6 +18,7 @@ use crate::dates::*;
 use crate::interact::{Cursor, Input};
 use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GUTTER, HOUR_H};
 use crate::model::Event;
+use crate::recurrence;
 use crate::theme::{self, Palette, RED};
 
 /// Seconds the pointer must rest on an event before its tooltip shows.
@@ -107,6 +108,8 @@ fn ghost_event(start: NaiveDateTime, end: NaiveDateTime, all_day: bool) -> Event
         rev: 0,
         etag: None,
         base: None,
+        recurrence: None,
+        time_zone: None,
     }
 }
 
@@ -176,7 +179,7 @@ fn draw_banner(ui: &Ui, painter: &egui::Painter, rect: Rect, ev: &Event, color: 
     } else {
         format!("{} {}", fmt_time(ev.start.time()), ev.title)
     };
-    let repeat = ev.recurring_id.is_some() && rect.width() > 60.0;
+    let repeat = ev.repeats() && rect.width() > 60.0;
     if repeat {
         draw_repeat_marker(painter, Pos2::new(rect.right() - 5.0, rect.center().y), text_color);
     }
@@ -204,6 +207,13 @@ fn hover_text(ev: &Event) -> String {
         )
     };
     let mut s = format!("{}\n{}", ev.title, when);
+    if let (Some(zone), false) = (&ev.time_zone, ev.all_day) {
+        s.push_str(&format!(" ({})", zone.replace('_', " ")));
+    }
+    if let Some(rule) = &ev.recurrence {
+        s.push('\n');
+        s.push_str(&rule.describe(recurrence::series_start(ev).date()));
+    }
     if !ev.location.is_empty() {
         s.push('\n');
         s.push_str(&ev.location);
@@ -264,8 +274,8 @@ fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
         let still = ctx.input(|i| i.pointer.time_since_last_movement());
         if still < TOOLTIP_DELAY {
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(TOOLTIP_DELAY - still));
-        } else if let Some(ev) = app.store.event(id) {
-            let text = hover_text(ev);
+        } else if let Some(ev) = app.store.find_event(id) {
+            let text = hover_text(&ev);
             egui::show_tooltip_at_pointer(&ctx, layer, egui::Id::new(("event-tip", id)), |ui| ui.label(text));
         }
     }
@@ -534,7 +544,7 @@ fn draw_timed(ui: &Ui, painter: &egui::Painter, r: Rect, ev: &Event, color: Colo
     let text_color = p.event_text(color, selected);
     let p_clip = painter.with_clip_rect(r.intersect(painter.clip_rect()));
     let x = r.left() + 7.0;
-    let repeat = ev.recurring_id.is_some() && r.width() > 60.0;
+    let repeat = ev.repeats() && r.width() > 60.0;
     let title_w = r.width() - 11.0 - if repeat { 12.0 } else { 0.0 };
     let title_font = theme::bold_font(12.0);
 

@@ -10,7 +10,9 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Week/Day time grid:** overlapping events sit side by side; all-day and multi-day events span the all-day lane.
 - **Direct manipulation:** drag on empty space to create an event, drag an event to move it, drag its bottom edge to resize. Everything snaps to 15 minutes.
 - **Month view:** multi-day banners span across days, timed events show a colored dot and their time, and overflow collapses to "N more".
-- **Event editor:** title, location, all-day, start/end date and time, calendar and notes.
+- **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar and notes.
+- **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
+- **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
 - **Google Calendar:** OAuth sign-in in your browser (loopback + PKCE), imports all your calendars, and sends creates, edits, moves and deletes back to Google. Read-only calendars (holidays, shared calendars) are shown but can't be edited.
 - Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows).
 
@@ -60,7 +62,8 @@ Google requires every app to have its own OAuth client:
   - **An edit always beats a delete.** If you edit an event that was deleted elsewhere, your version is recreated. If you delete an event that was edited elsewhere, it isn't deleted and comes back with their change.
   - **A retried create can't duplicate an event:** new events get their Google id up front, so a retry after a lost reply finds the event already there.
   - If Google rejects an edit (for example, no permission), the app goes back to Google's version.
-  - Recurring events are edited one occurrence at a time.
+  - Repeating events made here are uploaded as a series (`RRULE`) with their time zone; Google then sends them back as separate occurrences, which replace the local copy.
+  - Google’s repeating events are edited one occurrence at a time; “Delete All Events” deletes the whole series.
 
 ## Data
 
@@ -86,6 +89,7 @@ Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (t
 | `src/sync.rs` | Sync bookkeeping (no UI, no I/O): what to upload, retries, merging Google's changes |
 | `src/google.rs` | OAuth flow, Calendar v3 REST client, background worker thread |
 | `src/model.rs` | `Calendar`, `Event`, and the in-memory `Store` |
+| `src/recurrence.rs` | Repeat rules, expanding a series into occurrences, time zone conversion, `RRULE` |
 | `src/db.rs` | SQLite storage: persistent `data.db` and disposable `cache.db` |
 | `src/theme.rs` | Apple-like palette for light and dark mode, fonts |
 | `src/dates.rs` | Date helpers |
@@ -131,5 +135,6 @@ cargo test live_tests -- --ignored --test-threads 1 --skip live_sign_in
 
 - Recurring events created locally (Google recurring events already show, expanded into instances)
 - Search, event alerts/notifications, and an inspector-style popover next to the event
-- Editing a whole recurring series ("this and all future events")
+- Editing the rule of a series that came from Google, and “this and all future events”
+- Monthly rules like “the second Tuesday”
 - Keychain storage for tokens; additional providers (iCloud via CalDAV, Outlook)

@@ -25,7 +25,7 @@ pub fn is_weekend(d: NaiveDate) -> bool {
 }
 
 /// The weekday shown in week column `i`.
-fn column_weekday(i: usize) -> Weekday {
+pub fn column_weekday(i: usize) -> Weekday {
     let first = if WEEK_STARTS_MONDAY { Weekday::Mon } else { Weekday::Sun };
     (0..i % 7).fold(first, |wd, _| wd.succ())
 }

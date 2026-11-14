@@ -10,6 +10,7 @@ mod google;
 mod interact;
 mod layout;
 mod model;
+mod recurrence;
 mod sync;
 mod theme;
 mod views;

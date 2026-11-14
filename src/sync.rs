@@ -142,6 +142,17 @@ impl SyncEngine {
         // event is gone and deletes the copy it created.
     }
 
+    /// Call when the user deleted a whole repeating series that Google sent
+    /// as separate occurrences: deletes the series on Google.
+    pub fn series_deleted(&mut self, store: &mut Store, google_calendar_id: &str, series_remote_id: &str) {
+        let d = PendingDelete {
+            google_calendar_id: google_calendar_id.to_owned(),
+            remote_id: series_remote_id.to_owned(),
+            etag: None,
+        };
+        self.queue_delete(store, d);
+    }
+
     /// Uploads a pending event, unless an upload for it is already out
     /// (its reply triggers another upload if the event changed meanwhile).
     fn push(&mut self, store: &Store, id: &str) {
@@ -216,7 +227,7 @@ impl SyncEngine {
                 self.sync_finished(store, today);
             }
             Msg::Saved { local_id, google_calendar_id, rev, remote_id, etag } => {
-                self.on_saved(store, local_id, google_calendar_id, rev, remote_id, etag)
+                self.on_saved(store, local_id, google_calendar_id, rev, remote_id, etag, today)
             }
             Msg::SaveFailed { local_id, google_calendar_id, error, kind } => {
                 self.on_save_failed(store, local_id, google_calendar_id, error, kind, today)
@@ -271,6 +282,7 @@ impl SyncEngine {
         rev: u64,
         remote_id: String,
         etag: Option<String>,
+        today: NaiveDate,
     ) {
         self.in_flight.remove(&format!("save:{local_id}"));
         let still_there =
@@ -294,12 +306,18 @@ impl SyncEngine {
             // (`base` stays the older snapshot; merging against it only
             // makes our side win more often, never loses their changes.)
         }
+        // A new series: Google expands it into occurrences, which replace
+        // our copy (see `apply_changes`). Fetch them now.
+        let new_series = ev.recurrence.is_some() && !ev.pending;
         let changed_again = ev.pending;
         if new_id != local_id {
             self.notices.push(Notice::Renamed { from: local_id, to: new_id.clone() });
         }
         if changed_again {
             self.push(store, &new_id);
+        }
+        if new_series {
+            self.sync(store, today);
         }
     }
 
@@ -380,7 +398,8 @@ impl SyncEngine {
 
 /// Three-way merge of event fields. A field changed on only one side takes
 /// that side's value; changed differently on both sides, ours wins and the
-/// field is reported as a clash. Start, end, and all-day move together.
+/// field is reported as a clash. Start, end, all-day, time zone and
+/// repeat rule move together.
 fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) -> (EventFields, Vec<&'static str>) {
     let mut clashes = Vec::new();
     // Whether to take our value for one field (or field group).
@@ -391,7 +410,7 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
         }
         ours_changed
     };
-    let when = |f: &EventFields| format!("{} {} {}", f.start, f.end, f.all_day);
+    let when = |f: &EventFields| format!("{} {} {} {:?} {:?}", f.start, f.end, f.all_day, f.recurrence, f.time_zone);
     let take_title = take_ours("title", base.title.clone(), ours.title.clone(), theirs.title.clone());
     let take_loc = take_ours("location", base.location.clone(), ours.location.clone(), theirs.location.clone());
     let take_notes = take_ours("notes", base.notes.clone(), ours.notes.clone(), theirs.notes.clone());
@@ -405,6 +424,8 @@ fn merge_fields(base: &EventFields, ours: &EventFields, theirs: &EventFields) ->
         start: from(take_when).start,
         end: from(take_when).end,
         all_day: from(take_when).all_day,
+        recurrence: from(take_when).recurrence.clone(),
+        time_zone: from(take_when).time_zone.clone(),
     };
     (merged, clashes)
 }
@@ -471,7 +492,8 @@ fn apply_changes(store: &mut Store, changes: Vec<CalendarChanges>, dragging: Opt
         let mut index: HashMap<String, usize> =
             store.events.iter().enumerate().map(|(i, e)| (e.id.clone(), i)).collect();
         for ev in ch.events {
-            if ev.remote_id.as_ref().is_some_and(|r| deleting.contains(r)) {
+            let being_deleted = |id: &Option<String>| id.as_ref().is_some_and(|r| deleting.contains(r));
+            if being_deleted(&ev.remote_id) || being_deleted(&ev.recurring_id) {
                 continue;
             }
             match index.get(&ev.id) {
@@ -483,6 +505,21 @@ fn apply_changes(store: &mut Store, changes: Vec<CalendarChanges>, dragging: Opt
                 }
             }
         }
+        // A series we uploaded comes back expanded into occurrences (syncs
+        // ask for single events); once those are here, our own copy of the
+        // series would show everything twice.
+        let expanded: HashSet<String> = store
+            .events
+            .iter()
+            .filter(|e| e.calendar_id == cal_id)
+            .filter_map(|e| e.recurring_id.clone())
+            .collect();
+        store.events.retain(|e| {
+            let superseded = e.calendar_id == cal_id
+                && e.recurrence.is_some()
+                && e.remote_id.as_ref().is_some_and(|r| expanded.contains(r));
+            !superseded || protected(e)
+        });
         let state = store.sync_state.entry(ch.calendar_id).or_default();
         state.token = ch.next_token;
         if ch.full {
@@ -520,6 +557,8 @@ mod tests {
             rev: 0,
             etag: None,
             base: None,
+            recurrence: None,
+            time_zone: None,
         }
     }
 
@@ -1110,5 +1149,84 @@ mod tests {
         let mut store = store_with(vec![new_gev("local:x", "old version")]);
         SyncEngine::prepare(&mut store);
         assert_eq!(store.unsynced_count(), 1);
+    }
+
+    // ---- Repeating events and time zones ----------------------------------
+
+    use crate::recurrence::{Freq, Recurrence};
+
+    #[test]
+    fn a_new_series_is_replaced_by_googles_occurrences() {
+        let mut series = new_gev("local:s", "standup");
+        series.recurrence = Some(Recurrence::new(Freq::Weekly));
+        let mut store = store_with(vec![series]);
+        let mut engine = SyncEngine::default();
+        engine.event_changed(&mut store, "local:s");
+        assert_eq!(sent(&mut engine), [save("local:s", 1, None)]);
+
+        // Confirmed: fetch Google's occurrences right away. Until they
+        // arrive, our copy of the series is what shows.
+        engine.handle(&mut store, saved("local:s", 1, "s"), None, today());
+        assert_eq!(sent(&mut engine), [Sent::Sync(vec![])]);
+        assert_eq!(store.events.len(), 1);
+
+        let mut occ = gev("s_20261114T080000Z", "standup");
+        occ.recurring_id = Some("s".into());
+        engine.handle(&mut store, synced(changes(false, vec![occ], &[], Some("t"))), None, today());
+        assert_eq!(store.events.len(), 1, "series and occurrence would show twice");
+        assert_eq!(store.events[0].recurring_id.as_deref(), Some("s"));
+        assert!(store.events[0].recurrence.is_none());
+    }
+
+    #[test]
+    fn a_series_with_unsent_edits_is_kept_until_they_are_sent() {
+        let mut series = gev("s", "standup v2");
+        series.recurrence = Some(Recurrence::new(Freq::Daily));
+        series.pending = true;
+        let mut occ = gev("s_1", "standup");
+        occ.recurring_id = Some("s".into());
+        let mut store = store_with(vec![series]);
+        apply_changes(&mut store, changes(false, vec![occ], &[], None), None, today());
+        assert_eq!(titles(&store), ["standup", "standup v2"]);
+    }
+
+    #[test]
+    fn deleting_a_google_series_deletes_it_once_and_keeps_it_gone() {
+        let mut store = store_with(vec![]);
+        let mut engine = SyncEngine::default();
+        engine.series_deleted(&mut store, CAL, "s");
+        assert_eq!(sent(&mut engine), [Sent::Delete("s".into())]);
+        assert_eq!(store.unsynced_count(), 1);
+
+        // Its occurrences in a sync that crossed the delete stay away.
+        let mut occ = gev("s_1", "standup");
+        occ.recurring_id = Some("s".into());
+        apply_changes(&mut store, changes(false, vec![occ], &[], None), None, today());
+        assert!(store.events.is_empty());
+
+        engine.handle(&mut store, Msg::Deleted { remote_id: "s".into() }, None, today());
+        assert_eq!(store.unsynced_count(), 0);
+    }
+
+    #[test]
+    fn time_zone_and_repeat_rule_merge_as_part_of_the_time() {
+        let base = gev("a", "Standup").fields();
+        let mut ours = base.clone();
+        ours.title = "Daily standup".into();
+        let mut theirs = base.clone();
+        theirs.time_zone = Some("Europe/Paris".into());
+        theirs.recurrence = Some(Recurrence::new(Freq::Daily));
+        let (merged, clashes) = merge_fields(&base, &ours, &theirs);
+        assert!(clashes.is_empty());
+        assert_eq!(merged.title, "Daily standup");
+        assert_eq!(merged.time_zone.as_deref(), Some("Europe/Paris"));
+        assert!(merged.recurrence.is_some());
+
+        // Both changed when it happens: ours wins, and that's a clash.
+        let mut ours = base.clone();
+        ours.time_zone = Some("Asia/Tokyo".into());
+        let (merged, clashes) = merge_fields(&base, &ours, &theirs);
+        assert_eq!(clashes, ["time"]);
+        assert_eq!((merged.time_zone.as_deref(), merged.recurrence), (Some("Asia/Tokyo"), None));
     }
 }
