@@ -40,6 +40,8 @@ impl View {
 /// An in-progress pointer drag in the time grid.
 pub enum Drag {
     Create { anchor: NaiveDateTime, current: NaiveDateTime },
+    /// Drag-creating an all-day event across days in the all-day lane.
+    CreateAllDay { anchor: NaiveDate, current: NaiveDate },
     Move { id: String, grab: Duration },
     Resize { id: String },
 }
