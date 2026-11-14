@@ -463,67 +463,11 @@ fn calendar_chip(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
         v.window_stroke = Stroke::new(1.0_f32, p.grid_strong);
         ui.style_mut().spacing.menu_margin = egui::Margin::symmetric(5.0, 6.0);
         egui::popup::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
-            calendar_menu(ui, ed, store, p);
+            if let Some(id) = crate::menu::calendar_menu(ui, store, &ed.draft.calendar_id, p) {
+                ed.draft.calendar_id = id;
+            }
         });
     });
-}
-
-/// The hovered row of the calendar menu: the red macOS Calendar uses for its
-/// menu highlight, whatever the calendar's own color.
-const MENU_HIGHLIGHT: Color32 = Color32::from_rgb(0xB8, 0x43, 0x40);
-
-fn calendar_menu(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) {
-    const ROW_H: f32 = 22.0;
-    const PAD: f32 = 8.0;
-    ui.spacing_mut().item_spacing = Vec2::ZERO;
-    // Wide enough for the longest name: check and dot columns, then the text.
-    let text_w = store
-        .calendars
-        .iter()
-        .map(|c| ui.fonts(|f| f.layout_no_wrap(c.name.clone(), theme::font(14.0), p.text).size().x))
-        .fold(0.0, f32::max);
-    let width = (PAD + 36.0 + text_w + PAD + 6.0).max(180.0);
-    ui.set_width(width);
-
-    let google_header = store.google.account_email.clone().unwrap_or_else(|| "Google".into());
-    let groups = [(false, "On My Computer".to_owned()), (true, google_header)];
-    let mut first = true;
-    for (google, header) in groups {
-        let cals: Vec<_> = store.calendars.iter().filter(|c| !c.read_only && c.google_id().is_some() == google).collect();
-        if cals.is_empty() {
-            continue;
-        }
-        if !first {
-            let (r, _) = ui.allocate_exact_size(Vec2::new(width, 11.0), Sense::hover());
-            ui.painter().hline(r.left() + PAD..=r.right() - PAD, r.center().y, Stroke::new(1.0_f32, p.grid_strong));
-        }
-        first = false;
-        let (r, _) = ui.allocate_exact_size(Vec2::new(width, ROW_H - 2.0), Sense::hover());
-        let at = r.left_center() + Vec2::new(PAD, 0.0);
-        ui.painter().text(at, Align2::LEFT_CENTER, header, theme::bold_font(12.0), p.secondary);
-
-        for c in cals {
-            let (r, row) = ui.allocate_exact_size(Vec2::new(width, ROW_H), Sense::click());
-            let mut text = p.text;
-            if row.hovered() {
-                ui.painter().rect_filled(r, 5.0, MENU_HIGHLIGHT);
-                text = Color32::WHITE;
-            }
-            if c.id == ed.draft.calendar_id {
-                // A "✓", drawn (the UI font may not have the glyph).
-                let c = Pos2::new(r.left() + PAD + 5.0, r.center().y);
-                let s = Stroke::new(1.6_f32, text);
-                ui.painter().line_segment([c + Vec2::new(-4.0, 0.0), c + Vec2::new(-1.0, 3.5)], s);
-                ui.painter().line_segment([c + Vec2::new(-1.0, 3.5), c + Vec2::new(4.5, -4.5)], s);
-            }
-            ui.painter().circle_filled(Pos2::new(r.left() + PAD + 22.0, r.center().y), 6.0, theme::rgb(c.color));
-            let at = r.left_center() + Vec2::new(PAD + 36.0, 0.0);
-            ui.painter().text(at, Align2::LEFT_CENTER, &c.name, theme::font(14.0), text);
-            if row.clicked() {
-                ed.draft.calendar_id = c.id.clone();
-            }
-        }
-    }
 }
 
 /// Draws the editor's contents into `ui`.
