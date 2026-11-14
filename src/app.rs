@@ -10,6 +10,8 @@ use crate::google::{self, Cmd, Worker};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
 use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, ACCENT, RED};
+use crate::interact::Pointer;
+use crate::layout;
 use crate::views;
 
 /// How often to pull changes from Google.
@@ -17,7 +19,7 @@ const AUTO_SYNC: StdDuration = StdDuration::from_secs(5 * 60);
 /// How often to retry while local changes are waiting to upload.
 const RETRY_SYNC: StdDuration = StdDuration::from_secs(60);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Day,
     Week,
@@ -37,19 +39,18 @@ impl View {
     }
 }
 
-/// An in-progress pointer drag in the time grid.
-pub enum Drag {
-    Create { anchor: NaiveDateTime, current: NaiveDateTime },
-    Move { id: String, grab: Duration },
-    Resize { id: String },
-}
-
 /// Things views ask the app to do once drawing is finished.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Select(Option<String>),
     Open(String),
     New { start: NaiveDateTime, end: NaiveDateTime, all_day: bool },
     GoTo(NaiveDate, View),
+    /// A drag is about to change this event (snapshot it for sync).
+    BeginEdit(String),
+    /// Live update while dragging.
+    SetTimes { id: String, start: NaiveDateTime, end: NaiveDateTime },
+    /// A drag finished changing this event.
     Committed(String),
 }
 
@@ -84,7 +85,7 @@ pub struct App {
     pub date: NaiveDate,
     pub today: NaiveDate,
     pub selected: Option<String>,
-    pub drag: Option<Drag>,
+    pub pointer: Pointer,
     pub scroll_to: Option<f32>,
     pub actions: Vec<Action>,
     editor: Option<Editor>,
@@ -107,8 +108,8 @@ impl App {
             date: today,
             today,
             selected: None,
-            drag: None,
-            scroll_to: Some(views::HOUR_H * 7.5),
+            pointer: Pointer::default(),
+            scroll_to: Some(layout::HOUR_H * 7.5),
             actions: Vec::new(),
             editor: None,
             sidebar_open: true,
@@ -134,10 +135,7 @@ impl App {
     }
 
     fn dragging_id(&self) -> Option<String> {
-        match &self.drag {
-            Some(Drag::Move { id, .. } | Drag::Resize { id }) => Some(id.clone()),
-            _ => None,
-        }
+        self.pointer.dragging_id().map(str::to_owned)
     }
 
     fn handle_messages(&mut self) {
@@ -171,11 +169,7 @@ impl App {
                     if let Some(ed) = self.editor.as_mut().filter(|ed| ed.draft.id == from) {
                         ed.draft.id = to.clone();
                     }
-                    if let Some(Drag::Move { id, .. } | Drag::Resize { id }) = &mut self.drag {
-                        if *id == from {
-                            *id = to.clone();
-                        }
-                    }
+                    self.pointer.rename(&from, &to);
                 }
             }
         }
@@ -273,8 +267,8 @@ impl App {
         self.flush();
     }
 
-    /// Views call this when the user starts dragging an event.
-    pub fn begin_edit(&mut self, id: &str) {
+    /// Called when the user starts dragging an event.
+    fn begin_edit(&mut self, id: &str) {
         self.engine.before_change(&mut self.store, id);
     }
 
@@ -298,6 +292,13 @@ impl App {
                 Action::Open(id) => self.open_event(&id),
                 Action::New { start, end, all_day } => self.new_event(start, end, all_day),
                 Action::GoTo(d, v) => self.go_to(d, v),
+                Action::BeginEdit(id) => self.begin_edit(&id),
+                Action::SetTimes { id, start, end } => {
+                    if let Some(ev) = self.store.event_mut(&id) {
+                        ev.start = start;
+                        ev.end = end;
+                    }
+                }
                 Action::Committed(id) => {
                     self.engine.event_changed(&mut self.store, &id);
                     self.flush();
@@ -310,7 +311,7 @@ impl App {
 
     pub fn go_to(&mut self, date: NaiveDate, view: View) {
         if matches!(view, View::Day | View::Week) && !matches!(self.view, View::Day | View::Week) {
-            self.scroll_to = Some(views::HOUR_H * 7.5);
+            self.scroll_to = Some(layout::HOUR_H * 7.5);
         }
         self.date = date;
         self.view = view;

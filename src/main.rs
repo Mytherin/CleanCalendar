@@ -3,6 +3,8 @@
 mod app;
 mod dates;
 mod google;
+mod interact;
+mod layout;
 mod model;
 mod sync;
 mod theme;
