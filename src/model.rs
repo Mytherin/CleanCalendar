@@ -71,6 +71,9 @@ pub struct Event {
     pub location: String,
     #[serde(default)]
     pub notes: String,
+    /// People invited to the event (empty for an event without guests).
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
     /// The event's id on the remote service, if it lives on one.
     #[serde(default)]
     pub remote_id: Option<String>,
@@ -114,6 +117,95 @@ pub struct EventFields {
     pub recurrence: Option<Recurrence>,
     #[serde(default)]
     pub time_zone: Option<String>,
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
+}
+
+/// How an invitee answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Response {
+    #[default]
+    NeedsAction,
+    Accepted,
+    Tentative,
+    Declined,
+}
+
+impl Response {
+    /// Google's `responseStatus` value.
+    pub fn as_google(self) -> &'static str {
+        match self {
+            Response::NeedsAction => "needsAction",
+            Response::Accepted => "accepted",
+            Response::Tentative => "tentative",
+            Response::Declined => "declined",
+        }
+    }
+
+    pub fn from_google(s: &str) -> Self {
+        match s {
+            "accepted" => Response::Accepted,
+            "tentative" => Response::Tentative,
+            "declined" => Response::Declined,
+            _ => Response::NeedsAction,
+        }
+    }
+}
+
+/// Someone invited to an event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attendee {
+    pub email: String,
+    /// Display name, if known.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub response: Response,
+    #[serde(default)]
+    pub organizer: bool,
+    /// This is the signed-in user.
+    #[serde(default)]
+    pub is_self: bool,
+    #[serde(default)]
+    pub optional: bool,
+    /// A room or other resource rather than a person. Kept so that saving
+    /// the guest list doesn't drop it, but not shown.
+    #[serde(default)]
+    pub resource: bool,
+}
+
+impl Attendee {
+    pub fn new(email: &str) -> Self {
+        Attendee {
+            email: email.trim().to_owned(),
+            name: String::new(),
+            response: Response::NeedsAction,
+            organizer: false,
+            is_self: false,
+            optional: false,
+            resource: false,
+        }
+    }
+
+    /// The name if there is one, else the email address.
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.email
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// A loose check that `s` looks like one email address ("a@b.c").
+pub fn looks_like_email(s: &str) -> bool {
+    let s = s.trim();
+    let Some((user, domain)) = s.split_once('@') else { return false };
+    !user.is_empty()
+        && !s.chars().any(|c| c.is_whitespace() || c == ',' || c == ';')
+        && !domain.contains('@')
+        && domain.split('.').count() >= 2
+        && domain.split('.').all(|part| !part.is_empty())
 }
 
 impl Event {
@@ -127,6 +219,7 @@ impl Event {
             all_day: self.all_day,
             recurrence: self.recurrence.clone(),
             time_zone: self.time_zone.clone(),
+            attendees: self.attendees.clone(),
         }
     }
 
@@ -139,6 +232,7 @@ impl Event {
         self.all_day = f.all_day;
         self.recurrence = f.recurrence;
         self.time_zone = f.time_zone;
+        self.attendees = f.attendees;
     }
 
     /// Whether this is (an occurrence of) a repeating event.
@@ -400,6 +494,7 @@ mod tests {
             all_day: false,
             location: "Room 1".into(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: None,
             recurring_id: None,
             pending: false,
@@ -485,5 +580,15 @@ mod tests {
         assert_eq!(c.time_zone.as_deref(), Some("Europe/Amsterdam"));
         assert!(c.remote_id.is_none() && c.recurring_id.is_none() && c.etag.is_none() && c.recurrence.is_none());
         assert!(!c.pending && c.rev == 0);
+    }
+
+    #[test]
+    fn email_check() {
+        for ok in ["a@b.co", "first.last+tag@mail.example.org", " x@y.z "] {
+            assert!(looks_like_email(ok), "{ok}");
+        }
+        for bad in ["", "a", "a@", "@b.c", "a@b", "a@b.", "a b@c.d", "a@b@c.d", "a@b.c, d@e.f"] {
+            assert!(!looks_like_email(bad), "{bad}");
+        }
     }
 }

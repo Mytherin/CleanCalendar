@@ -121,6 +121,7 @@ fn ghost_event(start: NaiveDateTime, end: NaiveDateTime, all_day: bool) -> Event
         all_day,
         location: String::new(),
         notes: String::new(),
+        attendees: Vec::new(),
         remote_id: None,
         recurring_id: None,
         pending: false,

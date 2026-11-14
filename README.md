@@ -11,13 +11,14 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Direct manipulation:** drag on empty space to create an event, drag an event to move it, drag its bottom edge to resize. Everything snaps to 15 minutes.
 - **Right-click menu** like Apple Calendar's: Get Info, move to another calendar, Delete, Cut, Copy, Paste, Duplicate, go to the next/previous occurrence of a repeating event, and e-mail the event (or its series). Right-click on empty space to create an event or paste there.
 - **Month view:** multi-day banners span across days, timed events show a colored dot and their time, and overflow collapses to "N more".
-- **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar and notes.
+- **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar, invitees and notes.
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
 - **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
 - **Settings** (⚙ in the toolbar, or Ctrl+,), laid out like macOS Calendar's:
   - *General:* 5 or 7 days per week, the first day of the week (or the Windows region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar, and whether to show Google's birthdays and holidays calendars.
   - *Accounts:* add (+) or remove (−) the Google account, switch it off, give it a name, and choose how often it refreshes (every minute to hourly, or manually).
   - *Advanced:* shade busy days in the year view, and show week numbers in the week and month views.
+- **Invitees:** on Google calendars, type addresses into "Add Invitees" (Enter, comma or semicolon adds one). Google emails the invitations, updates and cancellations, and each guest's reply (accepted, maybe, declined, no response) is shown next to their name.
 - **Google Calendar:** OAuth sign-in in your browser (loopback + PKCE), imports all your calendars, and sends creates, edits, moves and deletes back to Google. Read-only calendars (holidays, shared calendars) are shown but can't be edited.
 - Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows).
 

@@ -29,9 +29,10 @@ use crate::settings::Settings;
 /// The `main.settings` row holding the app's preferences (as JSON).
 const PREFS_KEY: &str = "app.settings";
 
-const DATA_VERSION: i32 = 2;
+/// 2 added repeating events and time zones, 3 added invitees.
+const DATA_VERSION: i32 = 3;
 /// Bumped when cached events gain fields, so they are downloaded again.
-const CACHE_VERSION: i32 = 2;
+const CACHE_VERSION: i32 = 3;
 
 /// Where the two databases (and the old JSON store, for migration) live, and
 /// where the Google refresh token is kept.
@@ -247,7 +248,12 @@ impl std::fmt::Display for TooNew {
 impl std::error::Error for TooNew {}
 
 const EVENT_COLUMNS: &str = "id, calendar_id, title, start_at, end_at, all_day, location, notes, \
-                             remote_id, recurring_id, pending, rev, etag, base, recurrence, time_zone";
+                             remote_id, recurring_id, pending, rev, etag, base, recurrence, time_zone, attendees";
+
+/// Columns added to `events` and `outbox` since version 1, so older files
+/// can be brought up to date (whichever of them they already have).
+const ADDED_EVENT_COLUMNS: [(&str, &str); 3] =
+    [("recurrence", "TEXT"), ("time_zone", "TEXT"), ("attendees", "TEXT NOT NULL DEFAULT '[]'")];
 
 fn event_table(name: &str) -> String {
     format!(
@@ -267,7 +273,8 @@ fn event_table(name: &str) -> String {
             etag TEXT,
             base TEXT,
             recurrence TEXT,
-            time_zone TEXT
+            time_zone TEXT,
+            attendees TEXT NOT NULL DEFAULT '[]'
         );"
     )
 }
@@ -398,17 +405,22 @@ fn open_data(path: &Path) -> Result<(Connection, DataPart)> {
     if version > DATA_VERSION {
         return Err(TooNew(version).into());
     }
-    if version == 1 {
-        // Version 2 added repeating events and time zones.
-        conn.execute_batch(
-            "BEGIN;
-             ALTER TABLE main.events ADD COLUMN recurrence TEXT;
-             ALTER TABLE main.events ADD COLUMN time_zone TEXT;
-             ALTER TABLE main.outbox ADD COLUMN recurrence TEXT;
-             ALTER TABLE main.outbox ADD COLUMN time_zone TEXT;
-             PRAGMA main.user_version = 2;
-             COMMIT;",
-        )?;
+    if (1..DATA_VERSION).contains(&version) {
+        // Add the event columns this file doesn't have yet. Checking each one
+        // (rather than going by the version) also covers files written by
+        // builds that added them in a different order.
+        let mut sql = String::from("BEGIN;");
+        for table in ["events", "outbox"] {
+            let have: HashSet<String> = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}', 'main')"))?
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (col, decl) in ADDED_EVENT_COLUMNS.iter().filter(|(col, _)| !have.contains(*col)) {
+                sql += &format!("ALTER TABLE main.{table} ADD COLUMN {col} {decl};");
+            }
+        }
+        sql += &format!("PRAGMA main.user_version = {DATA_VERSION}; COMMIT;");
+        conn.execute_batch(&sql)?;
     }
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS main.settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -547,6 +559,7 @@ fn read_event(r: &Row) -> rusqlite::Result<Event> {
         all_day: r.get(5)?,
         location: r.get(6)?,
         notes: r.get(7)?,
+        attendees: json_column(r, 16)?.unwrap_or_default(),
         remote_id: r.get(8)?,
         recurring_id: r.get(9)?,
         pending: r.get(10)?,
@@ -561,8 +574,9 @@ fn read_event(r: &Row) -> rusqlite::Result<Event> {
 fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
     let base = ev.base.as_ref().map(serde_json::to_string).transpose()?;
     let recurrence = ev.recurrence.as_ref().map(serde_json::to_string).transpose()?;
+    let attendees = serde_json::to_string(&ev.attendees)?;
     tx.prepare_cached(&format!(
-        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         place.table()
     ))?
     .execute(params![
@@ -582,6 +596,7 @@ fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
         base,
         recurrence,
         ev.time_zone,
+        attendees,
     ])?;
     Ok(())
 }
@@ -907,6 +922,7 @@ mod tests {
             all_day: false,
             location: "Room 1".into(),
             notes: String::new(),
+            attendees: Vec::new(),
             remote_id: None,
             recurring_id: None,
             pending: false,
@@ -972,6 +988,37 @@ mod tests {
         let conn = Connection::open(path).unwrap();
         let mut stmt = conn.prepare(&format!("SELECT id FROM {table} ORDER BY id")).unwrap();
         stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn a_version_1_database_gains_invitees() {
+        let dir = TempDir::new();
+        drop(populated(&dir));
+        // Turn data.db back into the version-1 layout (no attendees column).
+        let conn = Connection::open(&dir.paths().data).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE events DROP COLUMN attendees;
+             ALTER TABLE outbox DROP COLUMN attendees;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut store = open(&dir.paths());
+        let ids: Vec<_> = sorted(&store.events).iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&"local1".to_owned()) && ids.contains(&"g2".to_owned()), "local data kept: {ids:?}");
+        assert!(store.events.iter().all(|e| e.attendees.is_empty()));
+        assert_eq!(store.google.refresh_token.as_deref(), Some("refresh"));
+
+        // Invitees are saved from now on.
+        let ev = store.event_mut("local1").unwrap();
+        ev.attendees.push(crate::model::Attendee::new("ann@example.com"));
+        store.save();
+        drop(store);
+        let store = open(&dir.paths());
+        assert_eq!(store.event("local1").unwrap().attendees[0].email, "ann@example.com");
+        let conn = Connection::open(&dir.paths().data).unwrap();
+        assert_eq!(user_version(&conn, "main").unwrap(), DATA_VERSION);
     }
 
     #[test]

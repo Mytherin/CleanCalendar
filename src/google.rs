@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::model::Event;
+use crate::model::{Attendee, Event, Response};
 use crate::recurrence;
 
 /// Where sign-in, token, and Calendar API requests go.
@@ -602,8 +602,23 @@ impl Client {
     /// instead of overwriting someone else's newer change. New events carry
     /// an id derived from the local id, so retrying a create whose reply was
     /// lost can't produce a duplicate.
+    ///
+    /// Invitees are sent when the guest list changed (a PATCH replaces the
+    /// whole list, so leaving it out otherwise can't lose anything we don't
+    /// model). For events with guests, Google emails them invitations and
+    /// updates (`sendUpdates=all`), as Apple Calendar does.
     fn save_event(&mut self, cal_id: &str, ev: &Event) -> Result<(String, Option<String>)> {
         let mut body = event_to_json(ev);
+        let before = ev.base.as_ref().map(|b| b.attendees.as_slice());
+        let guests_changed = match (&ev.remote_id, before) {
+            (None, _) => !ev.attendees.is_empty(),
+            (Some(_), Some(before)) => !same_guests(before, &ev.attendees),
+            (Some(_), None) => !ev.attendees.is_empty(),
+        };
+        if guests_changed {
+            body["attendees"] = attendees_to_json(&ev.attendees);
+        }
+        let notify = !ev.attendees.is_empty() || before.is_some_and(|b| !b.is_empty());
         let token = self.token()?;
         let req = match &ev.remote_id {
             Some(rid) => {
@@ -620,6 +635,7 @@ impl Client {
                 self.http.post(self.url(&["calendars", cal_id, "events"]))
             }
         };
+        let req = if notify { req.query(&[("sendUpdates", "all")]) } else { req };
         let result = req.bearer_auth(token).json(&body).send().map_err(anyhow::Error::from).and_then(Self::check);
         let resp: Value = match result {
             Ok(resp) => resp.json()?,
@@ -649,8 +665,13 @@ impl Client {
     }
 
     /// Deletes the event, only if it's still at `etag` when one is given.
+    /// Guests, if any, are told it was cancelled.
     fn delete_event(&mut self, cal_id: &str, remote_id: &str, etag: Option<&str>) -> Result<()> {
-        let mut req = self.http.delete(self.url(&["calendars", cal_id, "events", remote_id])).bearer_auth(self.token()?);
+        let mut req = self
+            .http
+            .delete(self.url(&["calendars", cal_id, "events", remote_id]))
+            .query(&[("sendUpdates", "all")])
+            .bearer_auth(self.token()?);
         if let Some(etag) = etag {
             req = req.header("If-Match", etag);
         }
@@ -718,6 +739,7 @@ fn event_from_json(cal_id: &str, v: &Value) -> Option<Event> {
         all_day,
         location: v["location"].as_str().unwrap_or_default().to_owned(),
         notes: v["description"].as_str().unwrap_or_default().to_owned(),
+        attendees: attendees_from_json(&v["attendees"]),
         remote_id: Some(remote_id),
         recurring_id: v["recurringEventId"].as_str().map(str::to_owned),
         pending: false,
@@ -768,6 +790,53 @@ fn event_to_json(ev: &Event) -> Value {
         body["recurrence"] = json!(recurrence::to_rrule(rule, ev, zone.as_deref().unwrap_or("UTC")));
     }
     body
+}
+
+fn attendees_from_json(v: &Value) -> Vec<Attendee> {
+    let Some(list) = v.as_array() else { return Vec::new() };
+    list.iter()
+        .filter_map(|a| {
+            Some(Attendee {
+                email: a["email"].as_str()?.to_owned(),
+                name: a["displayName"].as_str().unwrap_or_default().to_owned(),
+                response: Response::from_google(a["responseStatus"].as_str().unwrap_or_default()),
+                organizer: a["organizer"].as_bool().unwrap_or(false),
+                is_self: a["self"].as_bool().unwrap_or(false),
+                optional: a["optional"].as_bool().unwrap_or(false),
+                resource: a["resource"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn attendees_to_json(list: &[Attendee]) -> Value {
+    Value::Array(
+        list.iter()
+            .map(|a| {
+                let mut v = json!({ "email": a.email, "responseStatus": a.response.as_google() });
+                if !a.name.is_empty() {
+                    v["displayName"] = json!(a.name);
+                }
+                if a.optional {
+                    v["optional"] = json!(true);
+                }
+                if a.resource {
+                    v["resource"] = json!(true);
+                }
+                v
+            })
+            .collect(),
+    )
+}
+
+/// Whether two guest lists invite the same addresses.
+fn same_guests(a: &[Attendee], b: &[Attendee]) -> bool {
+    let emails = |l: &[Attendee]| {
+        let mut v: Vec<_> = l.iter().map(|x| x.email.to_lowercase()).collect();
+        v.sort();
+        v
+    };
+    emails(a) == emails(b)
 }
 
 fn to_rfc3339(t: NaiveDateTime) -> String {
@@ -836,6 +905,25 @@ mod tests {
         assert!(plain.time_zone.is_none() && plain.recurrence.is_none());
         assert!(event_to_json(&plain)["start"].get("timeZone").is_none());
         assert!(event_to_json(&plain).get("recurrence").is_none());
+    }
+
+    #[test]
+    fn parses_attendees() {
+        let v = json!({"id": "x", "start": {"date": "2026-11-11"}, "attendees": [
+            {"email": "me@example.com", "organizer": true, "self": true, "responseStatus": "accepted"},
+            {"email": "ann@example.com", "displayName": "Ann", "responseStatus": "tentative", "optional": true},
+            {"email": "room@resource.calendar.google.com", "resource": true},
+            {"displayName": "no email, skipped"}
+        ]});
+        let a = event_from_json("c", &v).unwrap().attendees;
+        assert_eq!(a.len(), 3);
+        assert!(a[0].organizer && a[0].is_self && a[0].response == Response::Accepted);
+        assert_eq!((a[1].label(), a[1].response, a[1].optional), ("Ann", Response::Tentative, true));
+        assert_eq!((a[2].response, a[2].resource), (Response::NeedsAction, true));
+        // Rooms and optional flags survive the round trip.
+        let back = attendees_to_json(&a);
+        assert_eq!(back[1]["optional"], true);
+        assert_eq!(back[2]["resource"], true);
     }
 
     #[test]
