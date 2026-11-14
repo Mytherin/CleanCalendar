@@ -10,10 +10,7 @@ use chrono::{Duration, NaiveDate};
 use crate::dates::{add_months, first_of_month, midnight};
 use crate::model::{Event, Store};
 use crate::recurrence;
-
-/// How far ahead repeating events are listed: as far as synced calendars go
-/// (see [`crate::sync`]).
-pub const MONTHS_AHEAD: i32 = 13;
+use crate::sync::MONTHS_AHEAD;
 
 /// The events matching `query`, sorted by start. An empty query matches
 /// nothing.

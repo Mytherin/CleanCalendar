@@ -36,7 +36,7 @@ const PREFS_KEY: &str = "app.settings";
 const DATA_VERSION: i32 = 4;
 /// Bumped when cached events gain fields (or sync state changes meaning),
 /// so they are downloaded again.
-const CACHE_VERSION: i32 = 4;
+const CACHE_VERSION: i32 = 5;
 
 /// Where the two databases (and the old JSON store, for migration) live, and
 /// where secrets are kept.
@@ -523,7 +523,8 @@ fn attach_cache(conn: &Connection, path: &Path) -> Result<CachePart> {
          CREATE TABLE IF NOT EXISTS cache.sync_state (
              calendar_id TEXT PRIMARY KEY,
              token TEXT,
-             full_sync_on TEXT
+             full_sync_on TEXT,
+             window_from TEXT
          );
          PRAGMA cache.user_version = {CACHE_VERSION};",
         event_table("cache.events"),
@@ -608,8 +609,8 @@ fn load_data(conn: &Connection) -> Result<DataPart> {
 
 fn load_cache(conn: &Connection) -> Result<CachePart> {
     let sync_state = conn
-        .prepare("SELECT calendar_id, token, full_sync_on FROM cache.sync_state")?
-        .query_map([], |r| Ok((r.get(0)?, SyncState { token: r.get(1)?, full_sync_on: r.get(2)? })))?
+        .prepare("SELECT calendar_id, token, full_sync_on, window_from FROM cache.sync_state")?
+        .query_map([], |r| Ok((r.get(0)?, SyncState { token: r.get(1)?, full_sync_on: r.get(2)?, window_from: r.get(3)? })))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(CachePart { events: load_events(conn, Place::Cache)?, sync_state })
 }
@@ -992,8 +993,8 @@ impl Db {
             tx.execute("DELETE FROM cache.sync_state", [])?;
             for (id, st) in &s.sync_state {
                 tx.execute(
-                    "INSERT INTO cache.sync_state (calendar_id, token, full_sync_on) VALUES (?1, ?2, ?3)",
-                    params![id, st.token, st.full_sync_on],
+                    "INSERT INTO cache.sync_state (calendar_id, token, full_sync_on, window_from) VALUES (?1, ?2, ?3, ?4)",
+                    params![id, st.token, st.full_sync_on, st.window_from],
                 )?;
             }
         }
@@ -1126,7 +1127,7 @@ mod tests {
         });
         store.sync_state.insert(
             "g:me@example.com".into(),
-            SyncState { token: Some("tok".into()), full_sync_on: Some(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()) },
+            SyncState { token: Some("tok".into()), full_sync_on: Some(NaiveDate::from_ymd_opt(2026, 11, 1).unwrap()), window_from: Some(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()) },
         );
         store.settings.days_per_week = 5;
         store.settings.week_start = Some(6);
@@ -1607,7 +1608,7 @@ mod tests {
         edited.pending = true;
         store.events.extend([cached, edited]);
         store.pending_deletes.push(PendingDelete { calendar: r.clone(), remote_id: "/1234/calendars/home/b.ics".into(), etag: None });
-        store.sync_state.insert(r.local_id(), SyncState { token: Some("https://x/sync/1".into()), full_sync_on: None });
+        store.sync_state.insert(r.local_id(), SyncState { token: Some("https://x/sync/1".into()), full_sync_on: None, window_from: None });
         store.save();
         store
     }
