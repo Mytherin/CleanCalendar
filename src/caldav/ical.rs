@@ -820,9 +820,31 @@ fn fill(v: &mut Component, ev: &Event, master_series: bool) {
     }
     v.set_text("LOCATION", &ev.location);
     v.set_text("DESCRIPTION", &ev.notes);
-    v.set(time_prop("DTSTART", ev.start, ev, zone));
-    v.remove("DURATION");
-    v.set(time_prop("DTEND", ev.end, ev, zone));
+    // Times the edit didn't touch are left exactly as the server has them:
+    // rewriting them would turn a floating time into a fixed UTC one, or
+    // move an event in a zone this app doesn't know (shown as local time)
+    // for everyone, just because its title changed.
+    let times_unchanged = ev.base.as_ref().is_some_and(|b| {
+        (b.start, b.end, b.all_day, &b.time_zone) == (ev.start, ev.end, ev.all_day, &ev.time_zone)
+    }) && v.prop("DTSTART").is_some();
+    if !times_unchanged {
+        // A floating event stays floating when its times change.
+        let floating = !ev.all_day
+            && ev.time_zone.is_none()
+            && v.prop("DTSTART").is_some_and(|p| {
+                p.param("TZID").is_none() && p.param("VALUE").is_none() && !p.value.trim().ends_with('Z')
+            });
+        let at = |name: &str, t: NaiveDateTime| {
+            if floating {
+                Prop::new(name, t.format(STAMP).to_string())
+            } else {
+                time_prop(name, t, ev, zone)
+            }
+        };
+        v.set(at("DTSTART", ev.start));
+        v.remove("DURATION");
+        v.set(at("DTEND", ev.end));
+    }
     v.set(Prop::new("DTSTAMP", now_utc()));
     v.set(Prop::new("LAST-MODIFIED", now_utc()));
     let seq = v.prop("SEQUENCE").and_then(|p| p.value.trim().parse::<u32>().ok());
