@@ -2,22 +2,37 @@
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId};
 
-pub const RED: Color32 = Color32::from_rgb(0xFF, 0x3B, 0x30);
+/// Today markers and the year view's month names (macOS dark-mode red).
+pub const RED: Color32 = Color32::from_rgb(0xEB, 0x53, 0x4E);
 pub const ACCENT: Color32 = Color32::from_rgb(0x00, 0x7A, 0xFF);
 
+/// Colors measured from macOS Calendar screenshots (dark mode), with a light
+/// counterpart.
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub dark: bool,
+    /// Window and calendar background.
     pub bg: Color32,
+    /// The inset sidebar panel.
     pub sidebar: Color32,
     pub toolbar: Color32,
+    /// Hour lines, column lines, cell borders.
     pub grid: Color32,
+    /// The line under the all-day lane.
     pub grid_strong: Color32,
+    /// Weekend cells in the month view.
     pub weekend: Color32,
     pub text: Color32,
+    /// Hour labels, weekend headers, event times.
     pub secondary: Color32,
+    /// Days outside the current month.
     pub tertiary: Color32,
     pub selection: Color32,
+    /// Round toolbar buttons (+, ‹, Today, ›).
+    pub button: Color32,
+    /// Segmented Day/Week/Month/Year control.
+    pub seg_track: Color32,
+    pub seg_knob: Color32,
 }
 
 impl Palette {
@@ -25,54 +40,80 @@ impl Palette {
         if ctx.style().visuals.dark_mode {
             Palette {
                 dark: true,
-                bg: Color32::from_rgb(0x1E, 0x1E, 0x1E),
-                sidebar: Color32::from_rgb(0x28, 0x28, 0x2A),
-                toolbar: Color32::from_rgb(0x2C, 0x2C, 0x2E),
-                grid: Color32::from_rgb(0x38, 0x38, 0x3A),
-                grid_strong: Color32::from_rgb(0x48, 0x48, 0x4A),
-                weekend: Color32::from_rgb(0x23, 0x23, 0x24),
-                text: Color32::from_rgb(0xF2, 0xF2, 0xF7),
-                secondary: Color32::from_rgb(0x98, 0x98, 0x9F),
-                tertiary: Color32::from_rgb(0x63, 0x63, 0x66),
-                selection: Color32::from_rgb(0x3A, 0x3A, 0x3C),
+                bg: Color32::from_rgb(0x24, 0x28, 0x2B),
+                sidebar: Color32::from_rgb(0x1D, 0x20, 0x22),
+                toolbar: Color32::from_rgb(0x24, 0x28, 0x2B),
+                grid: Color32::from_rgb(0x3A, 0x3D, 0x40),
+                grid_strong: Color32::from_rgb(0x4A, 0x4D, 0x50),
+                weekend: Color32::from_rgb(0x2B, 0x2E, 0x30),
+                text: Color32::from_rgb(0xDE, 0xDE, 0xDF),
+                secondary: Color32::from_rgb(0x9D, 0x9F, 0x9F),
+                tertiary: Color32::from_rgb(0x5A, 0x5D, 0x60),
+                selection: Color32::from_rgb(0x32, 0x35, 0x37),
+                button: Color32::from_rgb(0x35, 0x39, 0x3B),
+                seg_track: Color32::from_rgb(0x1C, 0x1F, 0x21),
+                seg_knob: Color32::from_rgb(0x3A, 0x3D, 0x40),
             }
         } else {
             Palette {
                 dark: false,
                 bg: Color32::WHITE,
                 sidebar: Color32::from_rgb(0xF2, 0xF1, 0xF6),
-                toolbar: Color32::from_rgb(0xF6, 0xF6, 0xF6),
+                toolbar: Color32::WHITE,
                 grid: Color32::from_rgb(0xE6, 0xE6, 0xE6),
                 grid_strong: Color32::from_rgb(0xD1, 0xD1, 0xD6),
-                weekend: Color32::from_rgb(0xFA, 0xFA, 0xFA),
+                weekend: Color32::from_rgb(0xF7, 0xF7, 0xF7),
                 text: Color32::from_rgb(0x1D, 0x1D, 0x1F),
                 secondary: Color32::from_rgb(0x8E, 0x8E, 0x93),
                 tertiary: Color32::from_rgb(0xC7, 0xC7, 0xCC),
                 selection: Color32::from_rgb(0xE8, 0xE8, 0xED),
+                button: Color32::from_rgb(0xE9, 0xE9, 0xEB),
+                seg_track: Color32::from_rgb(0xE3, 0xE3, 0xE8),
+                seg_knob: Color32::WHITE,
             }
         }
     }
 
-    /// Translucent fill used behind timed events.
+    /// Fill behind events. In dark mode Apple uses the calendar color scaled
+    /// down to about 30% brightness (e.g. #DC38FF → #421251).
     pub fn event_fill(&self, c: Color32, selected: bool) -> Color32 {
         if selected {
             return c;
         }
-        let a = if self.dark { 0.30 } else { 0.18 };
-        blend(self.bg, c, a)
+        if self.dark {
+            scale(c, 0.30)
+        } else {
+            blend(self.bg, c, 0.18)
+        }
     }
 
-    /// Text color for an event drawn on its translucent fill.
+    /// Event text: the calendar color itself on the dark fill (a darker shade
+    /// in light mode), white on a selected event.
     pub fn event_text(&self, c: Color32, selected: bool) -> Color32 {
         if selected {
             return Color32::WHITE;
         }
         if self.dark {
-            blend(c, Color32::WHITE, 0.45)
+            // Very dark calendar colors would vanish on the fill; lift them.
+            if luminance(c) < 0.35 {
+                blend(c, Color32::WHITE, 0.35)
+            } else {
+                c
+            }
         } else {
             blend(c, Color32::BLACK, 0.45)
         }
     }
+}
+
+fn scale(c: Color32, f: f32) -> Color32 {
+    let s = |x: u8| (x as f32 * f).round() as u8;
+    Color32::from_rgb(s(c.r()), s(c.g()), s(c.b()))
+}
+
+/// Perceived brightness, 0–1.
+fn luminance(c: Color32) -> f32 {
+    (0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32) / 255.0
 }
 
 pub fn rgb(c: [u8; 3]) -> Color32 {
