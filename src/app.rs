@@ -1029,10 +1029,6 @@ impl App {
                                 self.sync();
                             }
                         }
-                        let accounts_label = if connected { "Accounts" } else { "Add Account" };
-                        if ui.button(accounts_label).on_hover_text("iCloud, CalDAV and Google accounts").clicked() {
-                            self.open_accounts();
-                        }
                         let unsynced = self.store.unsynced_count();
                         if connected && unsynced > 0 {
                             let s = if unsynced == 1 { "" } else { "s" };
