@@ -7,7 +7,7 @@
 //! (or moving on to another event in the inspector) keeps the changes, and
 //! Esc discards them.
 
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use eframe::egui::{self, Align, Align2, Color32, Key, Layout, Order, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
 use crate::dates::*;
@@ -197,6 +197,142 @@ fn time_button(ui: &mut egui::Ui, id: &str, t: &mut NaiveTime) {
     });
 }
 
+/// A button showing the date ("04/11/2026") that drops down a compact month
+/// calendar, like macOS Calendar's: "Nov 2026" with ◀ ● ▶ to page months,
+/// today in red, the chosen day on a soft rounded square. Clicking a day
+/// picks it and closes; clicking elsewhere or Esc just closes.
+fn date_button(ui: &mut egui::Ui, id: &str, date: &mut NaiveDate, p: &Palette) {
+    let popup_id = ui.make_persistent_id(id);
+    let month_id = popup_id.with("month");
+    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let resp = ui.add_sized(DATE_BUTTON, egui::Button::new(date.format("%d/%m/%Y").to_string()).selected(open));
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+        ui.data_mut(|d| d.insert_temp(month_id, first_of_month(*date)));
+    }
+    if !ui.memory(|m| m.is_popup_open(popup_id)) {
+        return;
+    }
+
+    const CELL: Vec2 = Vec2::new(27.0, 22.0);
+    let today = chrono::Local::now().date_naive();
+    let mut month = ui.data(|d| d.get_temp::<NaiveDate>(month_id)).unwrap_or_else(|| first_of_month(*date));
+    let mut close = false;
+    let border = if p.dark { Color32::from_rgb(0x4A, 0x4D, 0x50) } else { p.grid_strong };
+
+    let area = egui::Area::new(popup_id)
+        .order(Order::Foreground)
+        .fixed_pos(resp.rect.left_bottom() + Vec2::new(0.0, 4.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::none()
+                .fill(p.popover)
+                .rounding(8.0)
+                .stroke(Stroke::new(1.0_f32, border))
+                .shadow(egui::epaint::Shadow { offset: Vec2::new(0.0, 4.0), blur: 14.0, spread: 0.0, color: Color32::from_black_alpha(70) })
+                .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+                .show(ui, |ui| {
+                    let w = 7.0 * CELL.x;
+                    // Header: "Nov 2026" on the left, ◀ ● ▶ on the right.
+                    let (head, _) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::hover());
+                    ui.painter().text(
+                        head.left_center() + Vec2::new(3.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        month.format("%b %Y").to_string(),
+                        theme::bold_font(15.0),
+                        p.text,
+                    );
+                    let nav = |ui: &mut egui::Ui, k: i32| {
+                        let c = Pos2::new(head.right() - 9.0 - (2 - k) as f32 * 16.0, head.center().y);
+                        let r = Rect::from_center_size(c, Vec2::splat(16.0));
+                        let resp = ui.interact(r, popup_id.with(("nav", k)), Sense::click());
+                        let color = if resp.hovered() { p.text } else { p.secondary };
+                        match k {
+                            0 => ui.painter().add(egui::Shape::convex_polygon(
+                                vec![c + Vec2::new(-4.0, 0.0), c + Vec2::new(3.0, -4.5), c + Vec2::new(3.0, 4.5)],
+                                color,
+                                Stroke::NONE,
+                            )),
+                            1 => ui.painter().add(egui::Shape::circle_filled(c, 3.5, color)),
+                            _ => ui.painter().add(egui::Shape::convex_polygon(
+                                vec![c + Vec2::new(4.0, 0.0), c + Vec2::new(-3.0, 4.5), c + Vec2::new(-3.0, -4.5)],
+                                color,
+                                Stroke::NONE,
+                            )),
+                        };
+                        resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                    };
+                    if nav(ui, 0) {
+                        month = add_months(month, -1);
+                    }
+                    if nav(ui, 1) {
+                        month = first_of_month(today);
+                    }
+                    if nav(ui, 2) {
+                        month = add_months(month, 1);
+                    }
+
+                    // Weekday initials ("Mo", "Tu", …) over a hairline.
+                    let (days, _) = ui.allocate_exact_size(Vec2::new(w, CELL.y), Sense::hover());
+                    for i in 0..7 {
+                        ui.painter().text(
+                            Pos2::new(days.left() + (i as f32 + 0.5) * CELL.x, days.center().y),
+                            Align2::CENTER_CENTER,
+                            &weekday_short(i)[..2],
+                            theme::bold_font(12.0),
+                            p.secondary,
+                        );
+                    }
+                    ui.painter().hline(days.x_range().shrink(3.0), days.bottom() + 1.0, Stroke::new(1.0_f32, p.grid));
+                    ui.add_space(4.0);
+
+                    // Six weeks of days.
+                    let (grid, _) = ui.allocate_exact_size(Vec2::new(w, 6.0 * CELL.y), Sense::hover());
+                    let start = start_of_week(month);
+                    for k in 0..42 {
+                        let day = start + Duration::days(k);
+                        let r = Rect::from_min_size(
+                            grid.min + Vec2::new((k % 7) as f32 * CELL.x, (k / 7) as f32 * CELL.y),
+                            CELL,
+                        );
+                        let resp = ui.interact(r, popup_id.with(("day", k)), Sense::click());
+                        let bg = r.shrink2(Vec2::new(1.5, 1.0));
+                        if day == *date {
+                            ui.painter().rect_filled(bg, 5.0, if p.dark { p.grid_strong } else { p.button });
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(bg, 5.0, p.selection);
+                        }
+                        let in_month = day.month() == month.month();
+                        let color = if day == today {
+                            RED
+                        } else if in_month {
+                            p.text
+                        } else {
+                            p.tertiary
+                        };
+                        let font = if day == *date || day == today { theme::bold_font(13.0) } else { theme::font(13.0) };
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, day.day().to_string(), font, color);
+                        if resp.clicked() {
+                            *date = day;
+                            close = true;
+                        }
+                    }
+                });
+        });
+    ui.data_mut(|d| d.insert_temp(month_id, month));
+
+    // Close on a press outside the calendar (other than on the button, which
+    // toggles it itself), or on Esc — swallowing the Esc so it doesn't also
+    // discard the whole edit.
+    let outside = ui.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer.press_origin().is_some_and(|pos| !area.response.rect.contains(pos) && !resp.rect.contains(pos))
+    });
+    let esc = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+    if close || outside || esc {
+        ui.memory_mut(|m| m.close_popup());
+    }
+}
+
 /// The calendar picker: a chip with the calendar's color dot; clicking it
 /// lists the calendars the event can move to.
 fn calendar_chip(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette, read_only: bool) {
@@ -288,7 +424,7 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
                 ] {
                     ui.label(RichText::new(label).color(p.secondary));
                     ui.horizontal(|ui| {
-                        ui.push_id(id, |ui| ui.add_sized(DATE_BUTTON, egui_extras::DatePickerButton::new(date)));
+                        date_button(ui, &format!("{id}-date"), date, p);
                         if !ed.draft.all_day {
                             time_button(ui, &format!("{id}-time"), time);
                         }
