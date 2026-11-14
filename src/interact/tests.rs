@@ -412,7 +412,7 @@ fn month_hits(events: &[Event]) -> layout::MonthLayout {
 
 fn month_layout(events: &[Event], editable: bool) -> layout::MonthLayout {
     let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 626.0));
-    layout::month(events, d("2026-11-14"), rect, &|_| 14.0, &|_| editable)
+    layout::month(events, layout::MonthScroll::at_rest(d("2026-11-14")), rect, &|_| 14.0, &|_| editable)
 }
 
 /// An empty spot in a month cell (below its day number).
@@ -605,49 +605,4 @@ fn right_click_breaks_up_a_double_click() {
     sim.send(Input::ContextPress { pos });
     sim.press(pos);
     assert_eq!(sim.release(), vec![Action::Select(Some("lunch".into()))], "not an Open");
-}
-
-// ---------------------------------------------------------------------------
-// Wheel paging
-
-#[test]
-fn wheel_notches_page_one_month_each() {
-    let mut w = WheelPager::default();
-    // Down is later; quick notches each count.
-    assert_eq!(w.scroll(Wheel::Lines(-1.0), 0.0), 1);
-    assert_eq!(w.scroll(Wheel::Lines(-1.0), 0.03), 1);
-    assert_eq!(w.scroll(Wheel::Lines(2.0), 0.06), -2);
-    assert_eq!(w.scroll(Wheel::Pages(-1.0), 0.09), 1);
-}
-
-#[test]
-fn a_touchpad_swipe_pages_once_momentum_included() {
-    // Windows: fractional wheel lines, many per swipe.
-    let mut w = WheelPager::default();
-    let mut moved = 0;
-    for i in 0..60 {
-        moved += w.scroll(Wheel::Lines(-0.3), i as f64 * 0.016);
-    }
-    assert_eq!(moved, 1);
-    // A whole line in the middle of a swipe is still the swipe.
-    assert_eq!(w.scroll(Wheel::Lines(-1.0), 60.0 * 0.016), 0);
-    // After a pause, the next swipe pages again.
-    assert_eq!(w.scroll(Wheel::Lines(-0.3), 2.0), 0);
-    assert_eq!(w.scroll(Wheel::Lines(-0.4), 2.02), 1);
-}
-
-#[test]
-fn a_tiny_nudge_does_not_page() {
-    let mut w = WheelPager::default();
-    assert_eq!(w.scroll(Wheel::Points(10.0), 0.0), 0);
-    assert_eq!(w.scroll(Wheel::Points(10.0), 0.02), 0);
-    assert_eq!(w.scroll(Wheel::Points(15.0), 0.04), -1, "trackpad points page backwards");
-}
-
-#[test]
-fn a_swipe_that_turns_around_pages_back() {
-    let mut w = WheelPager::default();
-    assert_eq!(w.scroll(Wheel::Points(-40.0), 0.0), 1);
-    assert_eq!(w.scroll(Wheel::Points(-40.0), 0.02), 0);
-    assert_eq!(w.scroll(Wheel::Points(40.0), 0.04), -1);
 }
