@@ -356,6 +356,22 @@ impl SyncEngine {
                 for id in full {
                     store.sync_state.entry(id).or_default().window_from = from;
                 }
+                // "Keep past events" changed while this sync was out: what it
+                // fetched (and its tokens) are for the old range. Drop the
+                // tokens so the next sync downloads the new range in full.
+                if from.is_some_and(|f| f != window(store, today).0) {
+                    let ours: Vec<String> = store
+                        .calendars
+                        .iter()
+                        .filter_map(|c| c.remote().filter(|r| r.account == account))
+                        .map(|r| r.local_id())
+                        .collect();
+                    for id in ours {
+                        if let Some(st) = store.sync_state.get_mut(&id) {
+                            st.token = None;
+                        }
+                    }
+                }
                 if !skipped.is_empty() {
                     let name = store.account_name(&account);
                     self.status(format!("{name} wouldn't send {}", skipped.join("; ")), true);
@@ -1510,6 +1526,29 @@ mod tests {
         assert_eq!(window(&store, today()), (earliest(), date(2027, 12, 1)));
         store.settings.history_months = 6;
         assert_eq!(window(&store, today()), (date(2026, 5, 1), date(2027, 12, 1)));
+    }
+
+    #[test]
+    fn keeping_less_history_during_a_sync_still_downloads_the_new_range() {
+        let mut store = store_with(vec![]);
+        let mut engine = SyncEngine::default();
+        let synced = |ch| Msg::Synced { account: GOOGLE.into(), calendars: vec![remote_cal()], changes: ch };
+
+        // A full sync of everything is out when the user picks "6 months"
+        // (the Settings window clears the tokens and asks for a sync).
+        engine.sync(&store, today());
+        sent(&mut engine);
+        store.settings.history_months = 6;
+        for st in store.sync_state.values_mut() {
+            st.token = None;
+        }
+        engine.sync(&store, today());
+        engine.handle(&mut store, synced(changes(true, vec![], &[], Some("t1"))), None, today());
+
+        // The follow-up sync must be a full one for the new range, not
+        // changes since a token from the old one.
+        let next = sent(&mut engine);
+        assert_eq!(next, [Sent::Sync(vec![])], "{next:?}");
     }
 
     #[test]
