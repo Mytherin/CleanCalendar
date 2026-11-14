@@ -27,9 +27,12 @@ mod settings_window;
 /// often to pull changes is the "Refresh Calendars" setting.)
 const RETRY_SYNC: StdDuration = StdDuration::from_secs(60);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The calendar's views. The last one shown is remembered (see
+/// [`crate::settings::Settings::view`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum View {
     Day,
+    #[default]
     Week,
     Month,
     Year,
@@ -136,8 +139,8 @@ impl App {
         store.settings.apply();
         let mut app = App {
             scroll_to: Some(store.settings.scroll_hour()),
+            view: store.settings.view,
             store,
-            view: View::Week,
             date: today,
             today,
             selected: None,
@@ -1352,6 +1355,12 @@ impl eframe::App for App {
         }
         self.context_menu(ctx, &p);
         self.settings_window(ctx, &p);
+
+        // Remember the view, so the app opens in it next time.
+        if self.store.settings.view != self.view {
+            self.store.settings.view = self.view;
+            self.store.save();
+        }
 
         // Keep the current-time line moving.
         ctx.request_repaint_after(StdDuration::from_secs(30));

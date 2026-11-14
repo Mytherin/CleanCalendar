@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use chrono::Weekday;
 use serde::{Deserialize, Serialize};
 
+use crate::app::View;
 use crate::dates;
 
 /// How the week view's ‹ › buttons (and arrow keys) move.
@@ -57,6 +58,23 @@ pub struct Settings {
     pub week_numbers: bool,
     /// How many months of past events synced calendars keep; 0 = all.
     pub history_months: u32,
+
+    // ---- Remembered (not shown in the Settings window)
+    /// The view last shown, which the app opens in. Read leniently: a view
+    /// this version doesn't know falls back to the default rather than
+    /// making every other setting unreadable.
+    #[serde(deserialize_with = "or_default")]
+    pub view: View,
+}
+
+/// Reads a field, taking its default if the value doesn't parse.
+fn or_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 impl Default for Settings {
@@ -78,6 +96,7 @@ impl Default for Settings {
             year_heatmap: false,
             week_numbers: false,
             history_months: 0,
+            view: View::Week,
         }
     }
 }
@@ -231,6 +250,17 @@ mod tests {
         assert_eq!(s.days_per_week, 5);
         assert_eq!(s.hours_shown, 12);
         assert!(s.google_enabled);
+        assert_eq!(s.view, View::Week);
+    }
+
+    #[test]
+    fn the_last_view_is_remembered_and_read_leniently() {
+        let s = Settings { view: View::Month, ..Settings::default() };
+        let again: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(again.view, View::Month);
+        // A view from a newer version: just that field falls back.
+        let s: Settings = serde_json::from_str(r#"{"view": "Agenda", "days_per_week": 5}"#).unwrap();
+        assert_eq!((s.view, s.days_per_week), (View::Week, 5));
     }
 
     #[test]
