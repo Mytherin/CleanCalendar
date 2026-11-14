@@ -1477,4 +1477,159 @@ mod tests {
         assert_eq!(again.event("local1").unwrap().time_zone.as_deref(), Some("Europe/Amsterdam"));
         assert_eq!(user_version(&Connection::open(&p.data).unwrap(), "main").unwrap(), DATA_VERSION);
     }
+
+    // ---- CalDAV accounts ------------------------------------------------------
+
+    const DAV_CAL: &str = "https://p01-caldav.icloud.com/1234/calendars/home/";
+
+    fn icloud() -> CalDavAccount {
+        CalDavAccount {
+            id: "caldav-1a2b".into(),
+            label: "iCloud".into(),
+            server: crate::caldav::ICLOUD.into(),
+            username: "me@icloud.com".into(),
+            password: Some("abcd-efgh-ijkl-mnop".into()),
+        }
+    }
+
+    /// A signed-in iCloud account with a calendar, a cached event, an
+    /// unsynced edit, a pending delete and a sync token.
+    fn with_icloud(dir: &TempDir) -> Store {
+        let mut store = open(&dir.paths());
+        store.caldav.push(icloud());
+        let r = CalRef::new("caldav-1a2b", DAV_CAL);
+        store.calendars.push(Calendar {
+            id: r.local_id(),
+            name: "Home".into(),
+            color: [255, 41, 104],
+            visible: true,
+            source: Source::CalDav { account: "caldav-1a2b".into(), url: DAV_CAL.into() },
+            read_only: false,
+        });
+        let mut cached = event(&r.event_id("/1234/calendars/home/a.ics"), &r.local_id(), "Cached");
+        cached.remote_id = Some("/1234/calendars/home/a.ics".into());
+        let mut edited = event(&r.event_id("/1234/calendars/home/s.ics#20261116T070000"), &r.local_id(), "Edited");
+        edited.remote_id = Some("/1234/calendars/home/s.ics#20261116T070000".into());
+        edited.recurring_id = Some("/1234/calendars/home/s.ics".into());
+        edited.pending = true;
+        store.events.extend([cached, edited]);
+        store.pending_deletes.push(PendingDelete { calendar: r.clone(), remote_id: "/1234/calendars/home/b.ics".into(), etag: None });
+        store.sync_state.insert(r.local_id(), SyncState { token: Some("https://x/sync/1".into()), full_sync_on: None });
+        store.save();
+        store
+    }
+
+    #[test]
+    fn caldav_accounts_round_trip_with_the_password_in_the_credential_store() {
+        let dir = TempDir::new();
+        let store = with_icloud(&dir);
+        let (calendars, events, caldav, deletes, sync) = (
+            store.calendars.clone(),
+            sorted(&store.events),
+            store.caldav.clone(),
+            store.pending_deletes.clone(),
+            store.sync_state.clone(),
+        );
+        drop(store);
+        assert_eq!(dir.1.get("caldav-1a2b-password").unwrap().as_deref(), Some("abcd-efgh-ijkl-mnop"));
+        let conn = Connection::open(dir.paths().data).unwrap();
+        let in_db: Option<String> = conn.query_row("SELECT password FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(in_db, None, "no password in data.db");
+        drop(conn);
+
+        let again = open(&dir.paths());
+        assert_eq!(again.caldav, caldav);
+        assert_eq!(again.calendars, calendars);
+        assert_eq!(sorted(&again.events), events);
+        assert_eq!(again.pending_deletes, deletes);
+        assert_eq!(again.sync_state, sync);
+        // Synced events are split between cache and outbox like Google's.
+        assert_eq!(rows(&dir.paths().data, "outbox").len(), 1);
+        assert_eq!(rows(&dir.paths().cache, "events").len(), 1);
+    }
+
+    #[test]
+    fn removing_an_account_forgets_its_password() {
+        let dir = TempDir::new();
+        let mut store = with_icloud(&dir);
+        store.caldav.clear();
+        store.save();
+        assert_eq!(dir.1.get("caldav-1a2b-password").unwrap(), None);
+        drop(store);
+        assert!(open(&dir.paths()).caldav.is_empty());
+    }
+
+    #[test]
+    fn a_changed_password_replaces_the_old_one() {
+        let dir = TempDir::new();
+        let mut store = with_icloud(&dir);
+        store.caldav[0].password = Some("new-app-password".into());
+        store.save();
+        drop(store);
+        assert_eq!(open(&dir.paths()).caldav[0].password.as_deref(), Some("new-app-password"));
+    }
+
+    #[test]
+    fn without_a_credential_store_passwords_stay_in_data_db() {
+        let dir = TempDir::new();
+        let broken = Paths { secrets: Secrets::Unavailable, ..dir.paths() };
+        let mut store = open(&broken);
+        store.caldav.push(icloud());
+        store.save();
+        drop(store);
+        assert_eq!(open(&broken).caldav[0].password.as_deref(), Some("abcd-efgh-ijkl-mnop"));
+
+        // A working credential store takes it over.
+        let store = open(&dir.paths());
+        assert_eq!(store.caldav[0].password.as_deref(), Some("abcd-efgh-ijkl-mnop"));
+        assert_eq!(dir.1.get("caldav-1a2b-password").unwrap().as_deref(), Some("abcd-efgh-ijkl-mnop"));
+        drop(store);
+        let conn = Connection::open(dir.paths().data).unwrap();
+        let in_db: Option<String> = conn.query_row("SELECT password FROM accounts", [], |r| r.get(0)).unwrap();
+        assert_eq!(in_db, None);
+    }
+
+    #[test]
+    fn a_version_2_data_file_is_upgraded_to_accounts() {
+        let dir = TempDir::new();
+        let p = dir.paths();
+        {
+            // The tables as version 2 had them, with a Google calendar and a
+            // pending Google delete.
+            let conn = Connection::open(&p.data).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE calendars (id TEXT PRIMARY KEY, position INTEGER NOT NULL, name TEXT NOT NULL,
+                     color INTEGER NOT NULL, visible INTEGER NOT NULL, google_id TEXT, read_only INTEGER NOT NULL);
+                 {} {}
+                 CREATE TABLE pending_deletes (position INTEGER PRIMARY KEY, google_calendar_id TEXT NOT NULL,
+                     remote_id TEXT NOT NULL, etag TEXT);
+                 INSERT INTO calendars VALUES ('local:home', 0, 'Home', 255, 1, NULL, 0);
+                 INSERT INTO calendars VALUES ('google:me@example.com', 1, 'Me', 65280, 1, 'me@example.com', 0);
+                 INSERT INTO pending_deletes VALUES (0, 'me@example.com', 'r9', '\"9\"');
+                 INSERT INTO settings VALUES ('google.client_id', 'cid');
+                 PRAGMA user_version = 2;",
+                event_table("events"),
+                event_table("outbox"),
+            ))
+            .unwrap();
+        }
+        let store = open(&p);
+        assert_eq!(user_version(&Connection::open(&p.data).unwrap(), "main").unwrap(), DATA_VERSION);
+        assert_eq!(store.calendars[0].source, Source::Local);
+        assert_eq!(store.calendars[1].source, Source::Google { calendar_id: "me@example.com".into() });
+        assert_eq!(store.calendars[1].remote(), Some(CalRef::google("me@example.com")));
+        assert_eq!(
+            store.pending_deletes,
+            [PendingDelete { calendar: CalRef::google("me@example.com"), remote_id: "r9".into(), etag: Some("\"9\"".into()) }]
+        );
+        assert_eq!(store.google.client_id, "cid");
+        drop(store);
+        // And it keeps working after the upgrade.
+        let mut again = open(&p);
+        again.caldav.push(icloud());
+        again.save();
+        drop(again);
+        assert_eq!(open(&p).caldav.len(), 1);
+    }
 }
