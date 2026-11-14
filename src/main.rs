@@ -14,6 +14,7 @@ mod menu;
 mod model;
 mod recurrence;
 mod remote;
+mod search;
 mod settings;
 mod sync;
 mod theme;

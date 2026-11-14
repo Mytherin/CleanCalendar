@@ -20,6 +20,7 @@ use crate::theme::{self, Palette, RED};
 use crate::interact::Pointer;
 use crate::views;
 
+mod search_ui;
 mod settings_window;
 
 /// How often to retry while local changes are waiting to upload. (How
@@ -98,6 +99,27 @@ pub struct App {
     status: Option<(String, bool)>,
     settings_ui: settings_window::SettingsUi,
     icon: AppIcon,
+    search: SearchUi,
+}
+
+/// The toolbar's search field and its results (see [`crate::search`]).
+#[derive(Default)]
+struct SearchUi {
+    /// The field is shown (Ctrl+F, or the magnifier button).
+    open: bool,
+    query: String,
+    /// Give the field the keyboard focus on the next frame.
+    focus: bool,
+    /// The query the results list was last scrolled for: a new one scrolls
+    /// it to what's coming up.
+    scrolled_for: Option<String>,
+}
+
+impl SearchUi {
+    /// Whether the results list is shown.
+    fn showing(&self) -> bool {
+        self.open && !self.query.trim().is_empty()
+    }
 }
 
 impl App {
@@ -131,9 +153,13 @@ impl App {
             status: None,
             settings_ui: Default::default(),
             icon: AppIcon::new(&cc.egui_ctx),
+            search: SearchUi::default(),
         };
         if let Some((view, date)) = std::env::var("CLEANCALENDAR_START").ok().and_then(|s| parse_start(&s)) {
             app.go_to(date.unwrap_or(today), view);
+        }
+        if let Some(q) = std::env::var("CLEANCALENDAR_SEARCH").ok().filter(|q| !q.trim().is_empty()) {
+            app.search = SearchUi { open: true, query: q, ..SearchUi::default() };
         }
         SyncEngine::prepare(&mut app.store);
         app.sync();
@@ -866,6 +892,7 @@ impl App {
         let mut delete = false;
         let mut edit: Option<Command> = None;
         let mut settings = false;
+        let mut find = false;
         ctx.input(|i| {
             if !typing {
                 // Ctrl+X/C/V arrive as clipboard events, not key presses.
@@ -900,6 +927,9 @@ impl App {
             if cmd && i.key_pressed(Key::T) {
                 today = true;
             }
+            if cmd && i.key_pressed(Key::F) {
+                find = true;
+            }
             if cmd && i.key_pressed(Key::N) {
                 new = true;
             }
@@ -920,6 +950,10 @@ impl App {
         }
         if modal {
             return;
+        }
+        if find {
+            self.search.open = true;
+            self.search.focus = true;
         }
         if let Some(v) = view {
             self.go_to(self.date, v);
@@ -971,6 +1005,7 @@ impl App {
                         self.new_event(start, start + default_event_len(), false);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.search_field(ui, p);
                         if icon_button(ui, "⚙", "Settings (Ctrl+,)").clicked() {
                             self.open_settings();
                         }
@@ -1264,6 +1299,9 @@ impl eframe::App for App {
         // Sidebar first, so it runs the window's full height.
         self.sidebar(ctx, &p);
         self.toolbar(ctx, &p);
+        if self.search.showing() {
+            self.search_results(ctx, &p);
+        }
         if self.view == View::Day {
             self.inspector(ctx, &p);
         }
