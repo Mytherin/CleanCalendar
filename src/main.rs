@@ -12,6 +12,7 @@ mod interact;
 mod layout;
 mod menu;
 mod model;
+mod places;
 mod recurrence;
 mod remote;
 mod settings;

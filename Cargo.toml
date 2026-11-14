@@ -25,6 +25,10 @@ chrono-tz = "0.10"
 iana-time-zone = "0.1"
 rrule = "0.14"
 quick-xml = "0.37"
+osmpbf = "0.3.8"
+zstd = "0.14.4"
+fst = "0.4.7"
+rayon = "1.12.0"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.19"

@@ -1478,6 +1478,10 @@ impl eframe::App for App {
         }
         self.apply_actions();
         self.editor_popover(ctx, &p);
+        // "Download location data…" in the editor's location field.
+        if self.editor.as_mut().is_some_and(|ed| std::mem::take(&mut ed.open_location_settings)) {
+            self.open_settings_at(settings_window::Tab::Locations);
+        }
         self.context_menu(ctx, &p);
         self.settings_window(ctx, &p);
         self.accounts_window(ctx, &p);
