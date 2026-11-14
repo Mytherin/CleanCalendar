@@ -204,14 +204,63 @@ fn read_system_week_start() -> Option<Weekday> {
     (digit < 7).then(|| weekday_from_monday(digit as u8))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn read_system_week_start() -> Option<Weekday> {
+    use objc2_foundation::NSCalendar;
+    // Follows the region chosen in System Settings, including a "First day
+    // of week" override. 1 = Sunday … 7 = Saturday.
+    let n = unsafe { NSCalendar::currentCalendar().firstWeekday() };
+    (1..=7).contains(&n).then(|| weekday_from_monday((n as u8 + 5) % 7))
+}
+
+/// On Linux and the BSDs, glibc's `locale` knows the first weekday of the
+/// `LC_TIME` locale. The plain C/POSIX locale counts as unknown.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_system_week_start() -> Option<Weekday> {
+    let locale = ["LC_ALL", "LC_TIME", "LANG"].iter().find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()))?;
+    if locale == "C" || locale == "POSIX" || locale.starts_with("C.") {
+        return None;
+    }
+    let out = std::process::Command::new("locale").args(["week-1stday", "first_weekday"]).output().ok()?;
+    parse_locale_week_start(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(not(any(windows, unix)))]
 fn read_system_week_start() -> Option<Weekday> {
     None
+}
+
+/// Parses `locale week-1stday first_weekday`: a date that starts a week
+/// (`19971130`, a Sunday, in most locales) and which day counting from it is
+/// the first (1 = that day).
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn parse_locale_week_start(out: &str) -> Option<Weekday> {
+    use chrono::Datelike;
+    let mut lines = out.lines().map(str::trim);
+    let base = chrono::NaiveDate::parse_from_str(lines.next()?, "%Y%m%d").ok()?;
+    let offset: u8 = lines.next()?.parse().ok()?;
+    if !(1..=7).contains(&offset) {
+        return None;
+    }
+    Some(weekday_from_monday(base.weekday().num_days_from_monday() as u8 + offset - 1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_week_start_is_read_from_glibc_locale_output() {
+        // en_US: Sunday; de_DE / en_GB: Monday; ar_EG-style: Saturday.
+        assert_eq!(parse_locale_week_start("19971130\n1\n"), Some(Weekday::Sun));
+        assert_eq!(parse_locale_week_start("19971130\n2\n"), Some(Weekday::Mon));
+        assert_eq!(parse_locale_week_start("19971130\n7\n"), Some(Weekday::Sat));
+        // Some locales use a Monday as the base date.
+        assert_eq!(parse_locale_week_start("19971201\n1"), Some(Weekday::Mon));
+        assert_eq!(parse_locale_week_start("19971130\n0\n"), None);
+        assert_eq!(parse_locale_week_start("locale: Cannot set LC_ALL\n"), None);
+        assert_eq!(parse_locale_week_start(""), None);
+    }
 
     #[test]
     fn out_of_range_values_from_disk_are_brought_back_in_range() {

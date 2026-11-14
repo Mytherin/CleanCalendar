@@ -23,7 +23,7 @@ impl App {
                 ui.painter().rect_filled(rect, 6.0, p.selection);
             }
             magnifier(ui.painter(), rect.center(), p.text);
-            if resp.on_hover_text("Search (Ctrl+F)").clicked() {
+            if resp.on_hover_text(format!("Search ({})", cmd_key!("F"))).clicked() {
                 s.open = true;
                 s.focus = true;
             }
