@@ -12,6 +12,7 @@ use eframe::egui::Pos2;
 use crate::app::{Action, View};
 use crate::dates::*;
 use crate::layout::{Grip, HitMap, Target, TimeGrid};
+use crate::menu::MenuAt;
 
 /// How far the pointer must move before a press becomes a drag.
 const DRAG_DIST: f32 = 6.0;
@@ -23,6 +24,8 @@ pub enum Input {
     Press { pos: Pos2 },
     Move { pos: Pos2 },
     Release { pos: Pos2, time: f64 },
+    /// The secondary (right) button went down: asks for a context menu.
+    ContextPress { pos: Pos2 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,9 +169,41 @@ impl Pointer {
                 Gesture::Dragging(drag) => finish_drag(drag, &mut out),
                 Gesture::Idle | Gesture::Ignored => {}
             },
+            // Like macOS, the menu opens on the press; not in the middle of
+            // a click or drag with the primary button.
+            Input::ContextPress { pos } => {
+                if matches!(self.gesture, Gesture::Idle) {
+                    self.last_click = None;
+                    context_press(hits, pos, &mut out);
+                }
+            }
         }
         out
     }
+}
+
+/// A right-click selects what's under the pointer (or clears the selection
+/// on empty space) and opens the menu for it.
+fn context_press(hits: &HitMap, pos: Pos2, out: &mut Vec<Action>) {
+    let at = match hits.hit(pos) {
+        Some(Target::Event { id, .. }) => {
+            out.push(Action::Select(Some(id.clone())));
+            out.push(Action::ContextMenu { at: MenuAt::Event(id.clone()), pos });
+            return;
+        }
+        Some(Target::TimeGrid) => match hits.grid {
+            Some(g) => MenuAt::Time(snap(g.time_at(pos))),
+            None => return,
+        },
+        Some(Target::AllDayLane) => match hits.grid {
+            Some(g) => MenuAt::Day { day: g.day_at(pos.x), all_day: true },
+            None => return,
+        },
+        Some(Target::MonthCell(day) | Target::MonthDayNumber(day)) => MenuAt::Day { day: *day, all_day: false },
+        Some(Target::DayHeader(_) | Target::More(_)) | None => return,
+    };
+    out.push(Action::Select(None));
+    out.push(Action::ContextMenu { at, pos });
 }
 
 /// Click targets match across the clicks of a double-click even if an

@@ -161,6 +161,25 @@ impl Event {
     pub fn duration(&self) -> Duration {
         self.end - self.start
     }
+
+    /// A copy of this event as a new, unsynced, non-repeating event on
+    /// `calendar_id` starting at `start` (pasting and duplicating).
+    pub fn copy_as_new(&self, calendar_id: String, start: NaiveDateTime) -> Event {
+        Event {
+            id: format!("local:{}", uuid::Uuid::new_v4().simple()),
+            calendar_id,
+            start,
+            end: start + self.duration(),
+            remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
+            etag: None,
+            base: None,
+            recurrence: None,
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -280,6 +299,42 @@ impl Store {
         recurrence::occurrence(self.event(series)?, id)
     }
 
+    /// The next (or previous) occurrence of the repeating event that the
+    /// shown event `id` is part of. It looks at a series stored here (expanded
+    /// into its occurrences) as well as stored events of the same series
+    /// (occurrences Google sent one by one, or ones changed on their own).
+    pub fn adjacent_occurrence(&self, id: &str, forward: bool) -> Option<Event> {
+        /// How far ahead to look for the next occurrence.
+        const HORIZON_DAYS: i64 = 6 * 366;
+        let ev = self.find_event(id)?;
+        let series_id = match recurrence::split_occurrence(id) {
+            Some((series, _)) if self.event(id).is_none() => series.to_owned(),
+            _ if ev.recurrence.is_some() => ev.id.clone(),
+            _ => ev.recurring_id.clone()?,
+        };
+        let mut found: Vec<Event> = self
+            .events
+            .iter()
+            .filter(|e| e.id != ev.id && e.recurrence.is_none() && e.calendar_id == ev.calendar_id)
+            .filter(|e| e.recurring_id.as_deref() == Some(series_id.as_str()))
+            .cloned()
+            .collect();
+        if let Some(series) = self.event(&series_id).filter(|s| s.recurrence.is_some()) {
+            let (from, to) = if forward {
+                (ev.start, ev.start + Duration::days(HORIZON_DAYS))
+            } else {
+                (series.start.min(ev.start) - Duration::days(1), ev.start)
+            };
+            found.extend(recurrence::occurrences(series, from, to));
+        }
+        let found = found.into_iter().filter(|e| e.id != id);
+        if forward {
+            found.filter(|e| e.start > ev.start).min_by_key(|e| e.start)
+        } else {
+            found.filter(|e| e.start < ev.start).max_by_key(|e| e.start)
+        }
+    }
+
     /// The Google calendar id an event lives on, if any.
     pub fn google_calendar_of(&self, ev: &Event) -> Option<String> {
         self.calendar(&ev.calendar_id).and_then(|c| c.google_id()).map(str::to_owned)
@@ -296,5 +351,112 @@ impl Store {
 
     pub fn writable_calendars(&self) -> impl Iterator<Item = &Calendar> {
         self.calendars.iter().filter(|c| !c.read_only)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recurrence::{Freq, Recurrence};
+
+    fn t(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap()
+    }
+
+    fn event(id: &str, start: &str, end: &str) -> Event {
+        Event {
+            id: id.into(),
+            calendar_id: "local:home".into(),
+            title: id.into(),
+            start: t(start),
+            end: t(end),
+            all_day: false,
+            location: "Room 1".into(),
+            notes: String::new(),
+            remote_id: None,
+            recurring_id: None,
+            pending: false,
+            rev: 0,
+            etag: None,
+            base: None,
+            recurrence: None,
+            time_zone: None,
+        }
+    }
+
+    fn store(events: Vec<Event>) -> Store {
+        Store { events, ..Store::with_defaults() }
+    }
+
+    #[test]
+    fn steps_through_a_series_stored_here() {
+        let series = Event { recurrence: Some(Recurrence::new(Freq::Weekly)), ..event("s", "2026-11-02 12:00", "2026-11-02 13:00") };
+        let s = store(vec![series]);
+        let second = recurrence::occurrence_id("s", t("2026-11-09 12:00"));
+        let next = s.adjacent_occurrence(&second, true).unwrap();
+        assert_eq!(next.start, t("2026-11-16 12:00"));
+        assert_eq!(next.id, recurrence::occurrence_id("s", t("2026-11-16 12:00")));
+        let prev = s.adjacent_occurrence(&second, false).unwrap();
+        assert_eq!(prev.start, t("2026-11-02 12:00"));
+        assert!(s.adjacent_occurrence(&prev.id, false).is_none(), "nothing before the first");
+    }
+
+    #[test]
+    fn skips_removed_occurrences_and_finds_detached_ones() {
+        // Daily at 09:00; the 3rd was deleted and the 4th moved to 15:00 on its own.
+        let mut rule = Recurrence::new(Freq::Daily);
+        rule.exceptions.push(t("2026-11-03 09:00"));
+        rule.exceptions.push(t("2026-11-04 09:00"));
+        let series = Event { recurrence: Some(rule), ..event("s", "2026-11-02 09:00", "2026-11-02 09:30") };
+        let detached = Event { recurring_id: Some("s".into()), ..event("d", "2026-11-04 15:00", "2026-11-04 15:30") };
+        let s = store(vec![series, detached]);
+        let first = recurrence::occurrence_id("s", t("2026-11-02 09:00"));
+        assert_eq!(s.adjacent_occurrence(&first, true).unwrap().id, "d");
+        assert_eq!(s.adjacent_occurrence("d", true).unwrap().start, t("2026-11-05 09:00"));
+        assert_eq!(s.adjacent_occurrence("d", false).unwrap().id, first);
+    }
+
+    #[test]
+    fn steps_through_occurrences_google_sent_one_by_one() {
+        let occ = |id: &str, day: &str| Event {
+            recurring_id: Some("g".into()),
+            ..event(id, &format!("{day} 10:00"), &format!("{day} 11:00"))
+        };
+        // Same series id on another calendar: a different series.
+        let other = Event { calendar_id: "local:work".into(), ..occ("x", "2026-11-05") };
+        let s = store(vec![occ("a", "2026-11-01"), occ("c", "2026-11-15"), occ("b", "2026-11-08"), other]);
+        assert_eq!(s.adjacent_occurrence("a", true).unwrap().id, "b");
+        assert_eq!(s.adjacent_occurrence("b", true).unwrap().id, "c");
+        assert_eq!(s.adjacent_occurrence("c", false).unwrap().id, "b");
+        assert!(s.adjacent_occurrence("c", true).is_none());
+    }
+
+    #[test]
+    fn single_events_have_no_occurrences() {
+        let s = store(vec![event("e", "2026-11-02 09:00", "2026-11-02 10:00")]);
+        assert!(s.adjacent_occurrence("e", true).is_none());
+        assert!(s.adjacent_occurrence("e", false).is_none());
+    }
+
+    #[test]
+    fn copies_are_new_single_events() {
+        let ev = Event {
+            remote_id: Some("r".into()),
+            recurring_id: Some("g".into()),
+            etag: Some("e".into()),
+            pending: true,
+            rev: 4,
+            recurrence: Some(Recurrence::new(Freq::Daily)),
+            time_zone: Some("Europe/Amsterdam".into()),
+            ..event("e", "2026-11-02 09:00", "2026-11-02 10:30")
+        };
+        let c = ev.copy_as_new("local:work".into(), t("2026-11-20 14:00"));
+        assert_ne!(c.id, ev.id);
+        assert!(c.id.starts_with("local:"));
+        assert_eq!((c.start, c.end), (t("2026-11-20 14:00"), t("2026-11-20 15:30")));
+        assert_eq!((c.title.as_str(), c.location.as_str(), c.calendar_id.as_str()), ("e", "Room 1", "local:work"));
+        assert_eq!(c.time_zone.as_deref(), Some("Europe/Amsterdam"));
+        assert!(c.remote_id.is_none() && c.recurring_id.is_none() && c.etag.is_none() && c.recurrence.is_none());
+        assert!(!c.pending && c.rev == 0);
     }
 }

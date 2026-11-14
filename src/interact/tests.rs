@@ -531,3 +531,77 @@ fn clicks_go_to_the_event_drawn_on_top() {
     let upper = Pos2::new(above.center().x, below.top() + 6.0);
     assert_eq!(sim.click(upper), vec![Action::Select(Some("nvidia".into()))]);
 }
+
+// ---------------------------------------------------------------------------
+// Right-click menus
+
+#[test]
+fn right_click_on_an_event_selects_it_and_opens_its_menu() {
+    let mut sim = Sim::week(vec![event("lunch", "2026-11-10 11:45", "2026-11-10 12:30")]);
+    let pos = sim.body("lunch");
+    let out = sim.send(Input::ContextPress { pos });
+    assert_eq!(
+        out,
+        vec![Action::Select(Some("lunch".into())), Action::ContextMenu { at: MenuAt::Event("lunch".into()), pos }]
+    );
+}
+
+#[test]
+fn right_click_works_on_read_only_events_too() {
+    let mut sim = Sim::week(vec![event("holiday", "2026-11-10 09:00", "2026-11-10 10:00")]);
+    sim.read_only.push("holiday".into());
+    let pos = sim.body("holiday");
+    let out = sim.send(Input::ContextPress { pos });
+    assert_eq!(out.last(), Some(&Action::ContextMenu { at: MenuAt::Event("holiday".into()), pos }));
+}
+
+#[test]
+fn right_click_on_empty_space_offers_that_time_or_day() {
+    let mut sim = Sim::week(vec![]);
+    // The hour grid: the time under the pointer, to the quarter hour.
+    let pos = sim.at("2026-11-11", "14:20");
+    let out = sim.send(Input::ContextPress { pos });
+    assert_eq!(out, vec![Action::Select(None), Action::ContextMenu { at: MenuAt::Time(t("2026-11-11 14:15")), pos }]);
+    // The all-day lane: that day, all-day.
+    let lane = sim.layout().rects.allday;
+    let pos = Pos2::new(sim.column("2026-11-12", 0.0).x, lane.center().y);
+    let out = sim.send(Input::ContextPress { pos });
+    assert_eq!(out.last(), Some(&Action::ContextMenu { at: MenuAt::Day { day: d("2026-11-12"), all_day: true }, pos }));
+}
+
+#[test]
+fn right_click_in_the_month_view() {
+    let events = vec![event("standup", "2026-11-10 09:00", "2026-11-10 10:00")];
+    let lay = month_hits(&events);
+    let mut p = Pointer::default();
+    let pos = lay.rows[0].rect.center();
+    assert_eq!(
+        p.handle(Input::ContextPress { pos }, &lay.hits),
+        vec![Action::Select(Some("standup".into())), Action::ContextMenu { at: MenuAt::Event("standup".into()), pos }]
+    );
+    let pos = month_blank(&lay, "2026-11-19");
+    assert_eq!(
+        p.handle(Input::ContextPress { pos }, &lay.hits),
+        vec![Action::Select(None), Action::ContextMenu { at: MenuAt::Day { day: d("2026-11-19"), all_day: false }, pos }]
+    );
+}
+
+#[test]
+fn right_click_during_a_drag_is_ignored() {
+    let mut sim = Sim::week(vec![event("lunch", "2026-11-10 11:45", "2026-11-10 12:30")]);
+    let grab = sim.body("lunch");
+    sim.press(grab);
+    sim.move_to(grab + Vec2::new(0.0, 30.0));
+    assert_eq!(sim.send(Input::ContextPress { pos: grab }), vec![]);
+    assert_eq!(sim.release(), vec![Action::Committed("lunch".into())]);
+}
+
+#[test]
+fn right_click_breaks_up_a_double_click() {
+    let mut sim = Sim::week(vec![event("lunch", "2026-11-10 11:45", "2026-11-10 12:30")]);
+    let pos = sim.body("lunch");
+    sim.click(pos);
+    sim.send(Input::ContextPress { pos });
+    sim.press(pos);
+    assert_eq!(sim.release(), vec![Action::Select(Some("lunch".into()))], "not an Open");
+}
