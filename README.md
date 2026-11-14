@@ -14,6 +14,10 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar and notes.
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
 - **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
+- **Settings** (⚙ in the toolbar, or Ctrl+,), laid out like macOS Calendar's:
+  - *General:* 5 or 7 days per week, the first day of the week (or the Windows region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar, and whether to show Google's birthdays and holidays calendars.
+  - *Accounts:* add (+) or remove (−) the Google account, switch it off, give it a name, and choose how often it refreshes (every minute to hourly, or manually).
+  - *Advanced:* shade busy days in the year view, and show week numbers in the week and month views.
 - **Google Calendar:** OAuth sign-in in your browser (loopback + PKCE), imports all your calendars, and sends creates, edits, moves and deletes back to Google. Read-only calendars (holidays, shared calendars) are shown but can't be edited.
 - Follows the system light/dark mode and uses the platform UI font (Segoe UI on Windows).
 
@@ -34,6 +38,7 @@ The MSVC toolchain works too if you have the Visual Studio C++ Build Tools.
 |---|---|
 | Ctrl+1 / 2 / 3 / 4 | Day / Week / Month / Year |
 | Ctrl+T | Go to today |
+| Ctrl+, | Settings |
 | Ctrl+N | New event |
 | ← / → | Previous / next period |
 | Delete / Backspace | Delete the selected event |
@@ -51,14 +56,14 @@ Google requires every app to have its own OAuth client:
 1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and **enable the Google Calendar API**.
 2. Configure the **OAuth consent screen** (External is fine) and add your Google account as a **test user**.
 3. Go to **Credentials → Create credentials → OAuth client ID**, application type **Desktop app**.
-4. In CleanCalendar click **Connect Google**, paste the client ID and secret, and click **Sign in with Google**.
+4. In CleanCalendar open **Settings → Accounts**, click **+**, choose Google, paste the client ID and secret, and click **Sign in with Google**.
 
 ### How sync works
 
 - **Your changes** (create, edit, move, resize, delete, change calendar) are uploaded right away and marked *pending* until Google confirms them.
   If Google can't be reached, they stay pending and are retried every minute. The toolbar shows "N changes not yet on Google".
   Pending changes survive restarts, and a sync never overwrites an event that has unsent edits.
-- **Changes from elsewhere** (phone, web, other people) are pulled on launch, every 5 minutes, and when you press ⟳.
+- **Changes from elsewhere** (phone, web, other people) are pulled on launch, every 5 minutes (change it under Settings → Accounts → Refresh Calendars), and when you press ⟳.
   After the first full download, each calendar syncs incrementally using Google's sync tokens, so only changed events are fetched.
   A full re-download runs weekly, when Google expires a token, or after Google rejects a change.
   The full download covers 6 months back to 12 months ahead.
@@ -74,7 +79,7 @@ Google requires every app to have its own OAuth client:
 
 Data is kept in two SQLite databases, split by who owns it:
 
-- **`data.db`: things only this computer has.** Google sign-in settings (client id, account), the calendar list (with your colours and which are shown), events on local calendars, and changes to Google events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\` on Windows (`~/Library/Application Support/CleanCalendar/` on macOS, `~/.local/share/cleancalendar/` on Linux).
+- **`data.db`: things only this computer has.** Your settings, Google sign-in settings (client id, account), the calendar list (with your colours and which are shown), events on local calendars, and changes to Google events that haven't been uploaded yet. Lives in `%APPDATA%\CleanCalendar\` on Windows (`~/Library/Application Support/CleanCalendar/` on macOS, `~/.local/share/cleancalendar/` on Linux).
 - **`cache.db`: a copy of Google.** Google events as last downloaded, plus the sync tokens. Lives in `%LOCALAPPDATA%\CleanCalendar\` on Windows (`~/Library/Caches/CleanCalendar/` on macOS, `~/.cache/cleancalendar/` on Linux), so it isn't carried around in a roaming profile. It is safe to delete: the next sync downloads everything again. If it can't be read, it is started over automatically.
 - **The Google refresh token** is kept in the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux) under `CleanCalendar` / `google-refresh-token`, not in either file. If no credential store is available it falls back to `data.db` (with a warning), and moves into the credential store once one works.
 
@@ -87,7 +92,9 @@ Set `CLEANCALENDAR_DATA=<dir>` to put both files in one folder of your choice (t
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Window setup |
-| `src/app.rs` | App state, toolbar, sidebar, event editor, Google dialog, sync merge |
+| `src/app.rs` | App state, toolbar, sidebar, event editor, sync merge |
+| `src/app/settings_window.rs` | The Settings window (General, Accounts with the add-account sheet, Advanced) |
+| `src/settings.rs` | The user's preferences and their defaults |
 | `src/views.rs` | Painting: month grid, day/week time grid, year view, mini-month |
 | `src/layout.rs` | Pure geometry: where events and cells go, and what each screen area means to the pointer |
 | `src/interact.rs` | Pointer interaction (clicks, double-clicks, drags) as a testable state machine |

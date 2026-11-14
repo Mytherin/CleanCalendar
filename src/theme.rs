@@ -23,6 +23,8 @@ pub struct Palette {
     pub grid: Color32,
     /// The line under the all-day lane.
     pub grid_strong: Color32,
+    /// Hours outside the working day in the day/week grid.
+    pub off_hours: Color32,
     /// Weekend cells in the month view.
     pub weekend: Color32,
     pub text: Color32,
@@ -54,6 +56,7 @@ impl Palette {
                 grid: Color32::from_rgb(0x3A, 0x3D, 0x40),
                 grid_strong: Color32::from_rgb(0x4A, 0x4D, 0x50),
                 weekend: Color32::from_rgb(0x2B, 0x2E, 0x30),
+                off_hours: Color32::from_rgb(0x1C, 0x1F, 0x21),
                 text: Color32::from_rgb(0xDE, 0xDE, 0xDF),
                 secondary: Color32::from_rgb(0x9D, 0x9F, 0x9F),
                 tertiary: Color32::from_rgb(0x5A, 0x5D, 0x60),
@@ -74,6 +77,7 @@ impl Palette {
                 grid: Color32::from_rgb(0xE6, 0xE6, 0xE6),
                 grid_strong: Color32::from_rgb(0xD1, 0xD1, 0xD6),
                 weekend: Color32::from_rgb(0xF7, 0xF7, 0xF7),
+                off_hours: Color32::from_rgb(0xF2, 0xF2, 0xF4),
                 text: Color32::from_rgb(0x1D, 0x1D, 0x1F),
                 secondary: Color32::from_rgb(0x8E, 0x8E, 0x93),
                 tertiary: Color32::from_rgb(0xC7, 0xC7, 0xCC),
