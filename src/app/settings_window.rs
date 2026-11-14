@@ -681,7 +681,8 @@ impl App {
                 self.status = None;
                 self.store.save();
                 let g = &self.store.google;
-                self.worker.send(Cmd::ConnectGoogle { client_id: g.client_id.clone(), client_secret: g.client_secret.clone() });
+                let (client_id, client_secret) = crate::google::client(&g.client_id, &g.client_secret);
+                self.worker.send(Cmd::ConnectGoogle { client_id, client_secret });
             }
             Some(provider) => {
                 let f = &mut self.settings_ui.form;
@@ -798,29 +799,39 @@ impl App {
 
     /// Google's sign-in form; returns whether "Sign in" can be pressed.
     fn google_form(&mut self, ui: &mut Ui, p: &Palette) -> bool {
-        ui.label("CleanCalendar talks to Google with your own OAuth client:");
+        ui.label("Your browser opens so you can sign in to Google and allow CleanCalendar to use your calendars.");
         ui.add_space(4.0);
-        for line in [
-            "1. In Google Cloud Console, create a project and enable the Google Calendar API.",
-            "2. Configure the OAuth consent screen and add yourself as a test user.",
-            "3. Create Credentials → OAuth client ID → Application type “Desktop app”.",
-            "4. Paste the client ID and secret below, then sign in.",
-        ] {
-            ui.label(RichText::new(line).color(p.secondary));
-        }
-        ui.hyperlink_to("Open Google Cloud Console", "https://console.cloud.google.com/apis/credentials");
+        ui.label(
+            RichText::new("CleanCalendar never sees your password, and you can revoke access any time in your Google Account.")
+                .color(p.secondary),
+        );
         ui.add_space(10.0);
         let g = &mut self.store.google;
         let field_w = ui.available_width() - SHEET_LABEL_W - 16.0;
-        form_row(ui, p, SHEET_LABEL_W, "Client ID", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut g.client_id).hint_text("Required").desired_width(field_w - 8.0));
-        });
-        form_row(ui, p, SHEET_LABEL_W, "Client Secret", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut g.client_secret).password(true).desired_width(field_w - 8.0));
-        });
+        egui::CollapsingHeader::new("Use your own OAuth client")
+            .id_salt("google-own-client")
+            .default_open(!g.client_id.trim().is_empty())
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Optional. Create a “Desktop app” OAuth client with the Google Calendar API enabled.")
+                        .color(p.secondary),
+                );
+                ui.hyperlink_to("Open Google Cloud Console", "https://console.cloud.google.com/apis/credentials");
+                ui.add_space(4.0);
+                form_row(ui, p, SHEET_LABEL_W, "Client ID", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut g.client_id)
+                            .hint_text("CleanCalendar's own")
+                            .desired_width(field_w - 8.0),
+                    );
+                });
+                form_row(ui, p, SHEET_LABEL_W, "Client Secret", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut g.client_secret).password(true).desired_width(field_w - 8.0));
+                });
+            });
         let busy = self.worker.busy > 0;
         sheet_status(ui, p, busy, "Waiting for the browser…", &self.status, None);
-        !busy && !g.client_id.trim().is_empty()
+        !busy
     }
 
     /// A CalDAV sign-in (iCloud, Yahoo, AOL, or any server); returns

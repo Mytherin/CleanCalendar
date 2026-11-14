@@ -324,6 +324,7 @@ impl Event {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GoogleSettings {
+    /// A custom OAuth client; empty means CleanCalendar's own.
     pub client_id: String,
     pub client_secret: String,
     pub refresh_token: Option<String>,
@@ -548,9 +549,10 @@ impl Store {
     pub fn login(&self, account: &str) -> Option<Login> {
         if account == GOOGLE {
             let g = &self.google;
+            let (client_id, client_secret) = google::client(&g.client_id, &g.client_secret);
             return Some(Login::Google(google::Creds {
-                client_id: g.client_id.clone(),
-                client_secret: g.client_secret.clone(),
+                client_id,
+                client_secret,
                 refresh_token: g.refresh_token.clone()?,
             }));
         }

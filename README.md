@@ -65,12 +65,9 @@ For another CalDAV server choose **Other CalDAV server** and enter its address (
 
 ## Connecting Google Calendar
 
-Google requires every app to have its own OAuth client:
+In CleanCalendar open **Settings → Accounts**, click **+**, choose Google, and click **Sign in with Google** (**Accounts → Connect Google Calendar** in the toolbar does the same). Your browser opens on Google's sign-in page; once you allow access, CleanCalendar gets a token for your calendars. It never sees your Google password, and you can revoke access any time under **Security → Third-party apps** in your Google Account. Google doesn't let calendar apps sign in with a password, so there's no username/password form like iCloud's.
 
-1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and **enable the Google Calendar API**.
-2. Configure the **OAuth consent screen** (External is fine) and add your Google account as a **test user**.
-3. Go to **Credentials → Create credentials → OAuth client ID**, application type **Desktop app**.
-4. In CleanCalendar open **Settings → Accounts**, click **+**, choose Google, paste the client ID and secret, and click **Sign in with Google**. (**Accounts → Connect Google Calendar** in the toolbar does the same.)
+CleanCalendar ships its own OAuth client (type *Desktop app*). For an installed app Google treats the client secret as public; PKCE and the loopback redirect are what protect the sign-in. To use your own client instead, expand **Use your own OAuth client** on the sign-in sheet and paste its ID and secret, or build with `CLEANCALENDAR_GOOGLE_CLIENT_ID` and `CLEANCALENDAR_GOOGLE_CLIENT_SECRET` set. To make one: in [Google Cloud Console](https://console.cloud.google.com/) create a project, enable the **Google Calendar API**, configure the **OAuth consent screen**, and create **Credentials → OAuth client ID** of type **Desktop app**.
 
 Google keeps using Google's own REST API rather than its CalDAV endpoint: it's richer (colours, sync tokens, structured JSON) and needs the same OAuth sign-in anyway.
 
