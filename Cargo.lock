@@ -781,6 +781,7 @@ dependencies = [
  "iana-time-zone",
  "keyring",
  "open",
+ "png 0.17.16",
  "quick-xml 0.37.5",
  "raw-window-handle",
  "reqwest",
