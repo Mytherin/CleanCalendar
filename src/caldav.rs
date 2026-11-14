@@ -113,15 +113,18 @@ impl Client {
     /// Sends a request, following redirects with the same method and body.
     /// Returns the URL that answered and the response.
     fn send(&self, method: &str, url: &Url, headers: &[(&str, &str)], body: Option<(&str, String)>) -> Result<(Url, Response)> {
-        let method = Method::from_bytes(method.as_bytes())?;
+        let mut method = Method::from_bytes(method.as_bytes())?;
+        let mut body = body;
         let mut url = url.clone();
+        let origin = url.clone();
         for _ in 0..8 {
             let mut h = HeaderMap::new();
             for (k, v) in headers {
                 h.insert(HeaderName::from_bytes(k.as_bytes())?, HeaderValue::from_str(v)?);
             }
             let mut req = self.http.request(method.clone(), url.clone()).headers(h);
-            if !self.login.username.is_empty() || !self.login.password.is_empty() {
+            let has_login = !self.login.username.is_empty() || !self.login.password.is_empty();
+            if has_login && may_receive_login(&origin, &url) {
                 req = req.basic_auth(&self.login.username, Some(&self.login.password));
             }
             if let Some((ctype, text)) = &body {
@@ -135,6 +138,11 @@ impl Client {
                     // Never send the password on in the clear.
                     if url.scheme() == "https" && next.scheme() != "https" {
                         return Err(anyhow!("{url} redirected to an insecure address ({next})"));
+                    }
+                    // 303 means "go GET this instead".
+                    if status == 303 {
+                        method = Method::GET;
+                        body = None;
                     }
                     url = next;
                     continue;
@@ -215,7 +223,13 @@ impl Client {
     }
 
     fn calendar_url(cal: &CalRef) -> Result<Url> {
-        Url::parse(&cal.id).map_err(|e| anyhow!("bad calendar URL {}: {e}", cal.id))
+        let mut url = Url::parse(&cal.id).map_err(|e| anyhow!("bad calendar URL {}: {e}", cal.id))?;
+        // Also for calendars stored before collection URLs were normalized.
+        if !url.path().ends_with('/') {
+            let path = format!("{}/", url.path());
+            url.set_path(&path);
+        }
+        Ok(url)
     }
 
     /// An href as the app keeps it: the resolved path.
@@ -284,12 +298,42 @@ fn utc_stamp(d: NaiveDate) -> String {
     format!("{}Z", d.and_time(NaiveTime::MIN).format("%Y%m%dT%H%M%S"))
 }
 
+/// Whether a request redirected from `origin` to `to` may carry the login:
+/// the same host, or a sibling under the same parent domain (iCloud sends
+/// caldav.icloud.com to p42-caldav.icloud.com). Elsewhere it would hand the
+/// password to whatever host a redirect names.
+fn may_receive_login(origin: &Url, to: &Url) -> bool {
+    let (Some(a), Some(b)) = (origin.host_str(), to.host_str()) else { return false };
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    // "caldav.icloud.com" → "icloud.com". IP addresses and single-label
+    // hosts only match themselves. Without a public-suffix list, a parent
+    // that looks like a country's second level ("co.uk", "com.au") is not
+    // trusted either, so "dav.example.co.uk" can't send it to all of "co.uk".
+    if a.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    let Some((_, parent)) = a.split_once('.') else { return false };
+    let labels: Vec<&str> = parent.split('.').collect();
+    let looks_like_public_suffix = labels.len() < 2
+        || (labels.len() == 2 && labels[1].len() == 2 && labels[0].len() <= 3);
+    !looks_like_public_suffix && b.to_ascii_lowercase().ends_with(&format!(".{}", parent.to_ascii_lowercase()))
+}
+
 /// The UID for a new event: its local id's hex part, so a retried create
 /// lands on the same resource.
+/// Other ids (an event moved here from another calendar, or recreated after
+/// a delete elsewhere, keeps its old id) get a UID derived from that id, so
+/// a retry also lands on the same resource instead of duplicating it.
 fn uid_for(local_id: &str) -> String {
     match local_id.strip_prefix("local:") {
         Some(hex) if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_alphanumeric()) => hex.to_owned(),
-        _ => uuid::Uuid::new_v4().simple().to_string(),
+        _ => {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(local_id.as_bytes());
+            digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+        }
     }
 }
 
@@ -299,7 +343,14 @@ impl Remote for Client {
         let (at, rs) = self.propfind(&home, "1", xml::CALENDARS)?;
         let mut out: Vec<(i64, RemoteCalendar)> = Vec::new();
         for r in &rs {
-            let Ok(url) = at.join(&r.href) else { continue };
+            let Ok(mut url) = at.join(&r.href) else { continue };
+            // A collection is a folder: without the slash, joining an event's
+            // name to it would replace its last segment (PUT /cal/x.ics
+            // instead of /cal/work/x.ics).
+            if !url.path().ends_with('/') {
+                let path = format!("{}/", url.path());
+                url.set_path(&path);
+            }
             if url.path() == home.path() {
                 continue;
             }
@@ -515,16 +566,40 @@ mod unit_tests {
         assert_eq!(parse_color("#1badf8"), Some([0x1B, 0xAD, 0xF8]));
         assert_eq!(parse_color("red"), None);
         assert_eq!(parse_color("#abcde€"), None, "8 bytes, but byte 6 is inside '€'");
+    }
+
+    #[test]
+    fn redirects_only_carry_the_login_to_related_hosts() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        let ok = |a: &str, b: &str| may_receive_login(&u(a), &u(b));
+        assert!(ok("https://caldav.icloud.com/", "https://p42-caldav.icloud.com/x"), "iCloud's partition hosts");
+        assert!(ok("https://dav.fastmail.com/", "https://dav.fastmail.com/dav/"));
+        assert!(!ok("https://caldav.icloud.com/", "https://evil.example.com/"));
+        assert!(!ok("https://icloud.com/", "https://evil.com/"), "parent of a two-label host is a TLD");
+        assert!(!ok("https://dav.example.co.uk/", "https://evil.co.uk/"));
+        assert!(!ok("http://127.0.0.1:8080/", "http://127.0.0.2/"));
+        assert!(ok("http://127.0.0.1:8080/", "http://127.0.0.1:9090/"), "same host, other port");
+    }
+
+    #[test]
+    fn events_go_inside_a_calendar_listed_without_a_trailing_slash() {
+        let cal = CalRef::new("caldav-1", "https://dav.example.com/cal/work");
+        let url = Client::resource_url(&Client::calendar_url(&cal).unwrap(), "abc.ics").unwrap();
+        assert_eq!(url.as_str(), "https://dav.example.com/cal/work/abc.ics");
+    }
+
+    #[test]
+    fn new_resource_ids_are_stable_across_retries() {
+        assert_eq!(uid_for("local:0123abcd"), "0123abcd");
+        // Moved or recreated events keep a non-local id; a retried create
+        // must still land on the same resource.
+        let moved = "caldav-1:https://h/cal/:/cal/a.ics";
+        assert_eq!(uid_for(moved), uid_for(moved));
+        assert_ne!(uid_for(moved), uid_for("caldav-1:https://h/cal/:/cal/b.ics"));
         assert_eq!(normalize_server("caldav.icloud.com").unwrap().as_str(), "https://caldav.icloud.com/");
         assert_eq!(normalize_server("http://127.0.0.1:5232/dav").unwrap().as_str(), "http://127.0.0.1:5232/dav/");
         assert!(normalize_server("http://").is_err());
         assert_eq!(utc_stamp(NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()), "20260501T000000Z");
-    }
-
-    #[test]
-    fn new_events_get_a_stable_uid() {
-        assert_eq!(uid_for("local:0123abcd"), "0123abcd");
-        assert_ne!(uid_for("weird id"), uid_for("weird id"), "random when there's nothing to derive it from");
     }
 
     #[test]
