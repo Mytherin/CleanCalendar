@@ -435,15 +435,6 @@ impl App {
 
     // ---- Accounts -----------------------------------------------------------
 
-    /// Settings → Accounts; with no accounts yet, straight to "Add Account".
-    pub(super) fn open_accounts(&mut self) {
-        self.open_settings();
-        self.settings_ui.tab = Tab::Accounts;
-        if self.account_ids().is_empty() && self.settings_ui.adding.is_none() {
-            self.settings_ui.adding = Some(AddStep::Provider(None));
-        }
-    }
-
     /// Every signed-in account, Google first (as in the sidebar).
     fn account_ids(&self) -> Vec<String> {
         let google = self.store.google.is_connected().then(|| GOOGLE.to_owned());
