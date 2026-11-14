@@ -9,6 +9,7 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Sidebar** with calendar visibility checkboxes, a right-click menu for color and delete, and a mini-month navigator.
 - **Week/Day time grid:** overlapping events sit side by side; all-day and multi-day events span the all-day lane.
 - **Direct manipulation:** drag on empty space to create an event, drag an event to move it, drag its bottom edge to resize. Everything snaps to 15 minutes.
+- **Right-click menu** like Apple Calendar's: Get Info, move to another calendar, Delete, Cut, Copy, Paste, Duplicate, go to the next/previous occurrence of a repeating event, and e-mail the event (or its series). Right-click on empty space to create an event or paste there.
 - **Month view:** multi-day banners span across days, timed events show a colored dot and their time, and overflow collapses to "N more".
 - **Event editor:** title, location, all-day, start/end date and time, time zone, repeat, calendar and notes.
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
@@ -36,7 +37,11 @@ The MSVC toolchain works too if you have the Visual Studio C++ Build Tools.
 | Ctrl+N | New event |
 | ← / → | Previous / next period |
 | Delete / Backspace | Delete the selected event |
+| Ctrl+X / C / V | Cut / copy the selected event, paste it (onto the selected event's day, at its own time) |
+| Ctrl+D | Duplicate the selected event |
+| Ctrl+] / Ctrl+[ | Next / previous occurrence of a repeating event |
 | Double-click | Open an event, or create one on empty space |
+| Right-click | The event's menu, or New Event / Paste on empty space |
 | Esc / Enter (in title) | Cancel / save in the editor |
 
 ## Connecting Google Calendar

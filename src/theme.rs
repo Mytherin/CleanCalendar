@@ -5,6 +5,9 @@ use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId}
 /// Today markers and the year view's month names (macOS dark-mode red).
 pub const RED: Color32 = Color32::from_rgb(0xEB, 0x53, 0x4E);
 pub const ACCENT: Color32 = Color32::from_rgb(0x00, 0x7A, 0xFF);
+/// The hovered row of a menu: the red macOS Calendar uses for its menu
+/// highlight, whatever the calendar's own color.
+pub const MENU_HIGHLIGHT: Color32 = Color32::from_rgb(0xB8, 0x43, 0x40);
 
 /// Colors measured from macOS Calendar screenshots (dark mode), with a light
 /// counterpart.

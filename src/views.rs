@@ -187,7 +187,9 @@ fn draw_banner(ui: &Ui, painter: &egui::Painter, rect: Rect, ev: &Event, color: 
     draw_text_centered(ui, painter, rect.left() + 6.0, rect, &text, theme::bold_font(11.5), text_color, max_w);
 }
 
-fn hover_text(ev: &Event) -> String {
+/// The event's title, when it happens, how it repeats and where (its
+/// tooltip, and the start of the text it's shared as).
+pub(crate) fn hover_text(ev: &Event) -> String {
     let when = if ev.all_day {
         let last = last_day(ev.start, ev.end);
         if last == ev.start.date() {
@@ -235,16 +237,24 @@ fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
     let (events, time, any_down, latest) =
         ctx.input(|i| (i.events.clone(), i.time, i.pointer.any_down(), i.pointer.latest_pos()));
 
+    // Like macOS, a click outside an open context menu only closes it.
+    let menu_open = app.menu.is_some();
     let mut actions = Vec::new();
     let mut released = false;
     for event in events {
         let input = match event {
             egui::Event::PointerMoved(pos) => Input::Move { pos },
             egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, .. } => {
-                if !ours(pos) {
+                if !ours(pos) || menu_open {
                     continue;
                 }
                 Input::Press { pos }
+            }
+            egui::Event::PointerButton { pos, button: PointerButton::Secondary, pressed: true, .. } => {
+                if !ours(pos) {
+                    continue;
+                }
+                Input::ContextPress { pos }
             }
             egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, .. } => {
                 released = true;
@@ -270,7 +280,7 @@ fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
             Cursor::PointingHand => CursorIcon::PointingHand,
         });
     }
-    if let (false, Some(Target::Event { id, .. })) = (app.pointer.is_active(), target) {
+    if let (false, Some(Target::Event { id, .. })) = (app.pointer.is_active() || menu_open, target) {
         let still = ctx.input(|i| i.pointer.time_since_last_movement());
         if still < TOOLTIP_DELAY {
             ctx.request_repaint_after(std::time::Duration::from_secs_f32(TOOLTIP_DELAY - still));

@@ -10,6 +10,7 @@ use crate::app_icon::AppIcon;
 use crate::editor::{self, Editor, Outcome, Placement, Scope};
 use crate::dates::*;
 use crate::google::{self, Cmd, Worker};
+use crate::menu::{self, Command, ContextMenu, Icon, Item, MenuAt};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
 use crate::recurrence;
 use crate::sync::{Notice, SyncEngine};
@@ -56,6 +57,8 @@ pub enum Action {
     SetTimes { id: String, start: NaiveDateTime, end: NaiveDateTime },
     /// A drag finished changing this event.
     Committed(String),
+    /// Open the right-click menu for what's at `pos`.
+    ContextMenu { at: MenuAt, pos: egui::Pos2 },
 }
 
 pub struct App {
@@ -73,6 +76,11 @@ pub struct App {
     pub event_rects: HashMap<String, egui::Rect>,
     /// The last pointer position, to anchor the popover of a new event.
     last_pointer: Option<egui::Pos2>,
+    /// The open right-click menu, and its items (worked out when it opened).
+    pub menu: Option<ContextMenu>,
+    menu_items: Vec<Item>,
+    /// The event last copied or cut, for pasting.
+    clipboard: Option<Event>,
     sidebar_open: bool,
     mini_month: NaiveDate,
     worker: Worker,
@@ -99,6 +107,9 @@ impl App {
             editor: None,
             event_rects: HashMap::new(),
             last_pointer: None,
+            menu: None,
+            menu_items: Vec::new(),
+            clipboard: None,
             sidebar_open: true,
             mini_month: first_of_month(today),
             worker: Worker::spawn(cc.egui_ctx.clone(), google::Endpoints::from_env()),
@@ -194,16 +205,24 @@ impl App {
 
     // ---- Event operations -------------------------------------------------
 
-    fn new_event(&mut self, start: NaiveDateTime, end: NaiveDateTime, all_day: bool) {
-        let calendar_id = self
-            .selected
+    /// The calendar new events go on: the selected event's, else the first
+    /// visible one that can be written to.
+    fn default_calendar(&self) -> Option<String> {
+        self.selected
             .as_ref()
             .and_then(|id| self.store.find_event(id))
             .map(|e| e.calendar_id)
-            .filter(|cid| self.store.calendar(cid).is_some_and(|c| !c.read_only))
+            .filter(|cid| self.is_writable(cid))
             .or_else(|| self.store.writable_calendars().find(|c| c.visible).map(|c| c.id.clone()))
-            .or_else(|| self.store.writable_calendars().next().map(|c| c.id.clone()));
-        let Some(calendar_id) = calendar_id else { return };
+            .or_else(|| self.store.writable_calendars().next().map(|c| c.id.clone()))
+    }
+
+    fn is_writable(&self, calendar_id: &str) -> bool {
+        self.store.calendar(calendar_id).is_some_and(|c| !c.read_only)
+    }
+
+    fn new_event(&mut self, start: NaiveDateTime, end: NaiveDateTime, all_day: bool) {
+        let Some(calendar_id) = self.default_calendar() else { return };
         let draft = Event {
             id: format!("local:{}", uuid::Uuid::new_v4().simple()),
             calendar_id,
@@ -454,6 +473,193 @@ impl App {
         self.flush();
     }
 
+    // ---- The right-click menu and the edit commands -----------------------
+
+    /// What the right-click menu offers for `at`, as in macOS Calendar.
+    fn menu_items_for(&self, at: &MenuAt) -> Vec<Item> {
+        let can_create = self.store.writable_calendars().next().is_some();
+        let can_paste = can_create && self.clipboard.is_some();
+        let id = match at {
+            MenuAt::Event(id) => id,
+            MenuAt::Time(_) | MenuAt::Day { .. } => {
+                return vec![
+                    Item::new(Icon::Plus, "New Event", can_create, Command::NewEvent),
+                    Item::Separator,
+                    Item::new(Icon::Paste, "Paste", can_paste, Command::Paste),
+                ];
+            }
+        };
+        let Some(ev) = self.store.find_event(id) else { return Vec::new() };
+        let writable = !self.is_read_only(&ev);
+        let mut items = vec![
+            Item::new(Icon::Info, "Get Info", true, Command::GetInfo),
+            Item::Calendars { enabled: writable, current: ev.calendar_id.clone() },
+            Item::Separator,
+            Item::new(Icon::Trash, "Delete", writable, Command::Delete),
+            Item::new(Icon::Scissors, "Cut", writable, Command::Cut),
+            Item::new(Icon::Copy, "Copy", true, Command::Copy),
+            Item::new(Icon::Paste, "Paste", can_paste, Command::Paste),
+            Item::new(Icon::Duplicate, "Duplicate", can_create, Command::Duplicate),
+        ];
+        if ev.repeats() {
+            let next = self.store.adjacent_occurrence(id, true).is_some();
+            let prev = self.store.adjacent_occurrence(id, false).is_some();
+            items.extend([
+                Item::Separator,
+                Item::new(Icon::Next, "Go to Next Occurrence", next, Command::NextOccurrence).shortcut("Ctrl+]"),
+                Item::new(Icon::Previous, "Go to Previous Occurrence", prev, Command::PreviousOccurrence).shortcut("Ctrl+["),
+            ]);
+        }
+        items.push(Item::Separator);
+        items.push(Item::new(Icon::Envelope, "Email Event", true, Command::EmailEvent));
+        if ev.repeats() {
+            items.push(Item::new(Icon::Envelopes, "Email Event Series", true, Command::EmailSeries));
+        }
+        // Events don't have participants here (yet), so these stay greyed
+        // out, as macOS shows them for events without any.
+        let none = Command::EmailEvent;
+        items.push(Item::new(Icon::EnvelopePerson, "Email All Participants", false, none.clone()));
+        items.push(Item::new(Icon::Bubble, "Message All Participants", false, none));
+        items
+    }
+
+    /// Draws the open right-click menu and runs what's picked from it.
+    fn context_menu(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(m) = self.menu.as_mut() else { return };
+        match menu::show(ctx, m, &self.menu_items, &self.store, p) {
+            menu::Outcome::Open => {}
+            menu::Outcome::Close => self.menu = None,
+            menu::Outcome::Run(cmd) => {
+                let at = self.menu.take().map(|m| m.at);
+                if let Some(at) = at {
+                    self.run_command(ctx, at, cmd);
+                }
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// Runs a command from the right-click menu or the keyboard.
+    fn run_command(&mut self, ctx: &egui::Context, at: MenuAt, cmd: Command) {
+        match (at, cmd) {
+            (MenuAt::Event(id), Command::GetInfo) => self.open_event(&id),
+            (MenuAt::Event(id), Command::MoveTo(cal)) => self.move_to_calendar(&id, &cal),
+            (MenuAt::Event(id), Command::Delete) => {
+                self.finish_editor(Outcome::Done);
+                self.delete_event(&id);
+            }
+            (MenuAt::Event(id), Command::Cut) => {
+                self.finish_editor(Outcome::Done);
+                if self.store.find_event(&id).is_some_and(|ev| !self.is_read_only(&ev)) {
+                    self.copy_event(ctx, &id);
+                    self.delete_event(&id);
+                }
+            }
+            (MenuAt::Event(id), Command::Copy) => self.copy_event(ctx, &id),
+            // Onto the right-clicked event's day, at the copied event's time.
+            (MenuAt::Event(id), Command::Paste) => {
+                if let Some(ev) = self.store.find_event(&id) {
+                    self.paste(ev.start.date(), None);
+                }
+            }
+            (MenuAt::Event(id), Command::Duplicate) => self.duplicate(&id),
+            (MenuAt::Event(id), Command::NextOccurrence) => self.go_to_occurrence(&id, true),
+            (MenuAt::Event(id), Command::PreviousOccurrence) => self.go_to_occurrence(&id, false),
+            (MenuAt::Event(id), Command::EmailEvent) => self.email(&id, false),
+            (MenuAt::Event(id), Command::EmailSeries) => self.email(&id, true),
+            (MenuAt::Time(t), Command::NewEvent) => self.new_event(t, t + Duration::hours(1), false),
+            (MenuAt::Day { day, all_day: true }, Command::NewEvent) => {
+                self.new_event(midnight(day), midnight(day) + Duration::days(1), true)
+            }
+            (MenuAt::Day { day, all_day: false }, Command::NewEvent) => {
+                let start = midnight(day) + Duration::hours(9);
+                self.new_event(start, start + Duration::hours(1), false);
+            }
+            (MenuAt::Time(t), Command::Paste) => self.paste(t.date(), Some(t)),
+            (MenuAt::Day { day, .. }, Command::Paste) => self.paste(day, None),
+            _ => {}
+        }
+        // The day view's inspector follows the selection.
+        if self.view == View::Day && self.editor.is_none() {
+            if let Some(id) = self.selected.clone() {
+                self.open_event(&id);
+            }
+        }
+    }
+
+    /// Moves an event to another calendar. A repeating event moves as a
+    /// whole series (as in macOS Calendar).
+    fn move_to_calendar(&mut self, id: &str, calendar_id: &str) {
+        self.finish_editor(Outcome::Done);
+        let target = match recurrence::split_occurrence(id) {
+            Some((series, _)) if is_occurrence(&self.store, id) => series.to_owned(),
+            _ => id.to_owned(),
+        };
+        let Some(mut ev) = self.store.event(&target).cloned() else { return };
+        if ev.calendar_id == calendar_id || self.is_read_only(&ev) || !self.is_writable(calendar_id) {
+            return;
+        }
+        ev.calendar_id = calendar_id.to_owned();
+        self.commit_event(ev, false);
+        self.selected = Some(id.to_owned());
+    }
+
+    /// Copies an event for pasting, and as text to the system clipboard.
+    fn copy_event(&mut self, ctx: &egui::Context, id: &str) {
+        if let Some(ev) = self.store.find_event(id) {
+            ctx.copy_text(menu::event_text(&ev, false));
+            self.clipboard = Some(ev);
+        }
+    }
+
+    /// A calendar a copy of an event can go on: its own if possible.
+    fn calendar_for_copy(&self, preferred: &str) -> Option<String> {
+        Some(preferred.to_owned()).filter(|c| self.is_writable(c)).or_else(|| self.default_calendar())
+    }
+
+    /// Pastes the copied event on `day`: at `time` if given (a slot in the
+    /// hour grid), else at the time it had. An all-day event stays all-day.
+    fn paste(&mut self, day: NaiveDate, time: Option<NaiveDateTime>) {
+        let Some(src) = self.clipboard.clone() else { return };
+        let start = match (src.all_day, time) {
+            (true, _) => midnight(day),
+            (false, Some(t)) => t,
+            (false, None) => day.and_time(src.start.time()),
+        };
+        let Some(calendar_id) = self.calendar_for_copy(&src.calendar_id) else { return };
+        self.finish_editor(Outcome::Done);
+        self.commit_event(src.copy_as_new(calendar_id, start), true);
+    }
+
+    /// A copy of the event at the same time, selected (macOS's Duplicate).
+    fn duplicate(&mut self, id: &str) {
+        let Some(ev) = self.store.find_event(id) else { return };
+        let Some(calendar_id) = self.calendar_for_copy(&ev.calendar_id) else { return };
+        self.finish_editor(Outcome::Done);
+        self.commit_event(ev.copy_as_new(calendar_id, ev.start), true);
+    }
+
+    /// Selects and shows the next (or previous) occurrence of a repeating event.
+    fn go_to_occurrence(&mut self, id: &str, forward: bool) {
+        let Some(occ) = self.store.adjacent_occurrence(id, forward) else { return };
+        self.finish_editor(Outcome::Done);
+        self.go_to(occ.start.date(), self.view);
+        if matches!(self.view, View::Day | View::Week) && !occ.is_banner() {
+            let hours = minute_of_day(occ.start) as f32 / 60.0;
+            self.scroll_to = Some((hours - 1.0).max(0.0) * layout::HOUR_H);
+        }
+        self.selected = Some(occ.id);
+    }
+
+    /// Opens a new message in the mail app with the event's details.
+    fn email(&mut self, id: &str, series: bool) {
+        let Some(ev) = self.store.find_event(id) else { return };
+        let url = menu::mailto(&ev.title, &menu::event_text(&ev, series));
+        if let Err(e) = open::that(&url) {
+            self.status = Some((format!("Could not open your mail app: {e}"), true));
+        }
+    }
+
     fn apply_actions(&mut self) {
         // Occurrences detached by a drag get a new id; later actions in this
         // batch may still name the old one.
@@ -498,6 +704,10 @@ impl App {
                     self.engine.event_changed(&mut self.store, &id);
                     self.flush();
                 }
+                Action::ContextMenu { at, pos } => {
+                    self.menu_items = self.menu_items_for(&at);
+                    self.menu = (!self.menu_items.is_empty()).then(|| ContextMenu::new(at, pos));
+                }
             }
         }
     }
@@ -529,13 +739,35 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.wants_keyboard_input();
         let popover = self.editor.as_ref().is_some_and(|ed| matches!(ed.placement, Placement::Popover { .. }));
-        let modal = popover || self.show_google;
+        let modal = popover || self.show_google || self.menu.is_some();
         let mut view = None;
         let mut step = 0;
         let mut today = false;
         let mut new = false;
         let mut delete = false;
+        let mut edit: Option<Command> = None;
         ctx.input(|i| {
+            if !typing {
+                // Ctrl+X/C/V arrive as clipboard events, not key presses.
+                for e in &i.events {
+                    match e {
+                        egui::Event::Cut => edit = Some(Command::Cut),
+                        egui::Event::Copy => edit = Some(Command::Copy),
+                        egui::Event::Paste(_) => edit = Some(Command::Paste),
+                        _ => {}
+                    }
+                }
+                let cmd = i.modifiers.command;
+                if cmd && i.key_pressed(Key::D) {
+                    edit = Some(Command::Duplicate);
+                }
+                if cmd && i.key_pressed(Key::CloseBracket) {
+                    edit = Some(Command::NextOccurrence);
+                }
+                if cmd && i.key_pressed(Key::OpenBracket) {
+                    edit = Some(Command::PreviousOccurrence);
+                }
+            }
             let cmd = i.modifiers.command;
             for (n, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4].into_iter().enumerate() {
                 if cmd && i.key_pressed(k) {
@@ -580,6 +812,16 @@ impl App {
             if let Some(id) = self.selected.clone() {
                 self.delete_event(&id);
             }
+        }
+        match (edit, self.selected.clone()) {
+            // Onto the selected event's day (else the day shown), at the
+            // copied event's time.
+            (Some(Command::Paste), selected) => {
+                let day = selected.and_then(|id| self.store.find_event(&id)).map_or(self.date, |ev| ev.start.date());
+                self.paste(day, None);
+            }
+            (Some(cmd), Some(id)) => self.run_command(ctx, MenuAt::Event(id), cmd),
+            _ => {}
         }
     }
 
@@ -970,6 +1212,7 @@ impl eframe::App for App {
         }
         self.apply_actions();
         self.editor_popover(ctx, &p);
+        self.context_menu(ctx, &p);
         self.google_window(ctx, &p);
 
         // Keep the current-time line moving.
