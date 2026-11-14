@@ -6,7 +6,7 @@
 
 use std::sync::OnceLock;
 
-use ab_glyph::{Font, FontArc, Glyph, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, FontVec, Glyph, PxScale, ScaleFont};
 use chrono::{Datelike, NaiveDate};
 
 const RED: [f32; 3] = [255.0, 59.0, 48.0];
@@ -25,8 +25,9 @@ struct Fonts {
 fn fonts() -> &'static Fonts {
     static FONTS: OnceLock<Fonts> = OnceLock::new();
     FONTS.get_or_init(|| {
-        let load = |paths: &[&str]| {
-            paths.iter().find_map(|p| std::fs::read(p).ok()).and_then(|b| FontArc::try_from_vec(b).ok())
+        let load = |f: Option<&crate::fonts::FontFile>| {
+            let f = f?;
+            FontVec::try_from_vec_and_index(f.bytes.clone(), f.index).ok().map(FontArc::new)
         };
         // egui's bundled font is the last resort, so this never fails.
         let fallback = || {
@@ -35,18 +36,8 @@ fn fonts() -> &'static Fonts {
             let data = data.expect("egui ships fonts").font.clone();
             FontArc::try_from_vec(data.into_owned()).expect("egui font parses")
         };
-        let regular = load(&[
-            "C:\\Windows\\Fonts\\segoeui.ttf",
-            "/System/Library/Fonts/SFNS.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ])
-        .unwrap_or_else(fallback);
-        let bold = load(&[
-            "C:\\Windows\\Fonts\\seguisb.ttf",
-            "C:\\Windows\\Fonts\\segoeuib.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        ])
-        .unwrap_or_else(|| regular.clone());
+        let regular = load(crate::fonts::regular()).unwrap_or_else(fallback);
+        let bold = load(crate::fonts::bold()).unwrap_or_else(|| regular.clone());
         Fonts { regular, bold }
     })
 }

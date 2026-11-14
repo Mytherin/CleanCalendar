@@ -609,8 +609,8 @@ impl App {
             let prev = self.store.adjacent_occurrence(id, false).is_some();
             items.extend([
                 Item::Separator,
-                Item::new(Icon::Next, "Go to Next Occurrence", next, Command::NextOccurrence).shortcut("Ctrl+]"),
-                Item::new(Icon::Previous, "Go to Previous Occurrence", prev, Command::PreviousOccurrence).shortcut("Ctrl+["),
+                Item::new(Icon::Next, "Go to Next Occurrence", next, Command::NextOccurrence).shortcut(cmd_key!("]")),
+                Item::new(Icon::Previous, "Go to Previous Occurrence", prev, Command::PreviousOccurrence).shortcut(cmd_key!("[")),
             ]);
         }
         items.push(Item::Separator);
@@ -1015,13 +1015,13 @@ impl App {
                     if icon_button(ui, "☰", "Show/hide calendar list").clicked() {
                         self.sidebar_open = !self.sidebar_open;
                     }
-                    if pill_button(ui, "+", p.seg_track, p).on_hover_text("New event (Ctrl+N)").clicked() {
+                    if pill_button(ui, "+", p.seg_track, p).on_hover_text(format!("New event ({})", cmd_key!("N"))).clicked() {
                         let start = midnight(self.date) + Duration::hours(9);
                         self.new_event(start, start + default_event_len(), false);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         self.search_field(ui, p);
-                        if icon_button(ui, "⚙", "Settings (Ctrl+,)").clicked() {
+                        if icon_button(ui, "⚙", &format!("Settings ({})", cmd_key!(","))).clicked() {
                             self.open_settings();
                         }
                         let connected = !self.store.accounts().is_empty();

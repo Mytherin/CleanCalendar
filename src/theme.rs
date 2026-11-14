@@ -155,29 +155,19 @@ pub fn bold_font(size: f32) -> FontId {
     FontId::new(size, bold())
 }
 
-/// Use the platform UI font when available (Segoe UI on Windows, SF on macOS),
-/// falling back to egui's built-in font.
+/// Use the platform UI font when available (see [`crate::fonts`]), falling
+/// back to egui's built-in font.
 pub fn install_fonts(ctx: &egui::Context) {
-    let regular = [
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "/System/Library/Fonts/SFNS.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ];
-    let bold_paths = [
-        "C:\\Windows\\Fonts\\seguisb.ttf",
-        "C:\\Windows\\Fonts\\segoeuib.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ];
-    let load = |paths: &[&str]| paths.iter().find_map(|p| std::fs::read(p).ok());
+    let data = |f: &crate::fonts::FontFile| FontData { index: f.index, ..FontData::from_owned(f.bytes.clone()) };
 
     let mut fonts = FontDefinitions::default();
-    if let Some(bytes) = load(&regular) {
-        fonts.font_data.insert("ui".into(), FontData::from_owned(bytes));
+    if let Some(f) = crate::fonts::regular() {
+        fonts.font_data.insert("ui".into(), data(f));
         fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "ui".into());
     }
     let mut bold_family = fonts.families[&FontFamily::Proportional].clone();
-    if let Some(bytes) = load(&bold_paths) {
-        fonts.font_data.insert("ui-bold".into(), FontData::from_owned(bytes));
+    if let Some(f) = crate::fonts::bold() {
+        fonts.font_data.insert("ui-bold".into(), data(f));
         bold_family.insert(0, "ui-bold".into());
     }
     fonts.families.insert(bold(), bold_family);
