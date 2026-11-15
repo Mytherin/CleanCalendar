@@ -6,7 +6,8 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 ## Features
 
 - **Day / Week / Month / Year** views with an Apple-style segmented control, a red "today" badge and a live current-time line.
-- **Sidebar** with calendar visibility checkboxes, a right-click menu for color and delete, and a mini-month navigator.
+- **Sidebar** with calendar visibility checkboxes, a right-click menu for color and delete, account groups you can fold (click the heading) and reorder (drag it; a red line shows where it goes), and a mini-month navigator.
+- **New events go on the calendar of the event last selected**, as on macOS; until one is selected, on the default calendar from Settings.
 - **Week/Day time grid:** overlapping events sit side by side; all-day and multi-day events span the all-day lane.
 - **Direct manipulation:** drag on empty space to create an event, drag an event to move it, drag its bottom edge to resize. Everything snaps to 15 minutes.
 - **Right-click menu** like Apple Calendar's: Get Info, move to another calendar, Delete, Cut, Copy, Paste, Duplicate, go to the next/previous occurrence of a repeating event, and e-mail the event (or its series). Right-click on empty space to create an event or paste there.
@@ -17,7 +18,7 @@ Built on [egui/eframe](https://github.com/emilk/egui).
 - **Repeating events:** every N days, weeks (on chosen weekdays), months or years, ending never, on a date, or after a number of times. Edit or delete one occurrence or the whole series; dragging an occurrence moves just that one.
 - **Time zones:** pin an event to a zone (“09:00 New York”) and it shows at the right local time wherever you are, also across daylight-saving changes; or leave it *floating* to keep the same wall-clock time everywhere.
 - **Settings** (⚙ in the toolbar, or Ctrl+, — ⌘, on macOS), laid out like macOS Calendar's:
-  - *General:* 5 or 7 days per week, the first day of the week (or the system's region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar, and whether to show Google's birthdays and holidays calendars.
+  - *General:* 5 or 7 days per week, the first day of the week (or the system's region setting), scrolling the week view by week or by day, working hours (shaded outside), how many hours fit on screen, the default event length, the default calendar (used until an event is selected), and whether to show Google's birthdays and holidays calendars.
   - *Accounts:* add (+) or remove (−) the Google account, switch it off, give it a name, and choose how often it refreshes (every minute to hourly, or manually).
   - *Locations:* the countries whose location data is installed (update or remove each), downloads in progress, and a search for countries to add.
   - *Advanced:* shade busy days in the year view, show week numbers in the week and month views, and how much of the past to keep from synced calendars (all of it by default, or the last 5 years, 2 years, 1 year or 6 months).

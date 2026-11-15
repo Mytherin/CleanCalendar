@@ -14,7 +14,7 @@ use crate::menu::{self, Command, ContextMenu, Icon, Item, MenuAt};
 use crate::model::{Calendar, Event, Source, Store, CALENDAR_COLORS};
 use crate::remote::{Worker, GOOGLE};
 use crate::recurrence;
-use crate::settings::WeekScroll;
+use crate::settings::{self, WeekScroll};
 use crate::sync::{Notice, SyncEngine};
 use crate::theme::{self, Palette, RED};
 use crate::interact::Pointer;
@@ -73,6 +73,9 @@ pub struct App {
     pub date: NaiveDate,
     pub today: NaiveDate,
     pub selected: Option<String>,
+    /// The calendar of the event last selected or edited, kept after
+    /// clicking away: new events go on it, as on macOS.
+    current_calendar: Option<String>,
     pub pointer: Pointer,
     /// Scroll the day/week grid to this hour on the next frame.
     pub scroll_to: Option<f32>,
@@ -143,6 +146,7 @@ impl App {
             date: today,
             today,
             selected: None,
+            current_calendar: None,
             pointer: Pointer::default(),
             week_first: None,
             month_anchor: None,
@@ -259,17 +263,31 @@ impl App {
 
     // ---- Event operations -------------------------------------------------
 
-    /// The calendar new events go on: the "Default Calendar" setting, else
-    /// the selected event's, else the first visible one that can be written to.
+    /// The calendar of the event being edited, else of the selected one.
+    fn calendar_in_focus(&self) -> Option<String> {
+        self.editor
+            .as_ref()
+            .map(|ed| ed.draft.calendar_id.clone())
+            .or_else(|| self.selected.as_ref().and_then(|id| self.store.find_event(id)).map(|e| e.calendar_id))
+    }
+
+    /// Remembers the calendar in focus, so that clicking away (as a
+    /// double-click on empty space does first) doesn't forget it.
+    fn note_current_calendar(&mut self) {
+        if let Some(cal) = self.calendar_in_focus() {
+            self.current_calendar = Some(cal);
+        }
+    }
+
+    /// The calendar new events go on: as on macOS, that of the event
+    /// selected or edited (or last so), else the "Default Calendar"
+    /// setting, else the first visible one that can be written to.
     fn default_calendar(&self) -> Option<String> {
         let writable = |cid: &String| self.store.writable_calendars().any(|c| &c.id == cid);
-        self.store
-            .settings
-            .default_calendar
-            .clone()
+        self.calendar_in_focus()
             .filter(writable)
-            .or_else(|| self.selected.as_ref().and_then(|id| self.store.find_event(id)).map(|e| e.calendar_id))
-            .filter(writable)
+            .or_else(|| self.current_calendar.clone().filter(writable))
+            .or_else(|| self.store.settings.default_calendar.clone().filter(writable))
             .or_else(|| self.store.writable_calendars().find(|c| c.visible).map(|c| c.id.clone()))
             .or_else(|| self.store.writable_calendars().next().map(|c| c.id.clone()))
     }
@@ -1111,28 +1129,51 @@ impl App {
 
     fn calendar_list(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let mut remove: Option<String> = None;
-        // Local calendars, then one group per account.
+        // Local calendars, then one group per account (an account without
+        // calendars isn't shown), in the order they've been dragged into.
         let mut groups: Vec<Option<String>> = vec![None, Some(GOOGLE.to_owned())];
         groups.extend(self.store.caldav.iter().map(|a| Some(a.id.clone())));
-        for account in groups {
+        fn listed(store: &Store, account: Option<&str>) -> Vec<usize> {
+            (0..store.calendars.len())
+                .filter(|&i| store.calendars[i].account() == account)
+                .filter(|&i| store.is_listed(&store.calendars[i]))
+                .collect()
+        }
+        groups.retain(|a| a.is_none() || !listed(&self.store, a.as_deref()).is_empty());
+        let keys: Vec<String> = groups.iter().map(|a| settings::group_key(a.as_deref()).to_owned()).collect();
+        let keys = self.store.settings.ordered_groups(keys);
+        // Each group's extent (heading to last row), to place a dragged one.
+        let mut extents: Vec<egui::Rangef> = Vec::new();
+        let mut dragging: Option<usize> = None;
+        let mut dropped = false;
+        for (gi, key) in keys.iter().enumerate() {
+            let account = (key != settings::LOCAL_GROUP).then_some(key.as_str());
             let google = account.is_some();
-            let idxs: Vec<usize> = (0..self.store.calendars.len())
-                .filter(|&i| self.store.calendars[i].account() == account.as_deref())
-                .filter(|&i| self.store.is_listed(&self.store.calendars[i]))
-                .collect();
-            if idxs.is_empty() && google {
-                continue;
-            }
+            let idxs = listed(&self.store, account);
             let description = self.store.settings.google_description.trim();
-            let header = match account.as_deref() {
+            let header = match account {
                 None => "On My Computer".to_owned(),
                 Some(GOOGLE) if !description.is_empty() => description.to_owned(),
                 Some(GOOGLE) => self.store.google.account_email.clone().unwrap_or_else(|| "Google".to_owned()),
                 Some(a) => self.store.account_name(a),
             };
+            let top = ui.cursor().top();
             ui.add_space(6.0);
-            ui.label(RichText::new(header).font(theme::bold_font(11.5)).color(p.secondary));
+            let collapsed = self.store.settings.is_collapsed(key);
+            let head = group_header(ui, key, &header, collapsed, p);
+            if head.clicked() {
+                self.store.settings.toggle_collapsed(key);
+                self.store.save();
+            }
+            if head.dragged() || head.drag_stopped() {
+                dragging = Some(gi);
+                dropped = head.drag_stopped();
+            }
             ui.add_space(2.0);
+            if collapsed {
+                extents.push(egui::Rangef::new(top, ui.cursor().top()));
+                continue;
+            }
             let local_count = idxs.len();
             for i in idxs {
                 let cal = &mut self.store.calendars[i];
@@ -1176,6 +1217,30 @@ impl App {
                         read_only: false,
                     });
                     self.store.save();
+                }
+            }
+            extents.push(egui::Rangef::new(top, ui.cursor().top()));
+        }
+        // A heading being dragged: a red line (with a ring at its start, as
+        // on macOS) marks the gap it would go to, and dropping moves it there.
+        if let (Some(from), Some(pos)) = (dragging, ui.ctx().pointer_latest_pos()) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            let to = extents.iter().filter(|r| r.center() < pos.y).count();
+            if to != from && to != from + 1 {
+                if dropped {
+                    self.store.settings.move_group(&keys, from, to);
+                    self.store.save();
+                } else {
+                    let y = match to {
+                        0 => extents[0].min + 2.0,
+                        n => extents[n - 1].max + 1.0,
+                    };
+                    let x = ui.min_rect().left() + 4.0;
+                    let right = ui.max_rect().right() - 4.0;
+                    let stroke = Stroke::new(2.0_f32, RED);
+                    let painter = ui.painter();
+                    painter.circle_stroke(egui::pos2(x, y), 3.5, stroke);
+                    painter.line_segment([egui::pos2(x + 3.5, y), egui::pos2(right, y)], stroke);
                 }
             }
         }
@@ -1314,6 +1379,7 @@ impl eframe::App for App {
         self.store.settings.apply();
 
         self.handle_messages();
+        self.note_current_calendar();
         // Unsent changes are retried every minute even when refreshing is
         // manual; otherwise pull as often as "Refresh Calendars" says.
         let refresh = self.store.settings.refresh_minutes;
@@ -1454,6 +1520,30 @@ fn segmented(ui: &mut egui::Ui, current: View, p: &Palette) -> Option<View> {
         }
     }
     picked
+}
+
+/// A sidebar group's heading: click to fold or unfold it, drag to move it.
+/// A chevron at the right shows on hover (and while folded), as on macOS.
+fn group_header(ui: &mut egui::Ui, key: &str, title: &str, collapsed: bool, p: &Palette) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
+    // Keyed by the group, not its place, so a drag survives reordering.
+    let resp = ui.interact(rect, egui::Id::new(("sidebar-group", key)), Sense::click_and_drag());
+    if resp.dragged() {
+        ui.painter().rect_filled(rect.expand2(Vec2::new(0.0, 2.0)), 5.0, p.selection);
+    }
+    ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, title, theme::bold_font(11.5), p.secondary);
+    if resp.hovered() || collapsed {
+        let c = egui::pos2(rect.right() - 8.0, rect.center().y);
+        let pts = if collapsed {
+            [c + Vec2::new(-1.5, -3.5), c + Vec2::new(2.0, 0.0), c + Vec2::new(-1.5, 3.5)]
+        } else {
+            [c + Vec2::new(-3.5, -1.5), c + Vec2::new(0.0, 2.0), c + Vec2::new(3.5, -1.5)]
+        };
+        let s = Stroke::new(1.5_f32, p.secondary);
+        ui.painter().line_segment([pts[0], pts[1]], s);
+        ui.painter().line_segment([pts[1], pts[2]], s);
+    }
+    resp.on_hover_text(if collapsed { "Click to show, drag to move" } else { "Click to hide, drag to move" })
 }
 
 fn calendar_row(ui: &mut egui::Ui, cal: &Calendar, p: &Palette) -> egui::Response {

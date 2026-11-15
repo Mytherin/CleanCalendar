@@ -407,16 +407,18 @@ impl App {
 
         section_break(ui);
         form_row(ui, p, LABEL_W, "Default Calendar", |ui| {
-            // A calendar that's gone (or hidden) falls back to the selection.
+            // Used until an event is selected: then, as on macOS, new events
+            // go on the calendar of the event last selected. One that's gone
+            // (or hidden) falls back to the first visible calendar.
             let current = s.default_calendar.as_ref().and_then(|id| calendars.iter().find(|c| &c.0 == id));
             let text = match current {
                 Some((_, name, color)) => RichText::new(format!("● {name}")).color(*color),
-                None => RichText::new("Selected calendar"),
+                None => RichText::new("First visible calendar"),
             };
             egui::ComboBox::new("default-calendar", "").selected_text(text).width(COMBO_W).height(300.0).show_ui(
                 ui,
                 |ui| {
-                    ui.selectable_value(&mut s.default_calendar, None, "Selected calendar");
+                    ui.selectable_value(&mut s.default_calendar, None, "First visible calendar");
                     ui.separator();
                     for (id, name, color) in &calendars {
                         let label = RichText::new(format!("● {name}")).color(*color);

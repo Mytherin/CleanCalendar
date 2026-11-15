@@ -38,8 +38,9 @@ pub struct Settings {
     pub hours_shown: u8,
     /// Length of a new event made by double-clicking or Ctrl+N.
     pub event_minutes: u32,
-    /// The calendar new events go to; `None` uses the selected event's
-    /// calendar (or the first one shown).
+    /// The calendar new events go to until an event is selected (then they
+    /// go on the calendar of the event last selected); `None` uses the
+    /// first one shown.
     pub default_calendar: Option<String>,
     pub show_birthdays: bool,
     pub show_holidays: bool,
@@ -65,7 +66,20 @@ pub struct Settings {
     /// making every other setting unreadable.
     #[serde(deserialize_with = "or_default")]
     pub view: View,
+    /// The sidebar's account groups (see [`group_key`]) in the order they
+    /// were dragged into; groups not listed follow, in their usual order.
+    pub group_order: Vec<String>,
+    /// Sidebar groups folded to just their heading.
+    pub collapsed_groups: Vec<String>,
 }
+
+/// A sidebar group's key: [`LOCAL_GROUP`] for "On My Computer", else the
+/// account (`"google"`, or a CalDAV account's id).
+pub fn group_key(account: Option<&str>) -> &str {
+    account.unwrap_or(LOCAL_GROUP)
+}
+
+pub const LOCAL_GROUP: &str = "local";
 
 /// Reads a field, taking its default if the value doesn't parse.
 fn or_default<'de, D, T>(d: D) -> Result<T, D::Error>
@@ -97,6 +111,8 @@ impl Default for Settings {
             week_numbers: false,
             history_months: 0,
             view: View::Week,
+            group_order: Vec::new(),
+            collapsed_groups: Vec::new(),
         }
     }
 }
@@ -123,6 +139,36 @@ impl Settings {
         }
         self.event_minutes = self.event_minutes.min(24 * 60);
         self
+    }
+
+    /// Sidebar groups (keys, in their usual order) sorted as dragged.
+    pub fn ordered_groups(&self, mut groups: Vec<String>) -> Vec<String> {
+        let rank = |g: &String| self.group_order.iter().position(|o| o == g).unwrap_or(usize::MAX);
+        groups.sort_by_key(rank); // stable: unranked ones keep their order
+        groups
+    }
+
+    /// Moves `shown[from]` to the gap before `shown[to]` (`to` may be
+    /// `shown.len()`, the end). Groups remembered but not shown now (a
+    /// hidden account) keep a place after them.
+    pub fn move_group(&mut self, shown: &[String], from: usize, to: usize) {
+        let mut order = shown.to_vec();
+        let g = order.remove(from);
+        order.insert(if to > from { to - 1 } else { to }, g);
+        order.extend(self.group_order.iter().filter(|g| !shown.contains(g)).cloned());
+        self.group_order = order;
+    }
+
+    pub fn is_collapsed(&self, group: &str) -> bool {
+        self.collapsed_groups.iter().any(|g| g == group)
+    }
+
+    pub fn toggle_collapsed(&mut self, group: &str) {
+        if self.is_collapsed(group) {
+            self.collapsed_groups.retain(|g| g != group);
+        } else {
+            self.collapsed_groups.push(group.to_owned());
+        }
     }
 
     /// The first day of the week, with "system" resolved.
@@ -279,6 +325,47 @@ fn parse_locale_week_start(out: &str) -> Option<Weekday> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sidebar_groups_follow_the_dragged_order() {
+        let mut s = Settings::default();
+        let usual = keys(&["local", "google", "dav1", "dav2"]);
+        assert_eq!(s.ordered_groups(usual.clone()), usual);
+
+        // Drag "dav1" to the top, then "local" to the end.
+        s.move_group(&usual, 2, 0);
+        assert_eq!(s.ordered_groups(usual.clone()), keys(&["dav1", "local", "google", "dav2"]));
+        let shown = s.ordered_groups(usual.clone());
+        s.move_group(&shown, 1, 4);
+        assert_eq!(s.ordered_groups(usual.clone()), keys(&["dav1", "google", "dav2", "local"]));
+
+        // Dropping a group in the gap either side of itself changes nothing.
+        let shown = s.ordered_groups(usual.clone());
+        s.move_group(&shown, 1, 1);
+        s.move_group(&shown, 1, 2);
+        assert_eq!(s.ordered_groups(usual.clone()), shown);
+
+        // A new account goes at the end; a hidden one keeps its place for later.
+        let without_google = keys(&["local", "dav1", "dav2", "dav3"]);
+        assert_eq!(s.ordered_groups(without_google.clone()), keys(&["dav1", "dav2", "local", "dav3"]));
+        let shown = s.ordered_groups(without_google);
+        s.move_group(&shown, 3, 0);
+        assert_eq!(s.ordered_groups(usual), keys(&["dav1", "dav2", "local", "google"]));
+    }
+
+    #[test]
+    fn sidebar_groups_collapse_and_expand() {
+        let mut s = Settings::default();
+        assert!(!s.is_collapsed("google"));
+        s.toggle_collapsed("google");
+        assert!(s.is_collapsed("google") && !s.is_collapsed(LOCAL_GROUP));
+        s.toggle_collapsed("google");
+        assert!(!s.is_collapsed("google"));
+    }
 
     #[test]
     fn the_week_start_is_read_from_glibc_locale_output() {
