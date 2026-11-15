@@ -143,9 +143,14 @@ impl Settings {
 
     /// Sidebar groups (keys, in their usual order) sorted as dragged.
     pub fn ordered_groups(&self, mut groups: Vec<String>) -> Vec<String> {
-        let rank = |g: &String| self.group_order.iter().position(|o| o == g).unwrap_or(usize::MAX);
-        groups.sort_by_key(rank); // stable: unranked ones keep their order
+        groups.sort_by_key(|g| self.group_rank(g)); // stable: unranked ones keep their order
         groups
+    }
+
+    /// A sidebar group's place in the dragged order (`usize::MAX` if it was
+    /// never moved), to sort by with a stable sort.
+    pub fn group_rank(&self, group: &str) -> usize {
+        self.group_order.iter().position(|o| o == group).unwrap_or(usize::MAX)
     }
 
     /// Moves `shown[from]` to the gap before `shown[to]` (`to` may be

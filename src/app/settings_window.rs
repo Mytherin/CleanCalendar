@@ -364,8 +364,18 @@ impl App {
     // ---- General ------------------------------------------------------------
 
     fn general_tab(&mut self, ui: &mut Ui, p: &Palette) {
+        // Grouped by account, in the sidebar's order (local first, then
+        // Google, then CalDAV accounts, unless dragged otherwise).
+        let store = &self.store;
+        let usual = |c: &crate::model::Calendar| match c.account() {
+            None => 0,
+            Some(GOOGLE) => 1,
+            Some(a) => 2 + store.caldav.iter().position(|x| x.id == a).unwrap_or(usize::MAX - 2),
+        };
+        let mut writable: Vec<_> = store.writable_calendars().collect();
+        writable.sort_by_key(|c| (store.settings.group_rank(crate::settings::group_key(c.account())), usual(c)));
         let calendars: Vec<(String, String, Color32)> =
-            self.store.writable_calendars().map(|c| (c.id.clone(), c.name.clone(), theme::rgb(c.color))).collect();
+            writable.into_iter().map(|c| (c.id.clone(), c.name.clone(), theme::rgb(c.color))).collect();
         let s = &mut self.store.settings;
 
         form_row(ui, p, LABEL_W, "Days per week", |ui| {
