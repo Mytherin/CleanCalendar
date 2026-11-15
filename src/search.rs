@@ -90,6 +90,44 @@ fn fingerprint(store: &Store) -> u64 {
     h.finish()
 }
 
+/// A line in the results list: a day's heading, or a result (an index into
+/// the results) under it. Today's heading reads "Today".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    Day(NaiveDate),
+    Event(usize),
+}
+
+/// The results grouped under a heading for each day they start on, like
+/// Apple Calendar. A "Today" heading always marks where today falls, even
+/// with nothing on it, so the past and what's coming up are easy to tell
+/// apart. No results, no rows.
+pub fn rows(results: &[Event], today: NaiveDate) -> Vec<Row> {
+    let mut out = Vec::new();
+    if results.is_empty() {
+        return out;
+    }
+    let mut day: Option<NaiveDate> = None;
+    let mut today_shown = false;
+    for (i, ev) in results.iter().enumerate() {
+        let d = ev.start.date();
+        if !today_shown && d >= today {
+            out.push(Row::Day(today));
+            day = Some(today);
+            today_shown = true;
+        }
+        if day != Some(d) {
+            out.push(Row::Day(d));
+            day = Some(d);
+        }
+        out.push(Row::Event(i));
+    }
+    if !today_shown {
+        out.push(Row::Day(today));
+    }
+    out
+}
+
 /// Index of the first result on or after `today` (else the last one), to
 /// scroll to: like Apple Calendar, the list opens at what's coming up.
 pub fn first_upcoming(results: &[Event], today: NaiveDate) -> Option<usize> {
@@ -209,6 +247,21 @@ mod tests {
         let monthly: Vec<_> = found.iter().filter(|e| e.id.starts_with("m#")).map(|e| e.start.date()).collect();
         assert_eq!(monthly, [day(3, 1), day(5, 1)], "the removed occurrence is left out");
         assert!(found.windows(2).all(|w| w[0].start <= w[1].start));
+    }
+
+    #[test]
+    fn results_are_grouped_by_day_with_today_marked() {
+        use Row::{Day, Event as E};
+        let evs = vec![ev("a", "x", day(1, 1)), ev("b", "x", day(1, 1)), ev("c", "x", day(11, 14)), ev("d", "x", day(12, 1))];
+        assert_eq!(rows(&evs, day(11, 14)), [Day(day(1, 1)), E(0), E(1), Day(day(11, 14)), E(2), Day(day(12, 1)), E(3)]);
+        assert_eq!(
+            rows(&evs, day(6, 1)),
+            [Day(day(1, 1)), E(0), E(1), Day(day(6, 1)), Day(day(11, 14)), E(2), Day(day(12, 1)), E(3)],
+            "today has its heading even with nothing on it"
+        );
+        assert_eq!(rows(&evs[..2], day(6, 1)), [Day(day(1, 1)), E(0), E(1), Day(day(6, 1))], "all past: today last");
+        assert_eq!(rows(&evs[3..], day(6, 1)), [Day(day(6, 1)), Day(day(12, 1)), E(0)], "all ahead: today first");
+        assert!(rows(&[], day(6, 1)).is_empty());
     }
 
     #[test]
