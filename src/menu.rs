@@ -10,6 +10,7 @@ use eframe::egui::{self, Align2, Color32, Key, Order, PointerButton, Pos2, Rect,
 
 use crate::model::{Event, Store};
 use crate::remote::GOOGLE;
+use crate::settings;
 use crate::theme::{self, Palette, MENU_HIGHLIGHT};
 
 /// What was right-clicked.
@@ -410,12 +411,13 @@ pub fn calendar_menu(ui: &mut egui::Ui, store: &Store, current: &str, p: &Palett
     let released = ui.input(|i| i.pointer.button_released(PointerButton::Secondary));
 
     let mut picked = None;
-    // Local calendars, then each account's (as in the sidebar).
+    // Local calendars, then each account's, in the sidebar's order.
     let mut groups: Vec<(Option<String>, String)> = vec![
         (None, "On My Computer".to_owned()),
         (Some(GOOGLE.to_owned()), store.google.account_email.clone().unwrap_or_else(|| "Google".into())),
     ];
     groups.extend(store.caldav.iter().map(|a| (Some(a.id.clone()), a.label.clone())));
+    groups.sort_by_key(|(account, _)| store.settings.group_rank(settings::group_key(account.as_deref())));
     let mut first = true;
     for (account, header) in groups {
         let cals: Vec<_> = store
