@@ -17,13 +17,10 @@ use eframe::egui::{
 use crate::app::{Action, App, View};
 use crate::dates::*;
 use crate::interact::{Cursor, Input};
-use crate::layout::{self, HitMap, Target, WeekLayout, WeekRects, DAY_HEADER_H, GRID_PAD, GUTTER};
+use crate::layout::{self, HitMap, WeekLayout, WeekRects, DAY_HEADER_H, GRID_PAD, GUTTER};
 use crate::model::Event;
 use crate::recurrence;
 use crate::theme::{self, Palette, RED};
-
-/// Seconds the pointer must rest on an event before its tooltip shows.
-const TOOLTIP_DELAY: f32 = 0.5;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -232,8 +229,8 @@ fn draw_banner(ui: &Ui, painter: &egui::Painter, rect: Rect, ev: &Event, color: 
     draw_text_centered(ui, painter, rect.left() + 6.0, rect, &text, theme::bold_font(11.5), text_color, max_w);
 }
 
-/// The event's title, when it happens, how it repeats and where (its
-/// tooltip, and the start of the text it's shared as).
+/// The event's title, when it happens, how it repeats and where (the
+/// start of the text it's shared as).
 pub(crate) fn hover_text(ev: &Event) -> String {
     let when = if ev.all_day {
         let last = last_day(ev.start, ev.end);
@@ -324,15 +321,6 @@ fn drive_pointer(app: &mut App, ui: &Ui, hits: &HitMap) {
             Cursor::ResizeVertical => CursorIcon::ResizeVertical,
             Cursor::PointingHand => CursorIcon::PointingHand,
         });
-    }
-    if let (false, Some(Target::Event { id, .. })) = (app.pointer.is_active() || menu_open, target) {
-        let still = ctx.input(|i| i.pointer.time_since_last_movement());
-        if still < TOOLTIP_DELAY {
-            ctx.request_repaint_after(std::time::Duration::from_secs_f32(TOOLTIP_DELAY - still));
-        } else if let Some(ev) = app.store.find_event(id) {
-            let text = hover_text(&ev);
-            egui::show_tooltip_at_pointer(&ctx, layer, egui::Id::new(("event-tip", id)), |ui| ui.label(text));
-        }
     }
 
     if !actions.is_empty() {
