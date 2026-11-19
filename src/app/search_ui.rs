@@ -189,13 +189,16 @@ impl App {
         };
         let x = rect.left() + PAD + 26.0;
         let w = right - times_w - 10.0 - x;
-        let title = if ev.title.trim().is_empty() { "New Event" } else { ev.title.as_str() };
+        // Each on one line: a location is often a whole address, with line
+        // breaks, which would spill over the title.
+        let title = one_line(&ev.title, " ");
+        let title = if title.is_empty() { "New Event".to_owned() } else { title };
         let title_font = theme::bold_font(14.0);
-        let location = ev.location.trim();
+        let location = one_line(&ev.location, ", ");
         let title_y = if location.is_empty() { mid } else { mid - 8.0 };
-        painter.text(egui::pos2(x, title_y), Align2::LEFT_CENTER, truncate(ui, title, title_font.clone(), w), title_font, text);
+        painter.text(egui::pos2(x, title_y), Align2::LEFT_CENTER, truncate(ui, &title, title_font.clone(), w), title_font, text);
         if !location.is_empty() {
-            painter.text(egui::pos2(x, mid + 9.0), Align2::LEFT_CENTER, truncate(ui, location, small.clone(), w), small, p.secondary);
+            painter.text(egui::pos2(x, mid + 9.0), Align2::LEFT_CENTER, truncate(ui, &location, small.clone(), w), small, p.secondary);
         }
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
@@ -213,6 +216,11 @@ impl App {
         }
         self.selected = Some(ev.id.clone());
     }
+}
+
+/// `text`'s lines, trimmed and joined by `sep`, leaving out blank ones.
+fn one_line(text: &str, sep: &str) -> String {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(sep)
 }
 
 /// `text` cut to fit `width`, with an ellipsis.
