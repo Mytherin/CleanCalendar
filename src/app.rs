@@ -283,13 +283,7 @@ impl App {
     /// selected or edited (or last so), else the "Default Calendar"
     /// setting, else the first visible one that can be written to.
     fn default_calendar(&self) -> Option<String> {
-        let writable = |cid: &String| self.store.writable_calendars().any(|c| &c.id == cid);
-        self.calendar_in_focus()
-            .filter(writable)
-            .or_else(|| self.current_calendar.clone().filter(writable))
-            .or_else(|| self.store.settings.default_calendar.clone().filter(writable))
-            .or_else(|| self.store.writable_calendars().find(|c| c.visible).map(|c| c.id.clone()))
-            .or_else(|| self.store.writable_calendars().next().map(|c| c.id.clone()))
+        pick_calendar(&self.store, self.calendar_in_focus(), self.current_calendar.clone())
     }
 
     fn is_writable(&self, calendar_id: &str) -> bool {
@@ -1462,6 +1456,45 @@ fn parse_start(s: &str) -> Option<(View, Option<NaiveDate>)> {
 /// than an event of its own).
 fn is_occurrence(store: &Store, id: &str) -> bool {
     store.event(id).is_none() && recurrence::split_occurrence(id).is_some()
+}
+
+/// The calendar new events go on, as on macOS: that of the event selected
+/// or being edited (`in_focus`), else the one last selected (`remembered`),
+/// else the "Default Calendar" setting, else the first one shown. The
+/// remembered and default calendars only count while they're shown: an
+/// event made on a calendar unticked since would be invisible, while it's
+/// being edited and after.
+fn pick_calendar(store: &Store, in_focus: Option<String>, remembered: Option<String>) -> Option<String> {
+    let writable = |cid: &String| store.writable_calendars().any(|c| &c.id == cid);
+    let shown = |cid: &String| writable(cid) && store.is_visible(cid);
+    in_focus
+        .filter(writable)
+        .or_else(|| remembered.filter(shown))
+        .or_else(|| store.settings.default_calendar.clone().filter(shown))
+        .or_else(|| store.writable_calendars().find(|c| c.visible).map(|c| c.id.clone()))
+        .or_else(|| store.writable_calendars().next().map(|c| c.id.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_events_never_go_on_a_calendar_hidden_since() {
+        let mut store = Store::with_defaults();
+        let (home, work) = (store.calendars[0].id.clone(), store.calendars[1].id.clone());
+        let pick = |s: &Store, remembered: Option<&str>| pick_calendar(s, None, remembered.map(str::to_owned));
+        assert_eq!(pick(&store, Some(&work)), Some(work.clone()), "the calendar last selected");
+
+        // "Work" is unticked after its event was selected and deselected.
+        store.calendars[1].visible = false;
+        assert_eq!(pick(&store, Some(&work)), Some(home.clone()), "not the hidden one");
+        store.settings.default_calendar = Some(work.clone());
+        assert_eq!(pick(&store, None), Some(home.clone()), "nor as the Default Calendar");
+
+        // An event selected right now keeps its calendar (it's on screen).
+        assert_eq!(pick_calendar(&store, Some(home.clone()), Some(work)), Some(home));
+    }
 }
 
 fn icon_button(ui: &mut egui::Ui, text: &str, hover: &str) -> egui::Response {
