@@ -224,6 +224,25 @@ impl Attendee {
     }
 }
 
+/// `s` for a place with room for one line: a location saved over several
+/// lines ("CIMA Rooftop Bar\nHekelveld 10, ...") reads "CIMA Rooftop Bar,
+/// Hekelveld 10, ..." instead of drawing a box for each line break.
+pub fn one_line(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(['\n', '\r']) {
+        return s.into();
+    }
+    let lines: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let mut out = String::with_capacity(s.len() + lines.len());
+    for line in lines {
+        if !out.is_empty() {
+            // No doubled comma when the line already ends in punctuation.
+            out.push_str(if out.ends_with([',', ';', ':']) { " " } else { ", " });
+        }
+        out.push_str(line);
+    }
+    out.into()
+}
+
 /// A loose check that `s` looks like one email address ("a@b.c").
 pub fn looks_like_email(s: &str) -> bool {
     let s = s.trim();

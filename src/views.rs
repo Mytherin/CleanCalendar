@@ -26,7 +26,7 @@ use crate::theme::{self, Palette, RED};
 // Shared helpers
 
 fn text_galley(ui: &Ui, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<Galley> {
-    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
+    let mut job = LayoutJob::simple_singleline(crate::model::one_line(text).into_owned(), font, color);
     job.wrap.max_width = max_w.max(1.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;

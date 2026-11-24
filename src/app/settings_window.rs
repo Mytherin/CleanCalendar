@@ -565,7 +565,7 @@ impl App {
         ui.add_space(4.0);
         let field_w = ui.available_width() - label_w - 8.0;
         form_row(ui, p, label_w, "Description", |ui| {
-            ui.add(egui::TextEdit::singleline(&mut s.google_description).hint_text("Google").desired_width(field_w));
+            crate::text_select::add(ui, egui::TextEdit::singleline(&mut s.google_description).hint_text("Google").desired_width(field_w));
         });
         form_row(ui, p, label_w, "User Name", |ui| {
             let mut shown = email.clone();
@@ -592,7 +592,7 @@ impl App {
         let field_w = ui.available_width() - label_w - 8.0;
         form_row(ui, p, label_w, "Description", |ui| {
             let fallback = default_label(provider, &a.server);
-            let resp = ui.add(egui::TextEdit::singleline(&mut a.label).hint_text(&fallback).desired_width(field_w));
+            let resp = crate::text_select::add(ui, egui::TextEdit::singleline(&mut a.label).hint_text(&fallback).desired_width(field_w));
             if resp.lost_focus() && a.label.trim().is_empty() {
                 a.label = fallback;
             }
@@ -834,14 +834,15 @@ impl App {
                 ui.hyperlink_to("Open Google Cloud Console", "https://console.cloud.google.com/apis/credentials");
                 ui.add_space(4.0);
                 form_row(ui, p, SHEET_LABEL_W, "Client ID", |ui| {
-                    ui.add(
+                    crate::text_select::add(
+                        ui,
                         egui::TextEdit::singleline(&mut g.client_id)
                             .hint_text("CleanCalendar's own")
                             .desired_width(field_w - 8.0),
                     );
                 });
                 form_row(ui, p, SHEET_LABEL_W, "Client Secret", |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut g.client_secret).password(true).desired_width(field_w - 8.0));
+                    crate::text_select::add(ui, egui::TextEdit::singleline(&mut g.client_secret).password(true).desired_width(field_w - 8.0));
                 });
             });
         let busy = self.worker.busy > 0;
@@ -898,24 +899,24 @@ impl App {
             };
             form_row(ui, p, SHEET_LABEL_W, user_label, |ui| {
                 let hint = if provider == Provider::ICloud { "name@icloud.com" } else { "name@example.com" };
-                first = Some(ui.add(egui::TextEdit::singleline(&mut f.username).hint_text(hint).desired_width(field_w - 8.0)));
+                first = Some(crate::text_select::add(ui, egui::TextEdit::singleline(&mut f.username).hint_text(hint).desired_width(field_w - 8.0)));
             });
             let password_label = if generic { "Password" } else { "App Password" };
             form_row(ui, p, SHEET_LABEL_W, password_label, |ui| {
                 let hint = if provider == Provider::ICloud { "xxxx-xxxx-xxxx-xxxx" } else { "Required" };
-                ui.add(egui::TextEdit::singleline(&mut f.password).password(true).hint_text(hint).desired_width(field_w - 8.0));
+                crate::text_select::add(ui, egui::TextEdit::singleline(&mut f.password).password(true).hint_text(hint).desired_width(field_w - 8.0));
             });
             if generic && f.kind != CalDavKind::Automatic {
                 form_row(ui, p, SHEET_LABEL_W, "Server Address", |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut f.server).hint_text("example.com").desired_width(field_w - 8.0));
+                    crate::text_select::add(ui, egui::TextEdit::singleline(&mut f.server).hint_text("example.com").desired_width(field_w - 8.0));
                 });
             }
             if generic && f.kind == CalDavKind::Advanced {
                 form_row(ui, p, SHEET_LABEL_W, "Server Path", |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut f.path).hint_text("/calendars/user/").desired_width(field_w - 8.0));
+                    crate::text_select::add(ui, egui::TextEdit::singleline(&mut f.path).hint_text("/calendars/user/").desired_width(field_w - 8.0));
                 });
                 form_row(ui, p, SHEET_LABEL_W, "Port", |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut f.port).hint_text(if f.ssl { "443" } else { "80" }).desired_width(56.0));
+                    crate::text_select::add(ui, egui::TextEdit::singleline(&mut f.port).hint_text(if f.ssl { "443" } else { "80" }).desired_width(56.0));
                     ui.add_space(14.0);
                     ui.checkbox(&mut f.ssl, "Use SSL");
                 });
@@ -1148,7 +1149,8 @@ impl App {
         let s = &mut self.settings_ui;
         ui.horizontal(|ui| {
             ui.label("Add a country:");
-            ui.add(
+            crate::text_select::add(
+                ui,
                 egui::TextEdit::singleline(&mut s.region_filter)
                     .hint_text("Search for a country")
                     .desired_width(ui.available_width()),

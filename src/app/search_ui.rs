@@ -46,7 +46,7 @@ impl App {
             .desired_width(text_rect.width());
         // In a child, so the toolbar's layout carries on left of the whole field.
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(text_rect).layout(egui::Layout::left_to_right(Align::Center)));
-        let resp = child.add(edit);
+        let resp = crate::text_select::add(&mut child, edit);
         if s.focus {
             resp.request_focus();
             s.focus = false;

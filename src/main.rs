@@ -31,6 +31,7 @@ mod remote;
 mod search;
 mod settings;
 mod sync;
+mod text_select;
 mod theme;
 mod views;
 

@@ -136,6 +136,7 @@ impl SearchUi {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
+        crate::text_select::install(&cc.egui_ctx);
         let today = Local::now().date_naive();
         let store = Store::load();
         store.settings.apply();
@@ -1367,6 +1368,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         theme::apply_style(ctx);
+        crate::text_select::begin_frame(ctx);
         let p = Palette::get(ctx);
         self.today = Local::now().date_naive();
         self.icon.update(ctx, frame, self.today);

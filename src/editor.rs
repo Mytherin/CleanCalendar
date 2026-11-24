@@ -396,7 +396,7 @@ fn zone_button(ui: &mut egui::Ui, ed: &mut Editor) {
     }
     egui::popup::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
         ui.set_min_width(size.x.max(240.0));
-        let search = ui.add(egui::TextEdit::singleline(&mut ed.zone_filter).hint_text("Search").desired_width(f32::INFINITY));
+        let search = crate::text_select::add(ui, egui::TextEdit::singleline(&mut ed.zone_filter).hint_text("Search").desired_width(f32::INFINITY));
         if opened {
             search.request_focus();
         }
@@ -807,7 +807,8 @@ fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
             if has_guests {
                 divider(ui, p);
             }
-            let field = ui.add(
+            let field = crate::text_select::add(
+                ui,
                 egui::TextEdit::singleline(&mut ed.invitee_input)
                     .id_source("invitee-input")
                     .hint_text(RichText::new("Add Invitees").color(p.placeholder))
@@ -838,7 +839,7 @@ fn invitees_card(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette,
 
 /// A row's text cut to one line, with "…" if it doesn't fit.
 fn one_line(ui: &egui::Ui, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    let mut job = egui::text::LayoutJob::simple_singleline(crate::model::one_line(text).into_owned(), font, color);
     job.wrap.max_width = max_w.max(1.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -932,15 +933,21 @@ fn location_row(ui: &mut egui::Ui, ed: &mut Editor, p: &Palette, read_only: bool
     let field = ui
         .horizontal(|ui| {
             let button_w = if has_location { 20.0 + ui.spacing().item_spacing.x } else { 0.0 };
-            let field = ui.add_enabled(
-                !read_only,
-                egui::TextEdit::singleline(&mut ed.draft.location)
-                    .id(id)
-                    .hint_text(RichText::new("Add Location").color(p.placeholder))
-                    .text_color(p.text)
-                    .frame(false)
-                    .desired_width(ui.available_width() - button_w),
-            );
+            // Multiline, so an address saved over several lines (as Apple
+            // Calendar does) shows its line breaks rather than a box for
+            // each; Enter still finishes the field instead of adding a line.
+            let edit = egui::TextEdit::multiline(&mut ed.draft.location)
+                .id(id)
+                .return_key(None)
+                .desired_rows(1)
+                .hint_text(RichText::new("Add Location").color(p.placeholder))
+                .text_color(p.text)
+                .frame(false)
+                .desired_width(ui.available_width() - button_w);
+            let field = ui.add_enabled_ui(!read_only, |ui| crate::text_select::add(ui, edit)).inner;
+            if field.has_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                ui.memory_mut(|m| m.surrender_focus(id));
+            }
             if has_location && maps_button(ui, p).clicked() {
                 if let Err(e) = open::that(places::google_maps_url(&ed.draft.location)) {
                     ed.error = Some(format!("Could not open Google Maps: {e}"));
@@ -1028,7 +1035,8 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
         ui.add_enabled_ui(!read_only, |ui| {
             ui.horizontal(|ui| {
                 let w = ui.available_width() - 48.0;
-                let title = ui.add(
+                let title = crate::text_select::add(
+                    ui,
                     egui::TextEdit::singleline(&mut ed.draft.title)
                         .hint_text(RichText::new("New Event").color(p.placeholder))
                         .font(theme::bold_font(18.0))
@@ -1104,7 +1112,8 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
     // Notes.
     card(ui, p, |ui| {
         ui.add_enabled_ui(!read_only, |ui| {
-            ui.add(
+            crate::text_select::add(
+                ui,
                 egui::TextEdit::multiline(&mut ed.draft.notes)
                     .hint_text(RichText::new("Add Notes or URL").color(p.placeholder))
                     .text_color(p.text)
