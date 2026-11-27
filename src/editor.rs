@@ -847,6 +847,63 @@ fn one_line(ui: &egui::Ui, text: &str, font: egui::FontId, color: Color32, max_w
     ui.fonts(|f| f.layout_job(job))
 }
 
+/// A blue "Join" pill, as macOS Calendar shows for a video call.
+fn join_button(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(52.0, 24.0), Sense::click());
+    let fill = if resp.hovered() { theme::blend(theme::ACCENT, Color32::BLACK, 0.15) } else { theme::ACCENT };
+    ui.painter().rect_filled(rect, 12.0, fill);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Join", theme::bold_font(13.0), Color32::WHITE);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("Join with {name}"))
+}
+
+/// The event's video call (e.g. Google Meet): its name with a Join button,
+/// the link, and the number to dial in by. Shown even on read-only
+/// calendars; there's nothing here to edit.
+fn conference_card(ui: &mut egui::Ui, ed: &mut Editor, p: &Palette) {
+    let Some(conf) = ed.draft.conference.clone() else { return };
+    let mut open_url = None;
+    card(ui, p, |ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal(|ui| {
+            let w = ui.available_width() - 60.0;
+            let name = one_line(ui, &conf.name, theme::font(14.0), p.text, w);
+            ui.label(name);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if join_button(ui, &conf.name).clicked() {
+                    open_url = Some(conf.url.clone());
+                }
+            });
+        });
+        let shown = conf.url.trim_start_matches("https://").trim_start_matches("http://");
+        let link = ui
+            .add(egui::Label::new(RichText::new(shown).color(theme::ACCENT).small()).truncate().sense(Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if link.clicked() {
+            open_url = Some(conf.url.clone());
+        }
+        if !conf.phone.is_empty() {
+            let mut line = format!("Join by phone: {}", conf.phone);
+            if !conf.pin.is_empty() {
+                line += &format!("  PIN: {}", conf.pin);
+            }
+            ui.label(RichText::new(line).color(p.secondary).small());
+        }
+        if !conf.more_phones.is_empty() {
+            let more = ui
+                .add(egui::Label::new(RichText::new("More phone numbers").color(theme::ACCENT).small()).sense(Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if more.clicked() {
+                open_url = Some(conf.more_phones.clone());
+            }
+        }
+    });
+    if let Some(url) = open_url {
+        if let Err(e) = open::that(&url) {
+            ed.error = Some(format!("Could not open {url}: {e}"));
+        }
+    }
+}
+
 /// A map pin that opens the location in Google Maps.
 fn maps_button(ui: &mut egui::Ui, p: &Palette) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
@@ -1056,6 +1113,8 @@ pub fn form(ui: &mut egui::Ui, ed: &mut Editor, store: &Store, p: &Palette) -> O
         });
         location_row(ui, ed, p, read_only);
     });
+
+    conference_card(ui, ed, p);
 
     // When: a summary line that expands into editable fields.
     card(ui, p, |ui| {
@@ -1273,6 +1332,7 @@ mod tests {
             base: None,
             recurrence: None,
             time_zone: None,
+            conference: None,
         }
     }
 

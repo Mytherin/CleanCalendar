@@ -32,11 +32,12 @@ use crate::settings::Settings;
 /// The `main.settings` row holding the app's preferences (as JSON).
 const PREFS_KEY: &str = "app.settings";
 
-/// 2 added repeating events and time zones, 3 invitees, 4 CalDAV accounts.
-const DATA_VERSION: i32 = 4;
+/// 2 added repeating events and time zones, 3 invitees, 4 CalDAV accounts,
+/// 5 video calls.
+const DATA_VERSION: i32 = 5;
 /// Bumped when cached events gain fields (or sync state changes meaning),
 /// so they are downloaded again.
-const CACHE_VERSION: i32 = 5;
+const CACHE_VERSION: i32 = 6;
 
 /// Where the two databases (and the old JSON store, for migration) live, and
 /// where secrets are kept.
@@ -263,12 +264,16 @@ impl std::fmt::Display for TooNew {
 impl std::error::Error for TooNew {}
 
 const EVENT_COLUMNS: &str = "id, calendar_id, title, start_at, end_at, all_day, location, notes, \
-                             remote_id, recurring_id, pending, rev, etag, base, recurrence, time_zone, attendees";
+                             remote_id, recurring_id, pending, rev, etag, base, recurrence, time_zone, attendees, conference";
 
 /// Columns added to `events` and `outbox` since version 1, so older files
 /// can be brought up to date (whichever of them they already have).
-const ADDED_EVENT_COLUMNS: [(&str, &str); 3] =
-    [("recurrence", "TEXT"), ("time_zone", "TEXT"), ("attendees", "TEXT NOT NULL DEFAULT '[]'")];
+const ADDED_EVENT_COLUMNS: [(&str, &str); 4] = [
+    ("recurrence", "TEXT"),
+    ("time_zone", "TEXT"),
+    ("attendees", "TEXT NOT NULL DEFAULT '[]'"),
+    ("conference", "TEXT"),
+];
 
 fn event_table(name: &str) -> String {
     format!(
@@ -289,7 +294,8 @@ fn event_table(name: &str) -> String {
             base TEXT,
             recurrence TEXT,
             time_zone TEXT,
-            attendees TEXT NOT NULL DEFAULT '[]'
+            attendees TEXT NOT NULL DEFAULT '[]',
+            conference TEXT
         );"
     )
 }
@@ -651,6 +657,8 @@ fn read_event(r: &Row) -> rusqlite::Result<Event> {
         base,
         recurrence: json_column(r, 14)?,
         time_zone: r.get(15)?,
+        // Only shown, and refreshed by the next sync: unreadable is no call.
+        conference: json_column(r, 17).ok().flatten(),
     })
 }
 
@@ -658,8 +666,9 @@ fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
     let base = ev.base.as_ref().map(serde_json::to_string).transpose()?;
     let recurrence = ev.recurrence.as_ref().map(serde_json::to_string).transpose()?;
     let attendees = serde_json::to_string(&ev.attendees)?;
+    let conference = ev.conference.as_ref().map(serde_json::to_string).transpose()?;
     tx.prepare_cached(&format!(
-        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT OR REPLACE INTO {} ({EVENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         place.table()
     ))?
     .execute(params![
@@ -680,6 +689,7 @@ fn write_event(tx: &Transaction, place: Place, ev: &Event) -> Result<()> {
         recurrence,
         ev.time_zone,
         attendees,
+        conference,
     ])?;
     Ok(())
 }
@@ -1089,6 +1099,7 @@ mod tests {
             base: None,
             recurrence: None,
             time_zone: None,
+            conference: None,
         }
     }
 
@@ -1531,6 +1542,13 @@ mod tests {
         let g2 = store.event_mut("g2").unwrap();
         g2.time_zone = Some("Asia/Tokyo".into());
         g2.base.as_mut().unwrap().time_zone = Some("Europe/Paris".into());
+        g2.conference = Some(crate::model::Conference {
+            name: "Google Meet".into(),
+            url: "https://meet.google.com/abc-defg-hij".into(),
+            phone: "+31 20 257 3778".into(),
+            pin: "123456789".into(),
+            more_phones: String::new(),
+        });
         store.save();
         let events = store.events.clone();
         drop(store);

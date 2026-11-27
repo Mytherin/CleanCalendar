@@ -129,6 +129,27 @@ pub struct Event {
     /// `None`: floating, it happens at the same wall time wherever you are.
     #[serde(default)]
     pub time_zone: Option<String>,
+    /// The video call to join it by (e.g. Google Meet), as the remote service
+    /// has it. Only shown: it is never uploaded, so saving leaves it alone.
+    #[serde(default)]
+    pub conference: Option<Conference>,
+}
+
+/// A video call attached to an event.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Conference {
+    /// What it is, e.g. "Google Meet".
+    pub name: String,
+    /// The link that joins it (always http or https).
+    pub url: String,
+    /// A number to join by phone instead, its PIN, and a page listing more
+    /// numbers (each may be empty).
+    #[serde(default)]
+    pub phone: String,
+    #[serde(default)]
+    pub pin: String,
+    #[serde(default)]
+    pub more_phones: String,
 }
 
 /// The user-editable parts of an event.
@@ -642,6 +663,7 @@ pub mod tests {
             base: None,
             recurrence: None,
             time_zone: None,
+            conference: None,
         }
     }
 
@@ -762,6 +784,7 @@ pub mod tests {
             base: None,
             recurrence: None,
             time_zone: None,
+            conference: None,
         }
     }
 

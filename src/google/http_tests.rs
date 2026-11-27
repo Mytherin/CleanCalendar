@@ -328,6 +328,7 @@ fn local_event(remote_id: Option<&str>) -> Event {
         base: None,
         recurrence: None,
         time_zone: None,
+        conference: None,
     }
 }
 

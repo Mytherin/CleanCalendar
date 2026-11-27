@@ -659,6 +659,7 @@ mod tests {
             base: None,
             recurrence: None,
             time_zone: None,
+            conference: None,
         }
     }
 

@@ -311,6 +311,7 @@ impl App {
             base: None,
             recurrence: None,
             time_zone: None,
+            conference: None,
         };
         self.finish_editor(Outcome::Done);
         if self.editor.is_some() {

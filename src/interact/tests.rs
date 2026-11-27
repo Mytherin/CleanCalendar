@@ -37,6 +37,7 @@ fn event(id: &str, start: &str, end: &str) -> Event {
         base: None,
         recurrence: None,
         time_zone: None,
+        conference: None,
     }
 }
 

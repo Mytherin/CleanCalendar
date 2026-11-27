@@ -570,6 +570,7 @@ mod tests {
             base: None,
             recurrence: Some(rule),
             time_zone: None,
+            conference: None,
         }
     }
 

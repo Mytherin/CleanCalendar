@@ -131,6 +131,7 @@ fn ghost_event(start: NaiveDateTime, end: NaiveDateTime, all_day: bool) -> Event
         base: None,
         recurrence: None,
         time_zone: None,
+        conference: None,
     }
 }
 

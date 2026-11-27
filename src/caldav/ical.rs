@@ -783,6 +783,7 @@ fn to_event(
         base: None,
         recurrence: None,
         time_zone,
+        conference: None,
     }
 }
 

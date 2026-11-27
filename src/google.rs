@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::model::{Attendee, Event, Response};
+use crate::model::{Attendee, Conference, Event, Response};
 use crate::recurrence;
 #[cfg(test)]
 use crate::remote::{classify, run, sync_all, Cmd, Connections, Failure, Login, Msg, GOOGLE};
@@ -592,7 +592,35 @@ fn event_from_json(cal_id: &str, v: &Value) -> Option<Event> {
         base: None,
         recurrence,
         time_zone,
+        conference: conference_from_json(v),
     })
+}
+
+/// The event's video call. Google keeps it apart from the description (only
+/// its CalDAV/.ics copies write it into the notes), in `conferenceData`, with
+/// `hangoutLink` for a Meet call on older events.
+fn conference_from_json(v: &Value) -> Option<Conference> {
+    let data = &v["conferenceData"];
+    let points = data["entryPoints"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let point = |kind: &str| points.iter().find(|p| p["entryPointType"].as_str() == Some(kind));
+    let str_of = |p: Option<&Value>, key: &str| p.and_then(|p| p[key].as_str()).unwrap_or_default().trim().to_owned();
+    let web = |s: &String| s.starts_with("https://") || s.starts_with("http://");
+
+    let url = Some(str_of(point("video"), "uri"))
+        .filter(web)
+        .or_else(|| v["hangoutLink"].as_str().map(|s| s.trim().to_owned()).filter(web))?;
+    let name = data["conferenceSolution"]["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(if url.contains("meet.google.com") { "Google Meet" } else { "Video call" })
+        .to_owned();
+    let phone = point("phone");
+    let number = Some(str_of(phone, "label"))
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| str_of(phone, "uri").trim_start_matches("tel:").to_owned());
+    let more_phones = Some(str_of(point("more"), "uri")).filter(web).unwrap_or_default();
+    Some(Conference { name, url, phone: number, pin: str_of(phone, "pin"), more_phones })
 }
 
 fn parse_when(v: &Value) -> Option<(NaiveDateTime, bool)> {
@@ -815,6 +843,51 @@ mod tests {
         let back = attendees_to_json(&a);
         assert_eq!(back[1]["optional"], true);
         assert_eq!(back[2]["resource"], true);
+    }
+
+    #[test]
+    fn parses_video_calls() {
+        // As Google sends a Meet call: in conferenceData, not the description.
+        let v = json!({"id": "m", "start": {"date": "2026-11-27"}, "description": "",
+            "hangoutLink": "https://meet.google.com/abc-defg-hij",
+            "conferenceData": {
+                "conferenceSolution": {"key": {"type": "hangoutsMeet"}, "name": "Google Meet"},
+                "entryPoints": [
+                    {"entryPointType": "video", "uri": "https://meet.google.com/abc-defg-hij", "label": "meet.google.com/abc-defg-hij"},
+                    {"entryPointType": "more", "uri": "https://tel.meet/abc-defg-hij?pin=123"},
+                    {"entryPointType": "phone", "uri": "tel:+31-20-257-3778", "label": "+31 20 257 3778", "pin": "123456789"}
+                ]}});
+        let ev = event_from_json("c", &v).unwrap();
+        assert_eq!(ev.notes, "");
+        let c = ev.conference.clone().unwrap();
+        assert_eq!((c.name.as_str(), c.url.as_str()), ("Google Meet", "https://meet.google.com/abc-defg-hij"));
+        assert_eq!((c.phone.as_str(), c.pin.as_str()), ("+31 20 257 3778", "123456789"));
+        assert_eq!(c.more_phones, "https://tel.meet/abc-defg-hij?pin=123");
+        // Never uploaded: saving can't touch Google's own conference.
+        let body = event_to_json(&ev);
+        assert!(body.get("conferenceData").is_none() && body.get("hangoutLink").is_none());
+
+        // Only a hangoutLink (older events).
+        let v = json!({"id": "h", "start": {"date": "2026-11-27"}, "hangoutLink": "https://meet.google.com/xyz"});
+        let c = event_from_json("c", &v).unwrap().conference.unwrap();
+        assert_eq!((c.name.as_str(), c.url.as_str(), c.phone.as_str()), ("Google Meet", "https://meet.google.com/xyz", ""));
+
+        // Another provider, and a phone entry with only a tel: URI.
+        let v = json!({"id": "z", "start": {"date": "2026-11-27"}, "conferenceData": {
+            "conferenceSolution": {"name": "Zoom Meeting"},
+            "entryPoints": [{"entryPointType": "video", "uri": "https://zoom.us/j/1"}, {"entryPointType": "phone", "uri": "tel:+1555"}]}});
+        let c = event_from_json("c", &v).unwrap().conference.unwrap();
+        assert_eq!((c.name.as_str(), c.phone.as_str()), ("Zoom Meeting", "+1555"));
+
+        // No call, a call still being created (no entry points), or a link
+        // that isn't a web address: nothing to join.
+        for v in [
+            json!({"id": "n", "start": {"date": "2026-11-27"}}),
+            json!({"id": "p", "start": {"date": "2026-11-27"}, "conferenceData": {"createRequest": {"status": {"statusCode": "pending"}}}}),
+            json!({"id": "f", "start": {"date": "2026-11-27"}, "conferenceData": {"entryPoints": [{"entryPointType": "video", "uri": "file:///C:/x.exe"}]}}),
+        ] {
+            assert!(event_from_json("c", &v).unwrap().conference.is_none(), "{v}");
+        }
     }
 
     #[test]
